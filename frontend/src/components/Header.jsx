@@ -1,8 +1,15 @@
-function Header() {
+const pageTitles = {
+  dashboard: 'Dashboard',
+  'company-setup': 'Company / Legal Entity',
+}
+
+function Header({ activePage }) {
+  const pageTitle = pageTitles[activePage] || 'Dashboard'
+
   return (
     <header className="top-header">
       <div>
-        <h5>Dashboard</h5>
+        <h5>{pageTitle}</h5>
       </div>
 
       <div className="header-right">

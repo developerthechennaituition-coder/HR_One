@@ -81,6 +81,59 @@ body {
   color: #ffffff;
 }
 
+.sidebar-group {
+  margin-top: 15px;
+}
+
+.sidebar-parent {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 15px;
+  margin-bottom: 5px;
+  color: #d1d5db;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-parent:hover,
+.sidebar-parent.expanded {
+  background-color: #374151;
+  color: #ffffff;
+}
+
+.sidebar-parent > i:first-child {
+  width: 20px;
+  font-size: 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.sidebar-chevron {
+  margin-left: auto;
+  font-size: 12px;
+  transition: transform 0.2s ease;
+}
+
+.sidebar-parent.expanded .sidebar-chevron {
+  transform: rotate(180deg);
+}
+
+.sidebar-submenu {
+  padding-left: 18px;
+}
+
+.sidebar-submenu a {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  font-size: 13px;
+}
+
 /* Main Area */
 .main-area {
   flex: 1;
@@ -100,7 +153,7 @@ body {
 
 .top-header h5 {
   margin: 0;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
 }
 
@@ -162,6 +215,39 @@ body {
   color: #6b7280;
 }
 
+/* Company setup surface */
+.company-setup-page .company-setup-toolbar h2 {
+  line-height: 1.25;
+}
+
+.company-setup-page .company-add-button,
+.company-setup-page .company-form-actions .btn {
+  min-height: 38px;
+}
+
+.company-setup-page .form-control {
+  min-height: 38px;
+}
+
+.company-setup-page .alert {
+  margin-bottom: 20px;
+}
+
+.company-table {
+  min-width: 720px;
+}
+
+.company-table th,
+.company-table td {
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.company-table-wrapper {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}
+
 /* Dashboard Cards */
 .dashboard-card {
   border: 1px solid #e5e7eb;
@@ -195,6 +281,11 @@ body {
   }
 
   .sidebar-menu a {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+
+  .sidebar-parent {
     padding: 10px 12px;
     font-size: 13px;
   }
@@ -247,6 +338,20 @@ body {
     display: none;
   }
 
+  .sidebar-parent {
+    justify-content: center;
+    padding: 12px 5px;
+  }
+
+  .sidebar-parent span,
+  .sidebar-chevron {
+    display: none;
+  }
+
+  .sidebar-submenu {
+    padding-left: 0;
+  }
+
   .top-header h5 {
     font-size: 16px;
   }
@@ -257,5 +362,25 @@ body {
 
   .main-content {
     padding: 15px;
+  }
+
+  .company-setup-page .company-setup-toolbar {
+    align-items: stretch !important;
+  }
+
+  .company-setup-page .company-setup-toolbar h2 {
+    font-size: 21px;
+  }
+
+  .company-setup-page .company-add-button {
+    width: 100%;
+  }
+
+  .company-setup-page .company-form-actions {
+    flex-direction: column-reverse;
+  }
+
+  .company-setup-page .company-form-actions .btn {
+    width: 100%;
   }
 }

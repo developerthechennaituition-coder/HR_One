@@ -1,17 +1,25 @@
+import { useState } from 'react'
 import Sidebar from './Sidebar'
 import Header from './Header'
+import CompanySetup from '../pages/CompanySetup'
 
 function MainLayout() {
+  const [activePage, setActivePage] = useState(() =>
+    window.location.hash === '#company-setup' ? 'company-setup' : 'dashboard',
+  )
+
   return (
     <div className="hrms-layout">
 
-      <Sidebar />
+      <Sidebar activePage={activePage} onNavigate={setActivePage} />
 
       <div className="main-area">
 
-        <Header />
+        <Header activePage={activePage} />
 
         <main className="main-content">
+          {activePage === 'company-setup' ? <CompanySetup /> : (
+            <>
           <h2>Welcome to HRMS</h2>
 
           <p>
@@ -48,6 +56,8 @@ function MainLayout() {
             </div>
 
           </div>
+            </>
+          )}
         </main>
 
       </div>

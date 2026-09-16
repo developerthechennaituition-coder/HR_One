@@ -13,7 +13,7 @@ function App() {
       .catch(() => {
         setBackendStatus('Backend connection failed')
       })
-  }, [])
+  }, []) 
 
   return (
     <>

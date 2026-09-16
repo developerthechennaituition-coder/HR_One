@@ -29,11 +29,13 @@ F:\HRMS-Project
 │   ├── package.json
 │   └── ...
 └── backend/
-    ├── .venv/
+     ├── venv/
     ├── app/
     │   ├── db/
     │   │   └── mongodb.py
     │   └── main.py
+     ├── tests/
+     │   └── test_companies_api.py
     ├── .env
     └── requirements.txt
 ```
@@ -64,7 +66,7 @@ Open a separate terminal:
 
 ``` powershell
 cd F:\HRMS-Project\backend
-.\.venv\Scripts\Activate.ps1
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
@@ -85,6 +87,83 @@ MONGODB_DATABASE=hrms_db
 ```
 
 MongoDB must be running before testing the backend database connection.
+
+## S1 - F001 Company / Legal Entity Setup
+
+Status: **Initial implementation completed.**
+
+Implemented capabilities:
+
+-   Company / Legal Entity UI in the HRMS shell.
+-   Create company flow from the React form.
+-   Company listing loaded from MongoDB through FastAPI.
+-   Edit and update company flow.
+-   Reversible company deactivation flow.
+-   FastAPI CRUD/status endpoints.
+-   MongoDB persistence in `hrms_db.companies`.
+-   React-to-FastAPI-to-MongoDB integration.
+-   Basic field validation, loading states, and error messages.
+-   Responsive table and form layout for desktop and mobile.
+-   Dynamic header title for the active page.
+
+### Initial Company Document
+
+The current implementation uses this initial schema. It is not a final
+production schema and may change after business confirmation:
+
+``` json
+{
+     "company": "...",
+     "legal_entity": "...",
+     "branch": "...",
+     "location": "...",
+     "is_active": true,
+     "created_at": "...",
+     "updated_at": "..."
+}
+```
+
+The `companies` collection is initialized when the FastAPI application starts.
+MongoDB validation requires the four initial business fields:
+`company`, `legal_entity`, `branch`, and `location`.
+
+### Company API
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/companies` | Create a company |
+| `GET` | `/api/companies` | List active companies |
+| `GET` | `/api/companies/{id}` | Get one active company |
+| `PUT` | `/api/companies/{id}` | Update an active company |
+| `DELETE` | `/api/companies/{id}` | Deactivate a company |
+
+Swagger documentation is available at `http://127.0.0.1:8000/docs`.
+
+### Validation and Testing
+
+Backend validation tests are located in
+`backend/tests/test_companies_api.py`. They cover valid payloads, blank
+fields, create/update behavior, deactivation, invalid IDs, backend errors,
+and API route registration.
+
+Run them from the backend directory:
+
+``` powershell
+cd F:\HRMS-Project\backend
+.\venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Manual verification should also confirm that a saved company remains visible
+after refreshing the browser and that edited values remain after refresh.
+
+### Unconfirmed Business Rules
+
+-   **Permanent deletion policy: TBD / Business Confirmation Required.**
+-   The current `DELETE` endpoint only sets `is_active` to `false` and retains
+     the MongoDB document.
+-   Restore/reactivation behavior is not defined yet.
+-   Final production fields, uniqueness rules, audit requirements, and
+     authorization rules require business confirmation.
 
 ## Today's Completed Items
 
@@ -144,9 +223,28 @@ FastAPI
 MongoDB
 ```
 
+     ### F001 Integration Verification
+
+     The Company Setup screen has been verified through the full flow:
+
+     ``` text
+     React company form
+          |
+          | GET / POST / PUT / DELETE
+          v
+     FastAPI company endpoints
+          |
+          v
+     MongoDB hrms_db.companies
+          |
+          v
+     Company table after load or refresh
+     ```
+
 ## Current Development Status
 
-The technical foundation and base UI shell are complete.
+The technical foundation, base UI shell, and the initial F001 Company / Legal
+Entity module are complete.
 
 The following business modules are not implemented yet:
 
