@@ -3,6 +3,7 @@
 
 # Python virtual environment
 venv/
+venv312/
 
 # Node dependencies
 node_modules/
