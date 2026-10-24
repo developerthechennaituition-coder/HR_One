@@ -1,0 +1,598 @@
+.employee-details-save-button {
+  height: 38px;
+
+  padding: 0 17px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 7px;
+
+  font-size: 14px;
+  font-weight: 600;
+
+  cursor: pointer;
+
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.employee-details-edit-button {
+  border: 1px solid #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.employee-details-edit-button:hover {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+
+.employee-details-cancel-button {
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+  color: #374151;
+}
+
+.employee-details-cancel-button:hover {
+  background: #f9fafb;
+}
+
+.employee-details-save-button {
+  border: 1px solid #16a34a;
+  background: #16a34a;
+  color: #ffffff;
+}
+
+.employee-details-save-button:hover {
+  background: #15803d;
+  border-color: #15803d;
+}
+
+.employee-details-edit-button:disabled,
+.employee-details-cancel-button:disabled,
+.employee-details-save-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* =========================================================
+   SUCCESS / ERROR
+========================================================= */
+
+.employee-details-success,
+.employee-details-error {
+  width: 100%;
+  min-height: 44px;
+
+  box-sizing: border-box;
+
+  display: flex;
+  align-items: center;
+
+  gap: 10px;
+
+  padding: 10px 14px;
+
+  margin-bottom: 18px;
+
+  border-radius: 7px;
+
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.employee-details-success {
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.employee-details-error {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.employee-details-message-icon {
+  width: 22px;
+  height: 22px;
+
+  flex-shrink: 0;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 50%;
+
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.employee-details-success
+  .employee-details-message-icon {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.employee-details-error
+  .employee-details-message-icon {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+/* =========================================================
+   SECTION
+========================================================= */
+
+.employee-details-section {
+  width: 100%;
+
+  margin-bottom: 20px;
+
+  background: #ffffff;
+
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+
+  overflow: hidden;
+}
+
+.employee-details-section-header {
+  width: 100%;
+
+  padding: 18px 22px;
+
+  background: #f9fafb;
+
+  border-bottom: 1px solid #e5e7eb;
+
+  box-sizing: border-box;
+}
+
+.employee-details-section-header h3 {
+  margin: 0;
+
+  font-size: 16px;
+  line-height: 1.35;
+  font-weight: 700;
+
+  color: #1f2937;
+}
+
+.employee-details-section-header p {
+  margin: 5px 0 0;
+
+  font-size: 13px;
+  line-height: 1.5;
+
+  color: #6b7280;
+}
+
+/* =========================================================
+   GRID
+========================================================= */
+
+.employee-details-grid {
+  width: 100%;
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(2, minmax(0, 1fr));
+
+  column-gap: 24px;
+  row-gap: 0;
+
+  padding: 20px 22px;
+
+  box-sizing: border-box;
+}
+
+/* =========================================================
+   FIELD
+========================================================= */
+
+.employee-details-field {
+  min-width: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  gap: 7px;
+
+  min-height: 78px;
+
+  padding: 0 0 18px;
+
+  box-sizing: border-box;
+}
+
+.employee-details-label {
+  display: block;
+
+  margin: 0;
+
+  font-size: 13px;
+  line-height: 1.4;
+  font-weight: 600;
+
+  color: #374151;
+}
+
+.employee-details-value {
+  width: 100%;
+  min-height: 40px;
+
+  box-sizing: border-box;
+
+  display: flex;
+  align-items: center;
+
+  padding: 9px 12px;
+
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+
+  background: #f9fafb;
+
+  color: #1f2937;
+
+  font-size: 14px;
+  line-height: 1.4;
+
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* =========================================================
+   INPUT / SELECT
+========================================================= */
+
+.employee-details-input {
+  width: 100%;
+  height: 40px;
+
+  box-sizing: border-box;
+
+  padding: 0 12px;
+
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+
+  background: #ffffff;
+  color: #111827;
+
+  font-size: 14px;
+
+  outline: none;
+
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.employee-details-input:focus {
+  border-color: #2563eb;
+
+  box-shadow:
+    0 0 0 3px rgba(37, 99, 235, 0.10);
+}
+
+.employee-details-input:disabled {
+  background: #f3f4f6;
+  cursor: not-allowed;
+}
+
+/* =========================================================
+   CHECKBOX
+========================================================= */
+
+.employee-details-checkbox {
+  min-height: 40px;
+
+  display: inline-flex;
+  align-items: center;
+
+  gap: 9px;
+
+  padding: 0 12px;
+
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+
+  background: #f9fafb;
+
+  cursor: pointer;
+
+  box-sizing: border-box;
+}
+
+.employee-details-checkbox input {
+  width: 16px;
+  height: 16px;
+
+  margin: 0;
+
+  cursor: pointer;
+}
+
+.employee-details-checkbox span {
+  font-size: 14px;
+  font-weight: 500;
+
+  color: #374151;
+}
+
+/* =========================================================
+   STATUS
+========================================================= */
+
+.employee-status-active,
+.employee-status-inactive {
+  display: inline-flex;
+  align-items: center;
+
+  min-height: 26px;
+
+  padding: 3px 10px;
+
+  border-radius: 999px;
+
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.employee-status-active {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.employee-status-inactive {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+/* =========================================================
+   MONOSPACE USER ID
+========================================================= */
+
+.employee-details-mono {
+  font-family:
+    "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
+
+  font-size: 13px;
+}
+
+/* =========================================================
+   READ ONLY NOTE
+========================================================= */
+
+.employee-details-readonly-note {
+  width: 100%;
+
+  display: flex;
+  align-items: flex-start;
+
+  gap: 12px;
+
+  padding: 14px 16px;
+
+  margin-top: 4px;
+  margin-bottom: 16px;
+
+  box-sizing: border-box;
+
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+
+  background: #eff6ff;
+  color: #1e40af;
+}
+
+.employee-details-readonly-icon {
+  width: 22px;
+  height: 22px;
+
+  flex-shrink: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 50%;
+
+  background: #dbeafe;
+  color: #1d4ed8;
+
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.employee-details-readonly-content {
+  min-width: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  gap: 3px;
+}
+
+.employee-details-readonly-content strong {
+  font-size: 13px;
+  line-height: 1.4;
+  font-weight: 700;
+}
+
+.employee-details-readonly-content span {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #1e40af;
+}
+
+/* =========================================================
+   CURRENT USER NOTE
+========================================================= */
+
+.employee-details-current-user-note {
+  width: 100%;
+
+  box-sizing: border-box;
+
+  padding: 12px 16px;
+
+  margin-bottom: 20px;
+
+  border: 1px solid #e5e7eb;
+  border-radius: 7px;
+
+  background: #f9fafb;
+
+  color: #4b5563;
+
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* =========================================================
+   LOADING
+========================================================= */
+
+.employee-details-loading {
+  min-height: 360px;
+
+  display: flex;
+  flex-direction: column;
+
+  align-items: center;
+  justify-content: center;
+
+  gap: 12px;
+
+  color: #6b7280;
+
+  font-size: 14px;
+}
+
+.employee-details-spinner {
+  width: 30px;
+  height: 30px;
+
+  border: 3px solid #e5e7eb;
+  border-top-color: #2563eb;
+
+  border-radius: 50%;
+
+  animation:
+    employee-details-spin 0.8s
+    linear infinite;
+}
+
+@keyframes employee-details-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* =========================================================
+   RESPONSIVE - TABLET
+========================================================= */
+
+@media (max-width: 900px) {
+  .employee-details-page {
+    padding: 20px;
+  }
+
+  .employee-details-grid {
+    column-gap: 18px;
+    padding: 18px;
+  }
+}
+
+/* =========================================================
+   RESPONSIVE - MOBILE
+========================================================= */
+
+@media (max-width: 700px) {
+  .employee-details-page {
+    padding: 16px;
+  }
+
+  .employee-details-header {
+    flex-direction: column;
+    align-items: stretch;
+
+    gap: 16px;
+  }
+
+  .employee-details-header-left {
+    align-items: flex-start;
+  }
+
+  .employee-details-header-actions {
+    width: 100%;
+
+    justify-content: flex-end;
+  }
+
+  .employee-details-grid {
+    grid-template-columns: 1fr;
+
+    padding: 18px;
+  }
+
+  .employee-details-section-header {
+    padding: 16px 18px;
+  }
+}
+
+/* =========================================================
+   SMALL MOBILE
+========================================================= */
+
+@media (max-width: 480px) {
+  .employee-details-page {
+    padding: 12px;
+  }
+
+  .employee-details-header-left {
+    gap: 11px;
+  }
+
+  .employee-details-title-block h2 {
+    font-size: 20px;
+  }
+
+  .employee-details-title-block p {
+    font-size: 12px;
+  }
+
+  .employee-details-header-actions {
+    justify-content: stretch;
+  }
+
+  .employee-details-header-actions
+    button {
+    flex: 1;
+  }
+
+  .employee-details-back-button {
+    padding: 0 10px;
+  }
+
+  .employee-details-grid {
+    padding: 16px;
+  }
+
+  .employee-details-section-header {
+    padding: 15px 16px;
+  }
+}
+

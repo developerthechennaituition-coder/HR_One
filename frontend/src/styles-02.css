@@ -1,0 +1,593 @@
+.hierarchy-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 36px;
+  height: 36px;
+
+  flex: 0 0 36px;
+
+  color: #2563eb;
+  background: #eff6ff;
+
+  border-radius: 6px;
+}
+
+.organization-stat strong,
+.organization-stat small {
+  display: block;
+}
+
+.organization-stat strong {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.organization-stat small {
+  margin-top: 5px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.organization-card {
+  overflow: hidden;
+}
+
+.organization-list-head {
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.organization-filters {
+  min-width: min(100%, 390px);
+}
+
+.organization-filters .form-select {
+  max-width: 170px;
+}
+
+.organization-table {
+  min-width: 650px;
+}
+
+.organization-table th {
+  color: #6b7280;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: #f8fafc;
+}
+
+.organization-table td,
+.organization-table th {
+  padding: 14px 20px;
+}
+
+.organization-description {
+  max-width: 180px;
+}
+
+.hierarchy-heading-icon {
+  color: #2563eb;
+  font-size: 22px;
+}
+
+.hierarchy-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  min-height: 58px;
+
+  padding: 9px 10px;
+
+  border-left: 2px solid #dbeafe;
+}
+
+.hierarchy-item > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.hierarchy-item strong,
+.hierarchy-item small {
+  display: block;
+
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hierarchy-item small {
+  margin-top: 3px;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+.hierarchy-kind {
+  color: #6b7280;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.hierarchy-root {
+  border-left-color: #2563eb;
+  background: #f8fbff;
+}
+
+.hierarchy-team {
+  margin-top: 4px;
+  border-left-color: #e5e7eb;
+}
+
+.hierarchy-node + .hierarchy-node,
+.hierarchy-unit + .hierarchy-node {
+  margin-top: 6px;
+}
+
+.empty-hierarchy {
+  padding: 34px 16px;
+
+  color: #6b7280;
+  text-align: center;
+
+  border: 1px dashed #cbd5e1;
+  border-radius: 6px;
+}
+
+.empty-hierarchy > i {
+  display: block;
+  margin-bottom: 10px;
+
+  color: #94a3b8;
+  font-size: 25px;
+}
+
+.organization-form {
+  border-top: 3px solid #2563eb !important;
+}
+
+
+/* =========================================================
+   Holiday Calendar Surface
+   ========================================================= */
+
+.holiday-page .eyebrow {
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.holiday-card,
+.holiday-form-card {
+  overflow: hidden;
+}
+
+.holiday-list-header,
+.holiday-section-header {
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.holiday-calendar-list {
+  max-height: 610px;
+  overflow-y: auto;
+}
+
+.holiday-calendar-item {
+  display: flex;
+  align-items: center;
+
+  width: 100%;
+
+  gap: 12px;
+
+  padding: 15px 20px;
+
+  color: #1f2937;
+  text-align: left;
+
+  background: #ffffff;
+
+  border: 0;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.holiday-calendar-item:hover,
+.holiday-calendar-item.active {
+  background: #f8fbff;
+}
+
+.holiday-calendar-item.active {
+  box-shadow: inset 3px 0 #2563eb;
+}
+
+.holiday-calendar-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 36px;
+  height: 36px;
+
+  flex: 0 0 36px;
+
+  color: #2563eb;
+  background: #eff6ff;
+
+  border-radius: 6px;
+}
+
+.holiday-calendar-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.holiday-calendar-copy strong,
+.holiday-calendar-copy small {
+  display: block;
+
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.holiday-calendar-copy small {
+  margin-top: 3px;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+.holiday-calendar-item > i {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.holiday-inline-form {
+  background: #f8fafc;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.holiday-table {
+  min-width: 650px;
+}
+
+.holiday-table th {
+  color: #6b7280;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: #f8fafc;
+}
+
+.holiday-table td,
+.holiday-table th {
+  padding: 14px 20px;
+}
+
+.holiday-table td small {
+  font-size: 11px;
+}
+
+.holiday-type {
+  display: inline-block;
+
+  padding: 4px 8px;
+
+  color: #1d4ed8;
+
+  font-size: 11px;
+
+  background: #eff6ff;
+
+  border-radius: 4px;
+}
+
+.assignment-list {
+  padding: 0 20px;
+}
+
+.assignment-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  padding: 13px 0;
+
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.assignment-row:last-child {
+  border-bottom: 0;
+}
+
+.assignment-row > span:nth-child(2) {
+  min-width: 0;
+}
+
+.assignment-row strong,
+.assignment-row small {
+  display: block;
+}
+
+.assignment-row small {
+  margin-top: 3px;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+.assignment-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 34px;
+  height: 34px;
+
+  flex: 0 0 34px;
+
+  color: #2563eb;
+  font-weight: 700;
+
+  background: #dbeafe;
+
+  border-radius: 50%;
+}
+
+.empty-holiday {
+  text-align: center;
+}
+
+.empty-holiday > i {
+  display: block;
+  margin-bottom: 12px;
+
+  color: #94a3b8;
+  font-size: 34px;
+}
+
+.holiday-form-card {
+  border-top: 3px solid #2563eb !important;
+}
+
+
+/* =========================================================
+   Dashboard Cards
+   ========================================================= */
+
+.dashboard-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.04);
+}
+
+.dashboard-card h6 {
+  color: #6b7280;
+  margin-bottom: 10px;
+}
+
+.dashboard-card h3 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 700;
+}
+
+
+/* =========================================================
+   Responsive Layout
+   ========================================================= */
+
+@media (max-width: 768px) {
+  .sidebar {
+    width: 200px;
+  }
+
+  .sidebar-brand {
+    padding: 20px 15px;
+  }
+
+  .sidebar-brand h4 {
+    font-size: 20px;
+  }
+
+  .sidebar-menu a {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+
+  .sidebar-parent {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+
+  .top-header {
+    padding: 0 15px;
+  }
+
+  .main-content {
+    padding: 20px;
+  }
+
+  .main-content h2 {
+    font-size: 22px;
+  }
+}
+
+
+@media (max-width: 576px) {
+  .sidebar {
+    width: 70px;
+  }
+
+  .sidebar-brand {
+    text-align: center;
+    padding: 18px 5px;
+  }
+
+  .sidebar-brand h4 {
+    font-size: 16px;
+  }
+
+  .sidebar-brand small {
+    display: none;
+  }
+
+  .sidebar-menu {
+    padding: 15px 5px;
+  }
+
+  .sidebar-menu a {
+    justify-content: center;
+    padding: 12px 5px;
+  }
+
+  .sidebar-menu a i {
+    margin: 0;
+  }
+
+  .sidebar-menu a span {
+    display: none;
+  }
+
+  .sidebar-parent {
+    justify-content: center;
+    padding: 12px 5px;
+  }
+
+  .sidebar-parent span,
+  .sidebar-chevron {
+    display: none;
+  }
+
+  .sidebar-submenu {
+    padding-left: 0;
+  }
+
+  .top-header h5 {
+    font-size: 16px;
+  }
+
+  .user-info > div:last-child {
+    display: none;
+  }
+
+  .main-content {
+    padding: 15px;
+  }
+
+  .company-setup-page .company-setup-toolbar {
+    align-items: stretch !important;
+  }
+
+  .company-setup-page .company-setup-toolbar h2 {
+    font-size: 21px;
+  }
+
+  .company-setup-page .company-add-button {
+    width: 100%;
+  }
+
+  .company-setup-page .company-form-actions {
+    flex-direction: column-reverse;
+  }
+
+  .company-setup-page .company-form-actions .btn {
+    width: 100%;
+  }
+}
+
+/* =========================================================
+   Notification wrapper and Notification Panel
+   ========================================================= */
+.notification-wrapper {
+  position: relative;
+  overflow: visible;
+}
+
+.notification-panel {
+  width: 390px;
+  max-width: calc(100vw - 24px);
+  box-sizing: border-box;
+}
+
+@media (max-width: 576px) {
+  .notification-panel {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+    right: -12px;
+  }
+}
+
+@media (max-width: 400px) {
+  .notification-panel {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+    right: -8px;
+  }
+}
+
+/* ============================================================
+   TEAM MEMBERS
+   ============================================================ */
+
+.team-members-page,
+.team-member-details-page {
+  width: 100%;
+  max-width: 100%;
+}
+
+
+/* ============================================================
+   PAGE HEADER
+   ============================================================ */
+
+.team-members-page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+
+.team-members-title-area {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.team-members-title-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #eaf2ff;
+  color: #0d6efd;
+  font-size: 21px;
+  flex-shrink: 0;
+}
+
+.team-members-page-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.team-members-page-subtitle {
+  margin: 4px 0 0;
+  color: #6c757d;
+  font-size: 14px;
+}
+
+
+/* ============================================================
+   MANAGER SUMMARY
+   ============================================================ */
+

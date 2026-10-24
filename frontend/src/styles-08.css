@@ -1,0 +1,80 @@
+/*
+ * WFH mobile/public verification scrolling.
+ * The authenticated HRMS shell uses a fixed-height layout with body overflow
+ * locked. The QR/email verification route is rendered outside that shell and
+ * must use normal document scrolling on phones.
+ */
+html.wfh-public-scroll,
+body.wfh-public-scroll {
+  height: auto !important;
+  min-height: 100%;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch;
+}
+
+body.wfh-public-scroll {
+  min-height: 100vh;
+  min-height: 100dvh;
+  overscroll-behavior-y: auto;
+}
+
+body.wfh-public-scroll #root {
+  height: auto !important;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: visible !important;
+}
+
+.wfh-public-page {
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+.wfh-public-page .container-fluid {
+  min-width: 0;
+}
+
+.wfh-public-page .card,
+.wfh-public-page .card-body,
+.wfh-public-page .alert {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.wfh-public-page .wfh-camera-frame,
+.wfh-public-page video {
+  max-width: 100%;
+}
+
+.wfh-public-page .table-responsive {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 576px) {
+  .wfh-public-page {
+    padding-left: max(0.5rem, env(safe-area-inset-left));
+    padding-right: max(0.5rem, env(safe-area-inset-right));
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+
+  .wfh-public-page h1,
+  .wfh-public-page h2 {
+    overflow-wrap: anywhere;
+  }
+
+  .wfh-public-page .btn {
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .wfh-public-page .wfh-camera-frame {
+    width: 100%;
+  }
+}

@@ -1,0 +1,606 @@
+
+.team-attendance-filters {
+  display: flex;
+  gap: 8px;
+}
+
+.team-attendance-filters select {
+  min-width: 135px;
+}
+
+
+/* ============================================================
+   ATTENDANCE SUMMARY
+   ============================================================ */
+
+.team-attendance-summary-card {
+  padding: 16px;
+  border-radius: 10px;
+  border: 1px solid;
+}
+
+.team-attendance-summary-card span,
+.team-attendance-summary-card strong,
+.team-attendance-summary-card small {
+  display: block;
+}
+
+.team-attendance-summary-card span {
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.team-attendance-summary-card strong {
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.team-attendance-summary-card small {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.team-attendance-summary-card.present {
+  background: #f0faf4;
+  border-color: #c8ecd8;
+  color: #198754;
+}
+
+.team-attendance-summary-card.absent {
+  background: #fff5f5;
+  border-color: #f3c6ca;
+  color: #dc3545;
+}
+
+.team-attendance-summary-card.leave {
+  background: #f8f3ff;
+  border-color: #dfcdf7;
+  color: #6f42c1;
+}
+
+
+/* ============================================================
+   ATTENDANCE LEGEND
+   ============================================================ */
+
+.team-attendance-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  margin-bottom: 16px;
+}
+
+.team-attendance-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: #6c757d;
+}
+
+.team-attendance-legend-item > span:first-child {
+  width: 17px;
+  height: 17px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+
+/* ============================================================
+   ATTENDANCE CALENDAR
+   ============================================================ */
+
+.team-attendance-calendar-wrapper {
+  border: 1px solid #e7eaf0;
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.team-attendance-calendar-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+.team-attendance-week-header,
+.team-attendance-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.team-attendance-week-header {
+  margin-bottom: 7px;
+}
+
+.team-attendance-week-header > div {
+  text-align: center;
+  color: #6c757d;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px;
+}
+
+.team-attendance-day {
+  width: 100%;
+  min-height: 70px;
+  border-radius: 8px;
+  padding: 5px 3px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  transition:
+    transform 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+.team-attendance-day:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.12);
+}
+
+.team-calendar-weekday {
+  font-size: 9px;
+  opacity: 0.85;
+  line-height: 1.1;
+}
+
+.team-calendar-day-number {
+  font-size: 15px;
+  line-height: 1.3;
+  margin-top: 2px;
+}
+
+.team-calendar-status {
+  font-size: 8px;
+  font-weight: 600;
+  max-width: 95%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+}
+
+.team-calendar-empty-cell {
+  min-height: 70px;
+}
+
+
+/* ============================================================
+   SELECTED ATTENDANCE
+   ============================================================ */
+
+.team-selected-attendance-card {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid #dce3ea;
+  border-radius: 10px;
+  background: #fafbfc;
+}
+
+.team-selected-attendance-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  margin-bottom: 18px;
+}
+
+.team-selected-attendance-header span:first-child,
+.team-selected-info span {
+  display: block;
+  color: #6c757d;
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+
+.team-selected-attendance-header strong {
+  font-size: 15px;
+}
+
+.team-selected-status {
+  padding: 7px 11px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.team-selected-status.present {
+  background: #e9f7ef;
+  color: #198754;
+}
+
+.team-selected-status.absent {
+  background: #fff0f1;
+  color: #dc3545;
+}
+
+.team-selected-status.leave {
+  background: #f8f3ff;
+  color: #6f42c1;
+}
+
+.team-selected-status.holiday {
+  background: #e6f5f8;
+  color: #0b3d4a;
+}
+
+.team-selected-status.notmarked {
+  background: #fff4df;
+  color: #7a5a2f;
+}
+
+.team-selected-info {
+  padding: 12px;
+  background: #fff;
+  border: 1px solid #e7eaf0;
+  border-radius: 8px;
+}
+
+.team-selected-info strong {
+  font-size: 13px;
+}
+
+.team-selected-empty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #6c757d;
+  font-size: 13px;
+  padding: 10px 0;
+}
+
+.team-selected-empty i {
+  font-size: 20px;
+}
+
+
+/* ============================================================
+   LOADING
+   ============================================================ */
+
+.team-member-details-loading {
+  min-height: 400px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 9px;
+  color: #495057;
+}
+
+
+/* ============================================================
+   ATTENDANCE LOADING
+   ============================================================ */
+
+.team-member-attendance-loading {
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #6c757d;
+}
+
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+
+@media (max-width: 991.98px) {
+  .team-members-page-header {
+    align-items: flex-start;
+  }
+
+  .team-manager-summary {
+    width: 100%;
+  }
+
+  .team-members-desktop-table {
+    display: none;
+  }
+
+  .team-members-mobile-list {
+    display: block;
+  }
+
+  .team-member-profile-hero {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .team-member-hero-status {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .team-members-page-title {
+    font-size: 21px;
+  }
+
+  .team-members-page-subtitle {
+    font-size: 13px;
+  }
+
+  .team-members-filter-card,
+  .team-member-section-card {
+    padding: 16px;
+  }
+
+  .team-filter-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .team-members-summary-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .team-member-profile-hero {
+    padding: 18px;
+  }
+
+  .team-member-profile-main {
+    align-items: flex-start;
+  }
+
+  .team-member-large-avatar {
+    width: 60px;
+    height: 60px;
+    font-size: 21px;
+  }
+
+  .team-member-hero-content h2 {
+    font-size: 20px;
+  }
+
+  .team-member-hero-meta {
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .team-attendance-heading {
+    flex-direction: column;
+  }
+
+  .team-attendance-filters {
+    width: 100%;
+  }
+
+  .team-attendance-filters select {
+    width: 50%;
+    min-width: 0;
+  }
+
+  .team-attendance-calendar-wrapper {
+    padding: 10px;
+  }
+
+  .team-attendance-calendar-grid,
+  .team-attendance-week-header {
+    gap: 4px;
+  }
+
+  .team-attendance-day,
+  .team-calendar-empty-cell {
+    min-height: 56px;
+  }
+
+  .team-calendar-status {
+    display: none;
+  }
+
+  .team-calendar-day-number {
+    font-size: 13px;
+  }
+
+  .team-selected-attendance-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .team-members-page-header {
+    gap: 14px;
+  }
+
+  .team-members-title-area {
+    align-items: flex-start;
+  }
+
+  .team-members-title-icon {
+    width: 42px;
+    height: 42px;
+  }
+
+  .team-manager-summary {
+    min-width: 0;
+  }
+
+  .team-mobile-member-header {
+    flex-direction: column;
+  }
+
+  .team-mobile-member-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .team-member-name-cell {
+    min-width: 0;
+  }
+
+  .team-member-name {
+    max-width: 180px;
+  }
+
+  .team-member-email {
+    max-width: 180px;
+  }
+
+  .team-attendance-week-header > div {
+    font-size: 9px;
+  }
+
+  .team-attendance-day,
+  .team-calendar-empty-cell {
+    min-height: 50px;
+  }
+
+  .team-calendar-weekday {
+    font-size: 8px;
+  }
+
+  .team-calendar-day-number {
+    font-size: 12px;
+  }
+}
+
+/* =========================================================
+   EMPLOYEE DETAILS PAGE
+========================================================= */
+
+.employee-details-page {
+  width: 100%;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px 28px 40px;
+  box-sizing: border-box;
+}
+
+/* =========================================================
+   HEADER
+========================================================= */
+
+.employee-details-header {
+  width: 100%;
+  min-height: 68px;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  gap: 24px;
+  margin-bottom: 22px;
+
+  box-sizing: border-box;
+}
+
+.employee-details-header-left {
+  min-width: 0;
+
+  display: flex;
+  align-items: center;
+
+  gap: 18px;
+}
+
+.employee-details-title-block {
+  min-width: 0;
+}
+
+.employee-details-title-block h2 {
+  margin: 0;
+
+  font-size: 24px;
+  line-height: 1.25;
+  font-weight: 700;
+
+  color: #1f2937;
+}
+
+.employee-details-title-block p {
+  margin: 5px 0 0;
+
+  font-size: 13px;
+  line-height: 1.5;
+
+  color: #6b7280;
+}
+
+/* =========================================================
+   BACK BUTTON
+========================================================= */
+
+.employee-details-back-button {
+  flex-shrink: 0;
+
+  height: 38px;
+  padding: 0 13px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  gap: 7px;
+
+  border: 1px solid #d1d5db;
+  border-radius: 7px;
+
+  background: #ffffff;
+  color: #374151;
+
+  font-size: 14px;
+  font-weight: 600;
+
+  cursor: pointer;
+
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.employee-details-back-button:hover {
+  background: #f9fafb;
+  border-color: #9ca3af;
+}
+
+.employee-details-back-button:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.employee-details-back-icon {
+  font-size: 17px;
+  line-height: 1;
+}
+
+/* =========================================================
+   HEADER ACTIONS
+========================================================= */
+
+.employee-details-header-actions {
+  flex-shrink: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+
+  gap: 10px;
+}
+
+/* =========================================================
+   BUTTONS
+========================================================= */
+
+.employee-details-edit-button,
+.employee-details-cancel-button,
+.employee-details-save-button {
+  height: 38px;
+  padding: 0 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}

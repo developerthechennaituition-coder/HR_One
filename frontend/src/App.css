@@ -167,7 +167,7 @@
 
   &::before,
   &::after {
-    content: '';
+    content: "";
     position: absolute;
     top: -4.5px;
     border: 5px solid transparent;
@@ -181,4 +181,14 @@
     right: 0;
     border-right-color: var(--border);
   }
+}
+
+
+/* Keep Monthly Attendance Details headings visible while scrolling vertically. */
+.monthly-attendance-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: #f8f9fa;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.08);
 }
