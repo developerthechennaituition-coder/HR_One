@@ -6,3 +6,314 @@
 @import "./styles-05.css";
 @import "./styles-06.css";
 @import "./styles-07.css";@import "./styles-08.css";
+
+/* =========================================================
+   Responsive HRMS layout layer
+   Applies to all authenticated pages and form/table surfaces.
+   ========================================================= */
+html,
+body,
+#root {
+  min-width: 320px;
+  max-width: 100%;
+}
+
+body {
+  overflow: hidden;
+}
+
+.hrms-layout,
+.main-area,
+.main-content,
+.main-content > *,
+.main-content .container,
+.main-content .container-fluid,
+.main-content .row,
+.main-content [class*="col-"] {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.main-content {
+  padding: clamp(12px, 2.2vw, 30px);
+  -webkit-overflow-scrolling: touch;
+}
+
+.main-content img,
+.main-content video,
+.main-content canvas,
+.main-content iframe,
+.main-content svg {
+  max-width: 100%;
+}
+
+.main-content input,
+.main-content select,
+.main-content textarea,
+.main-content .form-control,
+.main-content .form-select {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.main-content table {
+  max-width: 100%;
+}
+
+.main-content .table-responsive,
+.main-content [class*="table-wrapper"],
+.main-content [class*="table-wrap"] {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.header-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mobile-menu-toggle,
+.mobile-sidebar-backdrop {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  .main-content {
+    padding: 20px;
+  }
+
+  .sidebar {
+    width: 230px;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .hrms-layout {
+    position: relative;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  .sidebar {
+    position: fixed;
+    z-index: 1050;
+    inset: 0 auto 0 0;
+    width: min(84vw, 300px);
+    height: 100vh;
+    height: 100dvh;
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+    box-shadow: 12px 0 30px rgba(15, 23, 42, 0.16);
+  }
+
+  .sidebar.sidebar-mobile-open {
+    transform: translateX(0);
+  }
+
+  .mobile-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    z-index: 1040;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: rgba(15, 23, 42, 0.48);
+  }
+
+  .main-area {
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+  }
+
+  .top-header {
+    height: auto;
+    min-height: 60px;
+    padding: 10px 12px;
+    gap: 8px;
+  }
+
+  .top-header h5 {
+    font-size: clamp(15px, 4vw, 19px);
+    overflow-wrap: anywhere;
+  }
+
+  .mobile-menu-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 38px;
+    width: 38px;
+    height: 38px;
+    border: 1px solid #e2e8f0;
+    border-radius: 9px;
+    background: #fff;
+    color: #1f2937;
+    font-size: 22px;
+  }
+
+  .header-right {
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .user-info {
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .user-info > span:last-of-type {
+    display: none;
+  }
+
+  .user-info > i {
+    display: none;
+  }
+
+  .main-content {
+    padding: 14px 12px calc(18px + env(safe-area-inset-bottom));
+  }
+
+  .main-content h1 { font-size: clamp(1.35rem, 5vw, 1.8rem); }
+  .main-content h2 { font-size: clamp(1.2rem, 4.5vw, 1.6rem); }
+
+  .main-content .row {
+    --bs-gutter-x: 1rem;
+  }
+
+  .main-content .btn {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .main-content .d-flex {
+    flex-wrap: wrap;
+  }
+
+  .main-content .modal-dialog {
+    margin: 0.5rem;
+    max-width: calc(100% - 1rem);
+  }
+
+  .main-content .modal-body {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 480px) {
+  .top-header {
+    padding: 8px 9px;
+  }
+
+  .header-title-group {
+    gap: 7px;
+  }
+
+  .mobile-menu-toggle {
+    flex-basis: 34px;
+    width: 34px;
+    height: 34px;
+    font-size: 20px;
+  }
+
+  .main-content {
+    padding: 12px 9px calc(16px + env(safe-area-inset-bottom));
+  }
+
+  .main-content .card-body {
+    padding: 12px;
+  }
+
+  .main-content .btn-group,
+  .main-content .input-group {
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .main-content .form-actions,
+  .main-content .page-actions,
+  .main-content .toolbar-actions {
+    width: 100%;
+  }
+
+  .main-content .form-actions .btn,
+  .main-content .page-actions .btn,
+  .main-content .toolbar-actions .btn {
+    flex: 1 1 auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar { transition: none !important; }
+}
+
+/* Mobile drawer: keep navigation labels visible when the drawer is open.
+   styles-02.css contains an older icon-only mobile sidebar rule; these
+   later rules intentionally override it for the slide-in drawer. */
+@media (max-width: 767.98px) {
+  .sidebar {
+    width: min(84vw, 300px) !important;
+    max-width: 300px;
+  }
+
+  .sidebar-brand {
+    text-align: left;
+    padding: 20px 20px;
+  }
+
+  .sidebar-brand h4 {
+    font-size: 20px;
+  }
+
+  .sidebar-brand small {
+    display: block;
+  }
+
+  .sidebar-menu {
+    padding: 15px 10px;
+  }
+
+  .sidebar-menu a {
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 11px 13px;
+    min-height: 42px;
+    white-space: normal;
+  }
+
+  .sidebar-menu a span,
+  .sidebar-parent span {
+    display: inline !important;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .sidebar-menu a i {
+    margin: 0;
+    flex: 0 0 20px;
+  }
+
+  .sidebar-parent {
+    display: flex;
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 11px 13px;
+    width: 100%;
+    text-align: left;
+  }
+
+  .sidebar-chevron {
+    display: inline-block !important;
+    margin-left: auto;
+  }
+
+  .sidebar-submenu {
+    padding-left: 14px;
+  }
+}

@@ -4,15 +4,63 @@ from fastapi import HTTPException
 from app.db.mongodb import db
 
 
-def _company_snapshot() -> dict:
-    company = (
-        db["companies"].find_one({"organization_singleton_key": "primary"})
-        or db["companies"].find_one({})
-        or {}
-    )
+def _company_snapshot(employee_id: str | None = None) -> dict:
+    """Resolve the company snapshot for this employee, without exposing branch code."""
+    employee_id = str(employee_id or "").strip()
+    company = None
+
+    if employee_id:
+        employee = db["employees"].find_one({"employee_id": employee_id}) or {}
+        user = db["users"].find_one({"employee_id": employee_id}) or {}
+        assigned_ids = {
+            str(value)
+            for value in (employee.get("_id"), user.get("_id"), employee_id)
+            if value is not None and str(value).strip()
+        }
+        if assigned_ids:
+            company = db["companies"].find_one({
+                "is_active": {"$ne": False},
+                "employee_ids": {"$in": list(assigned_ids)},
+            })
+
+        if not company:
+            work_location = str(
+                employee.get("work_location")
+                or employee.get("location")
+                or user.get("work_location")
+                or user.get("location")
+                or ""
+            ).strip()
+            if work_location:
+                company = db["companies"].find_one({
+                    "is_active": {"$ne": False},
+                    "$or": [
+                        {"location": {"$regex": f"^{__import__('re').escape(work_location)}$", "$options": "i"}},
+                        {"branch": {"$regex": f"^{__import__('re').escape(work_location)}$", "$options": "i"}},
+                        {"branch_code": {"$regex": f"^{__import__('re').escape(work_location)}$", "$options": "i"}},
+                    ],
+                })
+
+    if not company:
+        active_companies = list(db["companies"].find({"is_active": {"$ne": False}}).limit(2))
+        if len(active_companies) == 1:
+            company = active_companies[0]
+        elif not employee_id:
+            company = db["companies"].find_one({
+                "organization_singleton_key": "primary",
+                "is_active": {"$ne": False},
+            }) or {}
+
+    location = str(company.get("location") or "").strip()
+    branch = str(company.get("branch") or "").strip()
+    display_location = location or branch
+
     return {
         "name": company.get("legal_entity") or company.get("company") or "HRMS",
-        "address": company.get("location") or company.get("branch") or "",
+        "company_name": company.get("company") or company.get("legal_entity") or "HRMS",
+        "address": display_location,
+        "location": location,
+        "branch": branch,
     }
 
 
@@ -351,9 +399,25 @@ def _payslip_pdf_response(row: dict, inline: bool = False):
     # ---------------------------------------------------------
     # PAYSLIP DATA
     # ---------------------------------------------------------
-    company = row.get("company_snapshot") or _company_snapshot() or {}
+    resolved_company = _company_snapshot(row.get("employee_id")) or {}
+    saved_company = row.get("company_snapshot") or {}
+    company = resolved_company
+    if not (company.get("location") or company.get("branch")) and saved_company:
+        # Preserve the stored snapshot only if the current employee assignment
+        # cannot provide a location/branch.
+        company = {
+            **saved_company,
+            **{key: value for key, value in company.items() if value not in (None, "")},
+        }
+    # Prefer the employee-specific company location. Show branch only when the
+    # location is not configured; branch code must never appear under company name.
+    company_address = str(company.get("location") or "").strip()
+    if not company_address:
+        company_address = str(company.get("branch") or "").strip()
+    if not company_address:
+        company_address = str(company.get("address") or "").strip()
+
     company_name = company.get("name") or company.get("company_name") or "THE CHENNAI TUITION LLM"
-    company_address = company.get("address") or ""
 
     period_raw = str(row.get("period") or "")
     period_display = display_period(period_raw)

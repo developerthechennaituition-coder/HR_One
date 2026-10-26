@@ -69,24 +69,70 @@ def money(value: Any, label: str) -> float:
     return float(number.quantize(Decimal("0.01")))
 
 def _company_snapshot(employee_id: str | None = None) -> dict:
-    """Snapshot the branch assigned to this employee, falling back to legacy primary."""
+    """Return a snapshot of the company/branch assigned to this employee."""
     company = None
+    employee_id = str(employee_id or "").strip()
+
     if employee_id:
-        employee = db["employees"].find_one({"employee_id": str(employee_id)}, {"_id": 1})
-        if employee:
-            company = db["companies"].find_one({"employee_ids": str(employee["_id"]), "is_active": True})
-    company = company or db["companies"].find_one({"organization_singleton_key": "primary"}) or db["companies"].find_one({}) or {}
-    branch = company.get("branch") or ""
-    branch_code = company.get("branch_code") or ""
-    location = company.get("location") or ""
-    address_parts = [part for part in (branch, branch_code and f"Branch Code: {branch_code}", location) if part]
+        employee = db["employees"].find_one({"employee_id": employee_id}) or {}
+        user = users_collection.find_one({"employee_id": employee_id}) or {}
+
+        # Company Setup may store the assigned employee as an Employee Master
+        # document ID, login-user ID, or (in older data) the employee_id itself.
+        assigned_ids = {
+            str(value)
+            for value in (employee.get("_id"), user.get("_id"), employee_id)
+            if value is not None and str(value).strip()
+        }
+        if assigned_ids:
+            company = db["companies"].find_one({
+                "is_active": {"$ne": False},
+                "employee_ids": {"$in": list(assigned_ids)},
+            })
+
+        # Legacy fallback: match the employee's recorded work location to a
+        # company branch/location, but never choose an arbitrary branch.
+        if not company:
+            work_location = str(
+                employee.get("work_location")
+                or employee.get("location")
+                or user.get("work_location")
+                or user.get("location")
+                or ""
+            ).strip()
+            if work_location:
+                company = db["companies"].find_one({
+                    "is_active": {"$ne": False},
+                    "$or": [
+                        {"location": {"$regex": f"^{__import__('re').escape(work_location)}$", "$options": "i"}},
+                        {"branch": {"$regex": f"^{__import__('re').escape(work_location)}$", "$options": "i"}},
+                        {"branch_code": {"$regex": f"^{__import__('re').escape(work_location)}$", "$options": "i"}},
+                    ],
+                })
+
+    if not company:
+        active_companies = list(db["companies"].find({"is_active": {"$ne": False}}).limit(2))
+        # Never assign the primary branch arbitrarily to an employee in a
+        # multi-branch organization. Use a fallback only when it is unambiguous.
+        if len(active_companies) == 1:
+            company = active_companies[0]
+        elif not employee_id:
+            company = db["companies"].find_one({
+                "organization_singleton_key": "primary",
+                "is_active": {"$ne": False},
+            }) or {}
+
+    branch = str(company.get("branch") or "").strip()
+    location = str(company.get("location") or "").strip()
+    # Payslip header shows location first; branch is shown only if location is blank.
+    display_location = location or branch
     return {
         "name": company.get("legal_entity") or company.get("company") or "HR One",
         "company_name": company.get("company") or company.get("legal_entity") or "HR One",
         "legal_entity": company.get("legal_entity") or "",
         "branch": branch,
-        "branch_code": branch_code,
-        "address": ", ".join(address_parts),
+        "branch_code": str(company.get("branch_code") or "").strip(),
+        "address": display_location,
         "location": location,
     }
 
@@ -531,6 +577,7 @@ class PayrollRunRequest(BaseModel):
     employee_ids: list[str] | None = None
     paid_days: dict[str, float] = Field(default_factory=dict)
     lop_days: dict[str, float] = Field(default_factory=dict)
+    overtime_amounts: dict[str, float] = Field(default_factory=dict)
 
 
 def _payroll_auth(authorization, x_user_id):
@@ -624,13 +671,18 @@ def calculate_monthly_payroll(payload: PayrollRunRequest,
         earnings, deductions = [], []
         components = profile.get("components", [])
         has_salary_breakdown = any(
-            c.get("category") == "earning" and c.get("included_in_monthly_salary", False)
+            c.get("category") == "earning"
+            and c.get("included_in_monthly_salary", False)
+            and not __import__("re").search(r"\b(?:ot|overtime|over\s*time)\b", str(c.get("name", "")), __import__("re").IGNORECASE)
             for c in components
         )
         # When HR defines Basic/HRA/etc. as a breakdown of monthly salary, use
         # those included components instead of adding them on top of salary.
         gross = Decimal("0.00") if has_salary_breakdown else prorated_base
         for component in components:
+            # OT is entered per employee and payroll month, not in the permanent salary profile.
+            if __import__("re").search(r"\b(?:ot|overtime|over\s*time)\b", str(component.get("name", "")), __import__("re").IGNORECASE):
+                continue
             if component.get("calculation_type") == "percentage":
                 monthly_amount = (_money_decimal(base_monthly) * Decimal(str(component.get("percentage", 0))) / Decimal("100")).quantize(Decimal("0.01"))
             else:
@@ -652,6 +704,18 @@ def calculate_monthly_payroll(payload: PayrollRunRequest,
                     gross += amount
             else:
                 deductions.append(item)
+        raw_overtime = payload.overtime_amounts.get(emp_id, 0)
+        try:
+            overtime_amount = Decimal(str(raw_overtime)).quantize(Decimal("0.01"))
+        except (InvalidOperation, TypeError, ValueError):
+            errors.append({"employee_id": emp_id, "employee_name": profile.get("employee_name", emp_id), "error": "Overtime amount must be a valid number."})
+            continue
+        if not overtime_amount.is_finite() or overtime_amount < 0 or overtime_amount > Decimal("999999999.99"):
+            errors.append({"employee_id": emp_id, "employee_name": profile.get("employee_name", emp_id), "error": "Overtime amount must be between 0 and 999999999.99."})
+            continue
+        if overtime_amount > 0:
+            earnings.append({"name": "Overtime (OT)", "amount": float(overtime_amount)})
+            gross += overtime_amount
         total_deductions = sum((_money_decimal(x["amount"]) for x in deductions), Decimal(0))
         net = max(Decimal(0), gross - total_deductions).quantize(Decimal("0.01"))
         existing_payroll = payroll_collection.find_one({"employee_id": emp_id, "period": period})
@@ -672,7 +736,7 @@ def calculate_monthly_payroll(payload: PayrollRunRequest,
             "unpaid_leave_days": attendance["unpaid_leave_days"], "absent_days": attendance["absent_days"],
             "holiday_days": attendance["holiday_days"], "attendance_review": attendance["review"],
             "monthly_salary": float(base_monthly), "bank_name": profile.get("bank_name", ""), "bank_account_number": profile.get("bank_account_number", ""), "pan_card_number": profile.get("pan_card_number", ""), "salary_per_calendar_day": float((base_monthly / Decimal(days_in_month)).quantize(Decimal("0.01"))),
-            "attendance_proration": float(attendance_proration), "earnings": earnings, "deductions": deductions, "gross_earnings": float(gross),
+            "attendance_proration": float(attendance_proration), "overtime_amount": float(overtime_amount), "earnings": earnings, "deductions": deductions, "gross_earnings": float(gross),
             "total_deductions": float(total_deductions), "net_salary": float(net),
             "status": "Calculated", "salary_snapshot": {k: profile.get(k) for k in ("monthly_salary", "bank_name", "bank_account_number", "pan_card_number", "currency", "components", "effective_from")},
             "company_snapshot": _company_snapshot(emp_id),

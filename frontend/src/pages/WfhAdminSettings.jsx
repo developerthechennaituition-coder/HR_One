@@ -53,6 +53,9 @@ function WfhAdminSettings({ session }) {
       if (employee.is_wfh_enabled && (!employee.wfh_permitted_from || !employee.wfh_permitted_to)) {
         throw new Error("Choose both WFH permitted from and until dates before enabling WFH.");
       }
+      if (employee.is_wfh_enabled && (!employee.wfh_permitted_start_time || !employee.wfh_permitted_end_time)) {
+        throw new Error("WFH start time and end time are mandatory.");
+      }
       if (employee.wfh_permitted_from && employee.wfh_permitted_from < todayIso()) throw new Error("WFH start date must be today or a future date.");
       if (employee.wfh_permitted_to && employee.wfh_permitted_to < todayIso()) throw new Error("WFH end date must be today or a future date.");
       if (employee.wfh_permitted_from && employee.wfh_permitted_to && employee.wfh_permitted_to < employee.wfh_permitted_from) throw new Error("WFH end date must be on or after the start date.");
@@ -159,7 +162,7 @@ function WfhAdminSettings({ session }) {
         <div className="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
           <div>
             <h3 className="h5 mb-1">WFH Settings & Permission Duration</h3>
-            <p className="text-muted small mb-0">Manage WFH access for employee and administrator accounts. Employees register their own current location from WFH Attendance. Start/end dates are required; times are optional.</p>
+            <p className="text-muted small mb-0">Manage WFH access, permitted dates, and mandatory daily start/end times. The same daily schedule applies throughout the selected date range.</p>
           </div>
           <button className="btn btn-outline-secondary btn-sm" type="button" onClick={() => { setLoading(true); loadEmployees(); }} disabled={loading}>Refresh</button>
         </div>
@@ -168,7 +171,7 @@ function WfhAdminSettings({ session }) {
         {loading ? <div className="text-muted py-3">Loading WFH settings...</div> : employees.length === 0 ? <div className="text-muted py-3">No eligible accounts found.</div> : (
           <div className="table-responsive">
             <table className="table table-sm align-middle mb-0">
-              <thead><tr><th>Employee / Role</th><th>WFH Enabled</th><th>Permit From</th><th>Permit Until</th><th>Optional Start Time</th><th>Optional End Time</th><th>Face</th><th>Location</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Employee / Role</th><th>WFH Enabled</th><th>Permit From</th><th>Permit Until</th><th>Required Start Time</th><th>Required End Time</th><th>Face</th><th>Location</th><th>Actions</th></tr></thead>
               <tbody>{employees.map((employee) => {
                 const locationRegistered = employee.home_latitude != null && employee.home_longitude != null;
                 const busy = busyAction.startsWith(`${employee.user_id}:`);
@@ -177,8 +180,8 @@ function WfhAdminSettings({ session }) {
                   <td><div className="form-check form-switch"><input className="form-check-input" type="checkbox" role="switch" id={`wfh-enabled-${employee.user_id}`} checked={Boolean(employee.is_wfh_enabled)} onChange={(event) => updateEmployee(employee.user_id, "is_wfh_enabled", event.target.checked)} aria-label={`Enable WFH for ${employee.name}`} /></div></td>
                   <td><input className="form-control form-control-sm" type="date" min={todayIso()} value={employee.wfh_permitted_from || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_from", event.target.value)} aria-label={`WFH permit start date for ${employee.name}`} /></td>
                   <td><input className="form-control form-control-sm" type="date" min={employee.wfh_permitted_from || todayIso()} value={employee.wfh_permitted_to || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_to", event.target.value)} aria-label={`WFH permit end date for ${employee.name}`} /></td>
-                  <td><input className="form-control form-control-sm" type="time" value={employee.wfh_permitted_start_time || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_start_time", event.target.value)} aria-label={`WFH start time for ${employee.name}`} /></td>
-                  <td><input className="form-control form-control-sm" type="time" value={employee.wfh_permitted_end_time || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_end_time", event.target.value)} aria-label={`WFH end time for ${employee.name}`} /></td>
+                  <td><input className="form-control form-control-sm" type="time" required={Boolean(employee.is_wfh_enabled)} value={employee.wfh_permitted_start_time || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_start_time", event.target.value)} aria-label={`WFH start time for ${employee.name}`} /></td>
+                  <td><input className="form-control form-control-sm" type="time" required={Boolean(employee.is_wfh_enabled)} value={employee.wfh_permitted_end_time || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_end_time", event.target.value)} aria-label={`WFH end time for ${employee.name}`} /></td>
                   <td><button type="button" className={`btn btn-sm ${employee.face_registered ? "btn-outline-success" : "btn-outline-secondary"}`} onClick={() => showFace(employee)}>{employee.face_registered ? "Face Registered" : "Not Registered"}</button></td>
                   <td><button type="button" className={`btn btn-sm ${locationRegistered ? "btn-outline-success" : "btn-outline-secondary"}`} onClick={() => showLocation(employee)}>{locationRegistered ? "Location Registered" : "Not Registered"}</button>{locationRegistered && employee.home_location_accuracy_meters != null && <small className="d-block text-muted mt-1">±{Math.round(employee.home_location_accuracy_meters)} m</small>}</td>
                   <td><div className="d-flex flex-wrap gap-1"><button type="button" className="btn btn-primary btn-sm" onClick={() => saveEmployee(employee)} disabled={savingId === employee.user_id}>{savingId === employee.user_id ? "Saving..." : "Save"}</button><button type="button" className="btn btn-outline-danger btn-sm" onClick={() => resetFace(employee)} disabled={!employee.face_registered || busy}>{busyAction === `${employee.user_id}:face` ? "Resetting..." : "Reset Face"}</button><button type="button" className="btn btn-outline-warning btn-sm" onClick={() => resetLocation(employee)} disabled={!locationRegistered || busy}>{busyAction === `${employee.user_id}:location` ? "Resetting..." : "Reset Location"}</button></div></td>

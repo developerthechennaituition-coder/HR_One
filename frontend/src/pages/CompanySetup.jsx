@@ -34,7 +34,7 @@ function CompanySetup({ currentUser }) {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [feedback, setFeedback] = useState({ type: "", message: "" });
-  const canManage = ["hr admin", "hr manager", "administrator"].includes(
+  const canManage = ["hr admin", "administrator"].includes(
     String(currentUser?.role || "").trim().toLowerCase(),
   );
 
@@ -62,18 +62,52 @@ function CompanySetup({ currentUser }) {
   useEffect(() => {
     const loadCompanies = async () => {
       try {
-        const [response, employeeResponse] = await Promise.all([
+        const [response, employeeResponse, usersResponse] = await Promise.all([
           fetch(API_URL),
           fetch(HRONE_API_BASE + "/api/employees"),
+          fetch(HRONE_API_BASE + "/api/users"),
         ]);
         if (!response.ok) {
           throw new Error(await readError(response));
         }
         const data = await response.json();
         const employeeData = employeeResponse.ok ? await employeeResponse.json() : [];
-        setEmployees(Array.isArray(employeeData) ? employeeData : []);
+        const userData = usersResponse.ok ? await usersResponse.json() : [];
+
+        // Employee Master stores user accounts, while some HRMS installations also
+        // maintain separate records in the employees collection. Include both sources.
+        // Use each record's Mongo id as the assignment key because the backend stores
+        // branch employee_ids against these stable record identifiers.
+        const employeeRecords = [
+          ...(Array.isArray(employeeData) ? employeeData : []),
+          ...(Array.isArray(userData) ? userData.filter((user) =>
+            user?.is_active !== false &&
+            (user?.employee_id || String(user?.role || "").trim().toLowerCase() === "employee")
+          ).map((user) => ({
+            ...user,
+            employee_name: user.employee_name || user.name,
+            email: user.email || user.work_email,
+          })) : []),
+        ];
+        const uniqueEmployees = new Map();
+        employeeRecords.forEach((employee) => {
+          const id = String(employee.id || employee._id || "").trim();
+          if (!id) return;
+          const existing = uniqueEmployees.get(id);
+          uniqueEmployees.set(id, {
+            ...existing,
+            ...employee,
+            id,
+            employee_name: employee.employee_name || employee.name || existing?.employee_name || "Unnamed employee",
+          });
+        });
+        setEmployees([...uniqueEmployees.values()]);
         setCompanies(
-          data.map((company) => ({ ...company, ...toFormCompany(company) })),
+          (Array.isArray(data) ? data : []).map((company) => ({
+            ...company,
+            ...toFormCompany(company),
+            employee_ids: Array.isArray(company.employee_ids) ? company.employee_ids.map(String) : [],
+          })),
         );
       } catch (error) {
         setError(error.message || "Unable to load companies.");
@@ -98,8 +132,24 @@ function CompanySetup({ currentUser }) {
   }, [feedback.message]);
 
   const filteredCompanies = companies.filter((company) =>
-    company.company.toLowerCase().includes(searchTerm.toLowerCase()),
+    String(company.company || "").toLowerCase().includes(searchTerm.toLowerCase()),
   );
+
+  // Employees assigned to any other active branch are unavailable here.
+  // Employees already assigned to the branch currently being edited remain selectable.
+  const assignedToOtherBranches = new Set(
+    companies
+      .filter((company) => company.id !== editingId && company.is_active !== false)
+      .flatMap((company) => (company.employee_ids || []).map(String)),
+  );
+  const selectedEmployeeIds = (formValues.employee_ids || []).map(String);
+  const availableEmployees = employees.filter((employee) => {
+    const employeeId = String(employee.id || employee._id || "").trim();
+    return employeeId && (
+      selectedEmployeeIds.includes(employeeId) ||
+      !assignedToOtherBranches.has(employeeId)
+    );
+  });
 
   // Add and edit share one form; editingId selects POST versus PUT on submit.
   const openAddForm = () => {
@@ -323,15 +373,15 @@ function CompanySetup({ currentUser }) {
                           >Clear all</button>
                         </div>
                       )}
-                      {employees
+                      {availableEmployees
                         .filter((employee) => {
                           const term = employeeSearchTerm.trim().toLowerCase();
                           const name = employee.employee_name || employee.name || employee.employee_id || "Unnamed employee";
                           return !term || `${name} ${employee.employee_id || ""}`.toLowerCase().includes(term);
                         })
                         .map((employee) => {
-                          const employeeId = String(employee.id);
-                          const selected = (formValues.employee_ids || []).includes(employeeId);
+                          const employeeId = String(employee.id || employee._id || "").trim();
+                          const selected = (formValues.employee_ids || []).map(String).includes(employeeId);
                           const employeeName = employee.employee_name || employee.name || "Unnamed employee";
                           return (
                             <label key={employeeId} className="dropdown-item rounded d-flex align-items-start gap-2 py-2" style={{ whiteSpace: "normal", cursor: "pointer" }}>
@@ -356,12 +406,16 @@ function CompanySetup({ currentUser }) {
                             </label>
                           );
                         })}
-                      {employees.filter((employee) => {
+                      {availableEmployees.filter((employee) => {
                         const term = employeeSearchTerm.trim().toLowerCase();
                         const name = employee.employee_name || employee.name || employee.employee_id || "Unnamed employee";
                         return !term || `${name} ${employee.employee_id || ""}`.toLowerCase().includes(term);
                       }).length === 0 && (
-                        <div className="text-muted small text-center py-3">No employees match your search.</div>
+                        <div className="text-muted small text-center py-3">
+                           {employees.length === 0
+                             ? "No active employees were returned by Employee Master. Check that employee accounts are active and reload this page."
+                             : "No available employees match your search. Employees assigned to another branch are excluded."}
+                         </div>
                       )}
                     </div>
                   )}
@@ -369,7 +423,7 @@ function CompanySetup({ currentUser }) {
                 {(formValues.employee_ids || []).length > 0 && (
                   <div className="d-flex flex-wrap gap-2 mt-2">
                     {formValues.employee_ids.map((employeeId) => {
-                      const employee = employees.find((item) => String(item.id) === employeeId);
+                      const employee = employees.find((item) => String(item.id || item._id || "") === String(employeeId));
                       const name = employee?.employee_name || employee?.name || employee?.employee_id || "Selected employee";
                       return (
                         <span key={employeeId} className="badge rounded-pill text-bg-light border d-inline-flex align-items-center gap-2 py-2 px-3">

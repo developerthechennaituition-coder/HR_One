@@ -81,10 +81,19 @@ async def protect_organization_routes(request: Request, call_next):
     try:
         user = _organization_user(request.headers.get("authorization"))
         role = str(user.get("role", "")).strip().casefold()
-        if role not in {"hr admin", "administrator", "hr manager", "manager", "employee"}:
+        profile_organization_read = (
+            request.method == "GET"
+            and request.url.path.rstrip("/") == "/api/organization/me"
+        )
+        if role == "hr manager" and not profile_organization_read:
+            raise HTTPException(status_code=403, detail="HR Manager does not have access to Organization Setup.")
+        allowed_read_roles = {"hr admin", "administrator", "manager", "employee"}
+        if profile_organization_read:
+            allowed_read_roles.update({"hr manager", "super admin"})
+        if role not in allowed_read_roles:
             raise HTTPException(status_code=403, detail="You are not authorized to view organization information.")
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and role not in {"hr admin", "hr manager", "administrator"}:
-            raise HTTPException(status_code=403, detail="Only HR Admin, HR Manager or Administrator can manage organization setup.")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and role not in {"hr admin", "administrator"}:
+            raise HTTPException(status_code=403, detail="Only HR Admin or Administrator can manage organization setup.")
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     return await call_next(request)

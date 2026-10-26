@@ -10,6 +10,7 @@ import os
 import logging
 import threading
 import hashlib
+import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -267,15 +268,23 @@ def _organization_user(
 
 def _organization_reader(user: dict = Depends(_organization_user)) -> dict:
     role = str(user.get("role", "")).strip().casefold()
-    if role not in {"hr admin", "administrator", "hr manager", "manager", "employee"}:
+    if role not in {"hr admin", "administrator", "manager", "employee"}:
         raise HTTPException(status_code=403, detail="You are not authorized to view organization information.")
+    return user
+
+
+def _profile_organization_reader(user: dict = Depends(_organization_user)) -> dict:
+    """Profile organization details are readable by every signed-in HRMS role."""
+    role = str(user.get("role", "")).strip().casefold()
+    if role not in {"hr admin", "administrator", "manager", "hr manager", "employee", "super admin"}:
+        raise HTTPException(status_code=403, detail="You are not authorized to view profile organization information.")
     return user
 
 
 def _organization_admin(user: dict = Depends(_organization_user)) -> dict:
     role = str(user.get("role", "")).strip().casefold()
-    if role not in {"hr admin", "hr manager", "administrator"}:
-        raise HTTPException(status_code=403, detail="Only HR Admin, HR Manager or Administrator can manage organization setup.")
+    if role not in {"hr admin", "administrator"}:
+        raise HTTPException(status_code=403, detail="Only HR Admin or Administrator can manage organization setup.")
     return user
 
 
@@ -983,23 +992,38 @@ def validate_employee_reference(employee_id: str):
 
 
 def validate_company_employee_ids(employee_ids: list[str]) -> list[str]:
+    """Accept stable Mongo IDs from either Employee Master user records or legacy employees."""
     normalized = list(dict.fromkeys(str(value).strip() for value in employee_ids if str(value).strip()))
     for employee_id in normalized:
         if not ObjectId.is_valid(employee_id):
             raise HTTPException(status_code=422, detail=f"Invalid employee selection: {employee_id}")
-        if employees_collection.find_one({"_id": ObjectId(employee_id), "is_active": True}) is None:
-            raise HTTPException(status_code=422, detail=f"Selected employee {employee_id} does not exist or is inactive.")
+        object_id = ObjectId(employee_id)
+        employee_record = employees_collection.find_one({"_id": object_id, "is_active": True})
+        user_record = users_collection.find_one({"_id": object_id, "is_active": True})
+        if employee_record is None and user_record is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Selected employee {employee_id} does not exist or is inactive.",
+            )
     return normalized
 
 
-def sync_company_employee_assignments(company_id: str, employee_ids: list[str]) -> None:
-    """Keep each Employee Master record assigned to at most one active branch."""
+def validate_employee_assignment_availability(company_id: str | None, employee_ids: list[str]) -> list[str]:
+    """Reject assignments when an employee already belongs to another active branch."""
     normalized = validate_company_employee_ids(employee_ids)
-    if normalized:
-        companies_collection.update_many(
-            {"_id": {"$ne": ObjectId(company_id)}, "is_active": True},
-            {"$pull": {"employee_ids": {"$in": normalized}}},
+    if not normalized:
+        return normalized
+
+    query: dict = {"is_active": True, "employee_ids": {"$in": normalized}}
+    if company_id is not None:
+        query["_id"] = {"$ne": ObjectId(company_id)}
+    conflict = companies_collection.find_one(query, {"company": 1, "branch": 1, "employee_ids": 1})
+    if conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="One or more selected employees are already assigned to another active branch. Refresh the employee list and try again.",
         )
+    return normalized
 
 
 @router.post(
@@ -1009,7 +1033,7 @@ def sync_company_employee_assignments(company_id: str, employee_ids: list[str]) 
     dependencies=[Depends(_organization_admin)],
 )
 def create_company(payload: CompanyPayload):
-    validate_company_employee_ids(payload.employee_ids)
+    validate_employee_assignment_availability(None, payload.employee_ids)
     now = datetime.now(timezone.utc)
     values = payload.model_dump()
     # Preserve the legacy primary-company marker for the first record only.
@@ -1029,7 +1053,6 @@ def create_company(payload: CompanyPayload):
             detail="A company/legal entity already exists.",
         ) from exc
     company["_id"] = result.inserted_id
-    sync_company_employee_assignments(str(result.inserted_id), payload.employee_ids)
     return get_active_company(str(result.inserted_id))
 
 
@@ -1068,8 +1091,8 @@ def get_company(company_id: str):
     dependencies=[Depends(_organization_admin)],
 )
 def update_company(company_id: str, payload: CompanyPayload):
-    validate_company_employee_ids(payload.employee_ids)
     object_id = parse_company_id(company_id)
+    validate_employee_assignment_availability(company_id, payload.employee_ids)
     now = datetime.now(timezone.utc)
     result = companies_collection.update_one(
         {"_id": object_id, "is_active": True},
@@ -1080,7 +1103,6 @@ def update_company(company_id: str, payload: CompanyPayload):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Company not found",
         )
-    sync_company_employee_assignments(company_id, payload.employee_ids)
     return get_active_company(company_id)
 
 
@@ -1197,7 +1219,7 @@ def get_organization_hierarchy(
 
 
 @router.get("/api/organization/me")
-def get_my_organization_information(user: dict = Depends(_organization_reader)):
+def get_my_organization_information(user: dict = Depends(_profile_organization_reader)):
     user_id = str(user["_id"])
     employee_id = str(user.get("employee_id") or user_id)
     details = db["employee_details"].find_one(
@@ -1207,7 +1229,38 @@ def get_my_organization_information(user: dict = Depends(_organization_reader)):
     if employee is None and ObjectId.is_valid(employee_id):
         employee = employees_collection.find_one({"_id": ObjectId(employee_id)})
     employee = employee or {}
-    company = companies_collection.find_one({"is_active": True}) or {}
+
+    # Resolve the logged-in person's actual branch assignment first. Legacy records
+    # may reference either the user id, the Employee Master id, or the employee code.
+    employee_aliases = {user_id, employee_id}
+    if employee.get("_id"):
+        employee_aliases.add(str(employee["_id"]))
+    company = companies_collection.find_one({
+        "is_active": True,
+        "employee_ids": {"$in": list(employee_aliases)},
+    })
+    if company is None:
+        work_location = str(
+            user.get("work_location") or details.get("work_location") or employee.get("work_location") or ""
+        ).strip()
+        if work_location:
+            company = companies_collection.find_one({
+                "is_active": True,
+                "$or": [
+                    {"branch": {"$regex": f"^{re.escape(work_location)}$", "$options": "i"}},
+                    {"location": {"$regex": f"^{re.escape(work_location)}$", "$options": "i"}},
+                    {"branch_code": work_location},
+                ],
+            })
+    if company is None:
+        # Keep legacy single-branch deployments working, but do not display a random
+        # branch when the organization has multiple branches and this person is unassigned.
+        active_companies = list(companies_collection.find({"is_active": True}).limit(2))
+        if len(active_companies) == 1:
+            company = active_companies[0]
+        else:
+            company = {}
+
     assignment_employee_id = str(employee.get("_id") or employee_id)
     current_year = datetime.now(ORGANIZATION_TIMEZONE).year
     calendar_filter: dict = {"status": "Published", "is_active": True}
@@ -1275,8 +1328,10 @@ def get_my_organization_information(user: dict = Depends(_organization_reader)):
         "company": {
             "company_name": company.get("company"),
             "legal_entity_name": company.get("legal_entity"),
-            "address": company.get("branch"),
-            "work_location": company.get("location") or employee.get("work_location"),
+            "address": company.get("branch") or company.get("location"),
+            "branch": company.get("branch"),
+            "branch_code": company.get("branch_code"),
+            "work_location": company.get("location") or employee.get("work_location") or user.get("work_location"),
         },
         "employee": {
             "department": details.get("department") or employee.get("department") or user.get("department"),

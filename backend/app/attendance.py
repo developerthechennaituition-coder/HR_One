@@ -1241,13 +1241,20 @@ def _assert_wfh_action_allowed(
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"WFH permission ended on {permitted_to}.")
     start_time = user.get("wfh_permitted_start_time")
     end_time = user.get("wfh_permitted_end_time")
-    if start_time or end_time:
-        # Use the same company timezone as the timestamp written to attendance.
-        now_time = company_now().time().replace(tzinfo=None)
-        if start_time and now_time < time.fromisoformat(str(start_time)):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, f"WFH permission starts at {start_time}.")
-        if end_time and now_time > time.fromisoformat(str(end_time)):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, f"WFH permission ended at {end_time}.")
+    if not start_time or not end_time:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "WFH start and end times have not been configured. Please contact HR Admin.")
+    # Start/end times describe the daily schedule. Check-in gets a separate
+    # grace window; check-out remains possible after the scheduled end time.
+    if purpose == "check_in":
+        now_local = company_now()
+        scheduled_start = time.fromisoformat(str(start_time))
+        scheduled_start_dt = datetime.combine(now_local.date(), scheduled_start, tzinfo=now_local.tzinfo)
+        earliest = scheduled_start_dt - timedelta(minutes=15)
+        latest_normal = scheduled_start_dt + timedelta(hours=1)
+        if now_local < earliest:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"WFH check-in opens 15 minutes before your scheduled start time ({start_time}).")
+        if now_local > latest_normal:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "You are outside the normal WFH check-in window. A reporting manager must approve late-time permission before check-in can proceed.")
     attendance = _today_wfh_attendance(user_id)
     if purpose == "check_in":
         if attendance:
@@ -1766,6 +1773,8 @@ def update_wfh_employee_settings(
     today = company_today()
     if payload.is_wfh_enabled and (not payload.wfh_permitted_from or not payload.wfh_permitted_to):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Select both WFH permitted from and until dates before enabling WFH.")
+    if payload.is_wfh_enabled and (not payload.wfh_permitted_start_time or not payload.wfh_permitted_end_time):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "WFH start time and end time are mandatory.")
     for label, value in (("start", payload.wfh_permitted_from), ("end", payload.wfh_permitted_to)):
         if value:
             try:
@@ -1795,6 +1804,27 @@ def update_wfh_employee_settings(
             }
         },
     )
+    if payload.is_wfh_enabled:
+        try:
+            # Reuse the existing general notification infrastructure so the
+            # employee receives the standard read/star/delete controls.
+            from app.notifications import create_system_notification
+            employee_name = str(employee.get("name") or employee.get("employee_id") or "Employee").strip()
+            start_label = datetime.strptime(payload.wfh_permitted_start_time, "%H:%M").strftime("%I:%M %p")
+            end_label = datetime.strptime(payload.wfh_permitted_end_time, "%H:%M").strftime("%I:%M %p")
+            create_system_notification(
+                title="Work From Home Approved",
+                message=(f"Hello! {employee_name}, your work from home is accepted from "
+                         f"{payload.wfh_permitted_from} to {payload.wfh_permitted_to} and from "
+                         f"{start_label} to {end_label}."),
+                validity=timedelta(days=365),
+                event_key=f"wfh-schedule:{user_id}:{payload.wfh_permitted_from}:{payload.wfh_permitted_to}:{payload.wfh_permitted_start_time}:{payload.wfh_permitted_end_time}:{now.isoformat()}",
+                user_ids=[user_id],
+            )
+        except Exception:
+            # Settings are already saved; log notification failure without
+            # falsely reporting that the schedule itself failed.
+            logger.exception("WFH settings saved but employee notification could not be created for %s", user_id)
     return {
         "user_id": user_id,
         "is_wfh_enabled": payload.is_wfh_enabled,

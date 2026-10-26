@@ -103,6 +103,7 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
   const [paidDays, setPaidDays] = useState({});
 
   const [lopDays, setLopDays] = useState({});
+  const [overtimeAmounts, setOvertimeAmounts] = useState({});
 
   const [paymentRef, setPaymentRef] = useState({});
 
@@ -166,6 +167,7 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
       setPaidDays(Object.fromEntries(safeAttendance.map((row) => [row.employee_id, String(row.paid_days ?? "")])));
 
       setLopDays(Object.fromEntries(safeAttendance.map((row) => [row.employee_id, String(row.lop_days ?? "")])));
+      setOvertimeAmounts((current) => Object.fromEntries(safeAttendance.map((row) => [row.employee_id, current[row.employee_id] ?? String(safePayrollRows.find((payrollRow) => payrollRow.employee_id === row.employee_id)?.overtime_amount ?? "0")] )));
 
     } catch (requestError) {
 
@@ -176,6 +178,8 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
   }, [month, year]);
 
 
+
+  useEffect(() => { setOvertimeAmounts({}); }, [month, year]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -257,6 +261,8 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
       const payloadLop = {};
 
+      const payloadOvertime = {};
+
       activeEmployees.filter((employee) => selectedEligibleIds.includes(employee.employee_id)).forEach((employee) => {
 
         const id = employee.employee_id;
@@ -265,9 +271,11 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
         if (lopDays[id] !== undefined && lopDays[id] !== "") payloadLop[id] = Number(lopDays[id]);
 
+        if (overtimeAmounts[id] !== undefined && overtimeAmounts[id] !== "") payloadOvertime[id] = Number(overtimeAmounts[id]);
+
       });
 
-      const result = await calculatePayroll({ month: Number(month), year: Number(year), employee_ids: selectedEligibleIds, paid_days: payloadDays, lop_days: payloadLop });
+      const result = await calculatePayroll({ month: Number(month), year: Number(year), employee_ids: selectedEligibleIds, paid_days: payloadDays, lop_days: payloadLop, overtime_amounts: payloadOvertime });
 
       setMessage(`Calculated ${result.calculated || 0} selected employee payroll record(s). ${(result.errors || []).length} employee(s) need attention.`);
 
@@ -462,11 +470,11 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
           <div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Search payroll data" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search employee ID, name, department…" /></label><span className="payroll-result-count">{visibleEmployees.length} employees · {attendanceSummary.length} salary profiles with effective dates</span></div>
 
-          <div className="payroll-table-wrap"><table className="payroll-table"><thead><tr><th><input type="checkbox" aria-label="Select all eligible employees" checked={visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).length > 0 && visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).every((employee) => selectedEmployeeIds.includes(employee.employee_id))} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th>{["Employee ID", "Employee Name", "Department", "Present", "Paid Leave", "Unpaid Leave", "Holidays", "Absent", "Working Days", "Payable Days (review)", "LOP Days (review)", "Estimated Salary", "Review & Calculate"].map((label) => <th key={label}>{label}</th>)}</tr></thead><tbody>
+          <div className="payroll-table-wrap"><table className="payroll-table"><thead><tr><th><input type="checkbox" aria-label="Select all eligible employees" checked={visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).length > 0 && visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).every((employee) => selectedEmployeeIds.includes(employee.employee_id))} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th>{["Employee ID", "Employee Name", "Department", "Present", "Paid Leave", "Unpaid Leave", "Holidays", "Absent", "Working Days", "Payable Days (review)", "LOP Days (review)", "OT Amount (₹)", "Estimated Salary", "Review & Calculate"].map((label) => <th key={label}>{label}</th>)}</tr></thead><tbody>
 
-            {visibleEmployees.map((employee) => { const attendance = attendanceSummary.find((row) => row.employee_id === employee.employee_id); const profile = salaryProfiles.find((row) => row.employee_id === employee.employee_id); const payrollRecord = records.find((row) => row.employee_id === employee.employee_id); const isCalculated = Boolean(payrollRecord); const canCalculate = Boolean(profile) && String(profile.effective_from || "").slice(0, 7) <= periodKey && !isCalculated; const daysInMonth = new Date(Number(year), Number(month), 0).getDate(); const payableDays = Number(paidDays[employee.employee_id] ?? attendance?.paid_days ?? 0); const estimatedSalary = Number(profile?.monthly_salary || 0) * (profile?.attendance_deduction_enabled === false ? 1 : Math.max(0, Math.min(daysInMonth, payableDays)) / daysInMonth); return <tr key={employee.employee_id}><td>{isCalculated ? <Icon name="check-circle-fill" className="payroll-calculated-check" /> : canCalculate ? <input type="checkbox" aria-label={`Select ${employee.employee_id} for payroll calculation`} checked={selectedEmployeeIds.includes(employee.employee_id)} onChange={(event) => toggleEmployeeSelection(employee.employee_id, event.target.checked)} /> : <span title="Configure an effective salary profile first">—</span>}</td><td className="payroll-id">{employee.employee_id}</td><td>{employee.name || "—"}</td><td>{employee.department || "—"}</td><td>{attendance?.present_days ?? "—"}</td><td>{attendance?.paid_leave_days ?? "—"}</td><td>{attendance?.unpaid_leave_days ?? "—"}</td><td>{attendance?.holiday_days ?? "—"}</td><td>{attendance?.absent_days ?? "—"}</td><td>{attendance?.working_days ?? "—"}</td><td><input aria-label={`Payable days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="No profile" value={paidDays[employee.employee_id] ?? ""} onChange={(event) => setPaidDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`LOP days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="No profile" value={lopDays[employee.employee_id] ?? ""} onChange={(event) => setLopDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td className="payroll-net">{profile ? money(estimatedSalary, profile.currency || "INR") : "—"}</td><td>{isCalculated ? <span className="payroll-status payroll-status-calculated">{payrollRecord.status}</span> : <span className="payroll-status payroll-status-pending">{profile ? "Pending" : "Salary setup required"}</span>}</td></tr>; })}
+            {visibleEmployees.map((employee) => { const attendance = attendanceSummary.find((row) => row.employee_id === employee.employee_id); const profile = salaryProfiles.find((row) => row.employee_id === employee.employee_id); const payrollRecord = records.find((row) => row.employee_id === employee.employee_id); const isCalculated = Boolean(payrollRecord); const canCalculate = Boolean(profile) && String(profile.effective_from || "").slice(0, 7) <= periodKey && !isCalculated; const daysInMonth = new Date(Number(year), Number(month), 0).getDate(); const payableDays = Number(paidDays[employee.employee_id] ?? attendance?.paid_days ?? 0); const estimatedSalary = Number(profile?.monthly_salary || 0) * (profile?.attendance_deduction_enabled === false ? 1 : Math.max(0, Math.min(daysInMonth, payableDays)) / daysInMonth) + Number(overtimeAmounts[employee.employee_id] || 0); return <tr key={employee.employee_id}><td>{isCalculated ? <Icon name="check-circle-fill" className="payroll-calculated-check" /> : canCalculate ? <input type="checkbox" aria-label={`Select ${employee.employee_id} for payroll calculation`} checked={selectedEmployeeIds.includes(employee.employee_id)} onChange={(event) => toggleEmployeeSelection(employee.employee_id, event.target.checked)} /> : <span title="Configure an effective salary profile first">—</span>}</td><td className="payroll-id">{employee.employee_id}</td><td>{employee.name || "—"}</td><td>{employee.department || "—"}</td><td>{attendance?.present_days ?? "—"}</td><td>{attendance?.paid_leave_days ?? "—"}</td><td>{attendance?.unpaid_leave_days ?? "—"}</td><td>{attendance?.holiday_days ?? "—"}</td><td>{attendance?.absent_days ?? "—"}</td><td>{attendance?.working_days ?? "—"}</td><td><input aria-label={`Payable days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="No profile" value={paidDays[employee.employee_id] ?? ""} onChange={(event) => setPaidDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`LOP days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="0" value={lopDays[employee.employee_id] ?? ""} onChange={(event) => setLopDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`Overtime amount for ${employee.employee_id}`} className="payroll-number-input payroll-overtime-input" type="number" min="0" max="999999999.99" step="0.01" placeholder="0.00" value={overtimeAmounts[employee.employee_id] ?? "0"} onChange={(event) => setOvertimeAmounts((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td className="payroll-net">{profile ? money(estimatedSalary, profile.currency || "INR") : "—"}</td><td>{isCalculated ? <span className="payroll-status payroll-status-calculated">{payrollRecord.status}</span> : <span className="payroll-status payroll-status-pending">{profile ? "Pending" : "Salary setup required"}</span>}</td></tr>; })}
 
-            {!visibleEmployees.length && <tr><td colSpan="14" className="payroll-empty"><Icon name="people" /><strong>No employees found</strong><span>Try a different search or add employees in Employee Master.</span></td></tr>}
+            {!visibleEmployees.length && <tr><td colSpan="15" className="payroll-empty"><Icon name="people" /><strong>No employees found</strong><span>Try a different search or add employees in Employee Master.</span></td></tr>}
 
           </tbody></table></div>
 

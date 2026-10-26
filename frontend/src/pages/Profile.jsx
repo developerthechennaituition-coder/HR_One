@@ -2265,6 +2265,8 @@ function Profile({ onNavigate }) {
                   ["Company Name", organizationData?.company?.company_name],
                   ["Legal Entity Name", organizationData?.company?.legal_entity_name],
                   ["Company Address", organizationData?.company?.address],
+                  ["Branch", organizationData?.company?.branch],
+                  ["Branch Code", organizationData?.company?.branch_code],
                   ["Department", organizationData?.employee?.department],
                   ["Designation", organizationData?.employee?.designation],
                   ["Reporting Manager", organizationData?.employee?.reporting_manager],
@@ -2295,13 +2297,17 @@ function Profile({ onNavigate }) {
                     : ""}
                 </p>
               </div>
-              <button
-                type="button"
-                className="btn btn-sm btn-outline-primary"
-                onClick={() => onNavigate?.("holiday-calendar")}
-              >
-                View yearly calendar
-              </button>
+              {["hr admin", "administrator"].includes(
+                String(user?.role || "").trim().toLowerCase(),
+              ) && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline-primary"
+                  onClick={() => onNavigate?.("holiday-calendar")}
+                >
+                  Manage yearly calendar
+                </button>
+              )}
             </div>
             {organizationData?.holiday_calendar?.holidays?.length ? (
               <>

@@ -19,6 +19,11 @@ const pageTitles = {
   "wfh-attendance": "WFH Attendance",
   "wfh-settings": "WFH Settings",
   "user-attendance": "Employee Attendance",
+  "my-attendance": "My Attendance",
+  leave: "Leave Management",
+  "employee-details": "Employee Details",
+  "change-password": "Change Password",
+  "403": "Access Denied",
   "essl-setup": "ESSL Attendance Setup",
   notifications: "Notifications",
   "team-members": "Team Members",
@@ -44,6 +49,8 @@ function Header({
   user = {},
   onLogout,
   onNavigate,
+  onToggleSidebar,
+  isMobileSidebarOpen = false,
 }) {
   const [isProfileOpen, setIsProfileOpen] =
     useState(false);
@@ -174,7 +181,16 @@ function Header({
   return (
     <header className="top-header">
 
-      <div>
+      <div className="header-title-group">
+        <button
+          type="button"
+          className="mobile-menu-toggle"
+          aria-label={isMobileSidebarOpen ? "Close navigation menu" : "Open navigation menu"}
+          aria-expanded={isMobileSidebarOpen}
+          onClick={onToggleSidebar}
+        >
+          <i className={`bi ${isMobileSidebarOpen ? "bi-x-lg" : "bi-list"}`} aria-hidden="true" />
+        </button>
         <h5>{pageTitle}</h5>
       </div>
 

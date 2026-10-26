@@ -122,10 +122,10 @@ function MainLayout({ session, onLogout }) {
   const canManageUsersForSession =
     canManageUsers(currentUser);
 
+  // Organization Setup is restricted to HR Admin and Administrator.
   const canManageOrganization = new Set([
     "hr admin",
     "administrator",
-    "hr manager",
   ]).has(currentUserRole);
 
   const canManageAttendance = new Set([
@@ -158,6 +158,8 @@ function MainLayout({ session, onLogout }) {
    * PAGE STATE
    * =======================================================
    */
+
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
   const [activePage, setActivePage] = useState(() => {
     const initialPage = getInitialPage();
@@ -1479,10 +1481,22 @@ function MainLayout({ session, onLogout }) {
    */
 
   return (
-    <div className="hrms-layout">
+    <div className={`hrms-layout${isMobileSidebarOpen ? " mobile-sidebar-open" : ""}`}>
+      {isMobileSidebarOpen && (
+        <button
+          type="button"
+          className="mobile-sidebar-backdrop"
+          aria-label="Close navigation menu"
+          onClick={() => setIsMobileSidebarOpen(false)}
+        />
+      )}
       <Sidebar
         activePage={activePage}
-        onNavigate={handleNavigate}
+        isMobileOpen={isMobileSidebarOpen}
+        onNavigate={(page, itemId) => {
+          handleNavigate(page, itemId);
+          setIsMobileSidebarOpen(false);
+        }}
         role={currentUserRole}
         canManageUsers={
           canManageUsersForSession
@@ -1506,6 +1520,8 @@ function MainLayout({ session, onLogout }) {
           session={session}
           onLogout={onLogout}
           onNavigate={handleNavigate}
+          onToggleSidebar={() => setIsMobileSidebarOpen((open) => !open)}
+          isMobileSidebarOpen={isMobileSidebarOpen}
         />
 
         <main className="main-content">

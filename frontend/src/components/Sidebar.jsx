@@ -10,6 +10,7 @@ const PAYROLL_PAGES = [
 function Sidebar({
   activePage,
   onNavigate,
+  isMobileOpen = false,
   role = "",
   canManageUsers,
   canManageAttendance,
@@ -20,7 +21,7 @@ function Sidebar({
   const normalizedRole = String(role || "").trim().toLowerCase();
   const isHrAdmin = normalizedRole === "hr admin";
   const isAdministrator = normalizedRole === "administrator";
-  const canManageOrganization = isHrAdmin || isAdministrator || normalizedRole === "hr manager";
+  const canManageOrganization = isHrAdmin || isAdministrator;
   const canManageUsersForRole = isHrAdmin;
   const [isPayrollOpen, setIsPayrollOpen] = useState(
     ["employee-salary-setup", "payroll-dashboard", "monthly-payroll", "payslip-management"].includes(activePage),
@@ -64,7 +65,7 @@ function Sidebar({
     : [["payslip-management", "My Payslips", "file-earmark-pdf"]];
 
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${isMobileOpen ? " sidebar-mobile-open" : ""}`} aria-label="Main navigation">
       <div className="sidebar-brand">
         <h4>HRMS</h4>
         <small>Human Resource Management</small>
