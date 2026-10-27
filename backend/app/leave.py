@@ -19,7 +19,9 @@ from pymongo import ReturnDocument
 
 from app.attendance import (
     COMPANY_START_TIME,
+    WEEKDAY_NAMES,
     company_now,
+    company_weekly_off_weekdays,
     leave_cancel_deadline,
     remove_leave_attendance,
     sync_leave_for_today,
@@ -145,7 +147,8 @@ class LeavePolicyUpdate(BaseModel):
 
 class LeaveCompanyPolicy(BaseModel):
     weekly_offs_per_month: int = Field(default=4, ge=1, le=10)
-    weekly_off_weekday: str = "sunday"
+    # Configured by HR Admin; no weekday is a weekly off until HR selects one.
+    weekly_off_weekdays: list[str] = Field(default_factory=list, max_length=6)
     probation_period_months: int = Field(default=3, ge=0, le=24)
     sick_leave_after_probation: float = Field(default=1, ge=0)
     sick_leave_before_probation_allowed: bool = False
@@ -155,13 +158,13 @@ class LeaveCompanyPolicy(BaseModel):
     medical_certificate_required: bool = True
     religion_holidays_enabled: bool = True
 
-    @field_validator("weekly_off_weekday")
+    @field_validator("weekly_off_weekdays")
     @classmethod
-    def validate_weekday(cls, value: str) -> str:
-        value = value.strip().lower()
-        if value not in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
-            raise ValueError("Weekly off must be a valid weekday.")
-        return value
+    def validate_weekdays(cls, value: list[str]) -> list[str]:
+        days = {str(item).strip().lower() for item in value}
+        if not days <= set(WEEKDAY_NAMES):
+            raise ValueError("Weekly off days must be valid weekdays.")
+        return [day for day in WEEKDAY_NAMES if day in days]
 
     @field_validator("one_day_approver", "more_than_two_days_approver")
     @classmethod
@@ -213,6 +216,20 @@ def ensure_leave_indexes() -> None:
         },
         upsert=True,
     )
+    # One-time migration from the old single weekly_off_weekday field. Its
+    # "sunday" value was a seeded default, so only an HR-chosen other day is kept.
+    legacy_policy = leave_policies_collection.find_one(
+        {"leave_type_id": "__company_policy__", "weekly_off_weekdays": {"$exists": False}}
+    )
+    if legacy_policy:
+        legacy_day = str(legacy_policy.get("weekly_off_weekday") or "").strip().lower()
+        leave_policies_collection.update_one(
+            {"_id": legacy_policy["_id"]},
+            {
+                "$set": {"weekly_off_weekdays": [legacy_day] if legacy_day in WEEKDAY_NAMES and legacy_day != "sunday" else []},
+                "$unset": {"weekly_off_weekday": ""},
+            },
+        )
 
     defaults = [
         {"code": "CL", "name": "Casual Leave", "description": "Casual leave", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
@@ -514,19 +531,11 @@ def _working_dates(user: dict[str, Any], start: date, end: date) -> list[date]:
     if end < start:
         raise HTTPException(status_code=400, detail="To date must be on or after from date")
     holidays = _holiday_dates(user, start, end)
-    weekly_off = {
-        "monday": 0,
-        "tuesday": 1,
-        "wednesday": 2,
-        "thursday": 3,
-        "friday": 4,
-        "saturday": 5,
-        "sunday": 6,
-    }[_company_policy().get("weekly_off_weekday", "sunday")]
+    weekly_offs = company_weekly_off_weekdays()
     result: list[date] = []
     current = start
     while current <= end:
-        if current.weekday() != weekly_off and current not in holidays:
+        if current.weekday() not in weekly_offs and current not in holidays:
             result.append(current)
         current += timedelta(days=1)
     return result

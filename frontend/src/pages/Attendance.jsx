@@ -1,5 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useMemo, useState } from "react";
+import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
 
 const USERS_API_URL = HRONE_API_BASE + "/api/users";
 const EMPLOYEES_API_URL = HRONE_API_BASE + "/api/employees";
@@ -1257,6 +1258,8 @@ function Attendance({ session }) {
           </div>
         </div>
       </div>
+
+      <AttendanceRequestInbox />
     </div>
   );
 }

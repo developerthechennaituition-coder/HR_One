@@ -567,7 +567,7 @@ function PayrollTable({ rows, mode, money: formatMoney, onAction, onReview, paym
 
   return <div className="payroll-table-wrap"><table className="payroll-table"><thead><tr>{["Employee ID", "Employee Name", "Department", "Gross Earnings", "Deductions", "Net Salary", "Status", "Actions"].map((label) => <th key={label}>{label}</th>)}</tr></thead><tbody>
 
-    {rows.map((row) => <tr key={row.id || `${row.employee_id}-${row.month}-${row.year}`}><td className="payroll-id">{row.employee_id}</td><td>{row.employee_name || "—"}</td><td>{row.department || "—"}</td><td>{formatMoney(row.gross_earnings, row.currency)}</td><td>{formatMoney(row.total_deductions, row.currency)}</td><td className="payroll-net">{formatMoney(row.net_salary, row.currency)}</td><td><StatusBadge status={row.status} /></td><td><div className="payroll-row-actions">
+    {rows.map((row) => <tr key={row.id || `${row.employee_id}-${row.month}-${row.year}`}><td className="payroll-id">{row.employee_id}</td><td>{row.employee_name || "—"}</td><td>{row.department || "—"}</td><td>{formatMoney(row.gross_earnings, row.currency)}</td><td>{formatMoney(row.total_deductions, row.currency)}</td><td className="payroll-net">{formatMoney(row.net_salary, row.currency)}</td><td><StatusBadge status={row.status} />{row.status === "Calculated" && row.attendance_outdated && <div className="small text-danger mt-1" title={row.attendance_outdated_reason || ""}>Attendance changed — disapprove &amp; recalculate</div>}</td><td><div className="payroll-row-actions">
 
       {mode !== "dashboard" && row.status === "Calculated" && <button type="button" className="payroll-button payroll-button-outline" onClick={() => onReview?.(row)}><Icon name="eye" /> Review</button>}
 

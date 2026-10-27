@@ -62,6 +62,9 @@ function EsslAdminSettings({ session }) {
   const [importFile, setImportFile] = useState(null);
   const [importing, setImporting] = useState(false);
   const [importSummary, setImportSummary] = useState(null);
+  const [importPreview, setImportPreview] = useState(null);
+  const [mappingSearch, setMappingSearch] = useState("");
+  const [mappingDepartment, setMappingDepartment] = useState("all");
   const [savingMappingId, setSavingMappingId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -69,6 +72,18 @@ function EsslAdminSettings({ session }) {
   const lastSuccessfulSync = history.find(
     (item) => item.status === "COMPLETED",
   );
+  const mappingDepartments = [...new Set(
+    employees.map((employee) => String(employee.department || "").trim()).filter(Boolean),
+  )].sort((a, b) => a.localeCompare(b));
+  const filteredEmployees = employees.filter((employee) => {
+    const query = mappingSearch.trim().toLocaleLowerCase();
+    const searchable = [
+      employee.name, employee.employee_id, employee.essl_employee_id,
+      employee.department, employee.role,
+    ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+    return (!query || searchable) &&
+      (mappingDepartment === "all" || employee.department === mappingDepartment);
+  });
 
   const headers = useCallback(() => {
     if (!token) throw new Error("Login session not found. Please login again.");
@@ -492,50 +507,60 @@ function EsslAdminSettings({ session }) {
         </form>
 
         <div className="border rounded p-3 mb-4">
-          <h5>Employee ID Mapping</h5>
-          <p className="small text-muted">
-            Map the ID sent by ESSL to the HRMS employee code. Unmapped IDs are held for review and never assigned to another employee.
-          </p>
-          <div className="table-responsive">
-            <table className="table table-sm align-middle">
-              <thead>
-                <tr><th>Employee</th><th>HRMS Employee Code</th><th>Department</th><th>ESSL Employee ID</th><th></th></tr>
+          <div className="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">
+            <div>
+              <h5 className="mb-1">Employee ID Mapping</h5>
+              <p className="small text-muted mb-0">
+                Map each ESSL employee code to the correct HRMS employee. All users with an employee code are listed across roles and departments.
+              </p>
+            </div>
+            <span className="badge text-bg-light border">{filteredEmployees.length} of {employees.length} employees</span>
+          </div>
+          <div className="row g-2 my-2">
+            <div className="col-md-8">
+              <label className="visually-hidden" htmlFor="essl-mapping-search">Search employee mappings</label>
+              <input id="essl-mapping-search" type="search" className="form-control form-control-sm"
+                placeholder="Search Employee Name, Employee ID, ESSL Employee Code, Department or Role"
+                value={mappingSearch} onChange={(event) => setMappingSearch(event.target.value)} />
+            </div>
+            <div className="col-md-4">
+              <label className="visually-hidden" htmlFor="essl-mapping-department">Filter by HRMS department</label>
+              <select id="essl-mapping-department" className="form-select form-select-sm" value={mappingDepartment}
+                onChange={(event) => setMappingDepartment(event.target.value)}>
+                <option value="all">All Departments</option>
+                {mappingDepartments.map((department) => <option key={department} value={department}>{department}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="table-responsive essl-employee-mapping-scroll" style={{ height: `${Math.min(460, Math.max(180, employees.length * 40 + 44))}px`, maxHeight: "460px", overflowY: "auto", overflowX: "auto", overscrollBehavior: "contain" }}>
+            <table className="table table-sm table-hover align-middle mb-0">
+              <thead className="table-light" style={{ position: "sticky", top: 0, zIndex: 2 }}>
+                <tr><th>Employee Name</th><th>Employee ID</th><th>Role</th><th>Department</th><th>ESSL Employee Code</th><th>Mapping Status</th><th>Action</th></tr>
               </thead>
               <tbody>
-                {employees.map((employee) => (
+                {filteredEmployees.map((employee) => (
                   <tr key={employee.user_id}>
                     <td>{employee.name || "—"}{!employee.is_active && <span className="badge text-bg-secondary ms-2">Inactive</span>}</td>
                     <td>{employee.employee_id || "—"}</td>
-                    <td>{employee.department || "—"}</td>
-                    <td style={{ maxWidth: 220 }}>
-                      <input
-                        className="form-control form-control-sm"
-                        value={employee.essl_employee_id || ""}
-                        onChange={(event) =>
-                          setEmployees((current) =>
-                            current.map((item) =>
-                              item.user_id === employee.user_id
-                                ? { ...item, essl_employee_id: event.target.value }
-                                : item,
-                            ),
-                          )
-                        }
-                        aria-label={`ESSL employee ID for ${employee.name}`}
-                      />
+                    <td>{employee.role || "—"}</td>
+                    <td>{employee.department || "Unassigned"}</td>
+                    <td style={{ minWidth: "180px" }}>
+                      <input className="form-control form-control-sm" value={employee.essl_employee_id || ""}
+                        onChange={(event) => setEmployees((current) => current.map((item) =>
+                          item.user_id === employee.user_id ? { ...item, essl_employee_id: event.target.value } : item,
+                        ))} aria-label={`ESSL employee code for ${employee.name}`} />
                     </td>
-                    <td>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-outline-primary"
-                        disabled={savingMappingId === employee.user_id}
-                        onClick={() => saveMapping(employee)}
-                      >
-                        {savingMappingId === employee.user_id ? "Saving..." : "Save mapping"}
-                      </button>
-                    </td>
+                    <td><span className={`badge ${employee.essl_employee_id ? "text-bg-success" : "text-bg-warning"}`}>
+                      {employee.essl_employee_id ? "Mapped" : "Unmapped"}
+                    </span></td>
+                    <td><button type="button" className="btn btn-sm btn-outline-primary"
+                      disabled={savingMappingId === employee.user_id}
+                      onClick={() => saveMapping(employee)}>
+                      {savingMappingId === employee.user_id ? "Saving..." : "Save"}
+                    </button></td>
                   </tr>
                 ))}
-                {employees.length === 0 && <tr><td colSpan="5" className="text-center text-muted">No employee accounts found.</td></tr>}
+                {filteredEmployees.length === 0 && <tr><td colSpan="7" className="text-center text-muted py-4">No employees match the selected search or department.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -544,47 +569,123 @@ function EsslAdminSettings({ session }) {
         <div className="border rounded p-3 mb-4">
           <h5>Import ESSL Attendance File</h5>
           <p className="text-muted small mb-3">
-            Upload an ESSL CSV, XLS, or XLSX report. Employee IDs must be mapped in the table above. Re-importing replaces previous file-import punches for each employee/date included in the file, so corrected or removed punches do not remain as stale records. API-synchronized punches are preserved. Existing manual/WFH attendance is protected.
+            Upload the original eTimeTrackLite daily report. The importer detects each repeated date section and its IN/OUT columns. Review the preview and resolve unmapped employees before importing. Re-importing reconciles file-import punches for employee/date pairs in the report; API punches and protected manual/WFH attendance are preserved.
           </p>
           <div className="row g-2 align-items-end">
             <div className="col-md-8">
-              <label className="form-label">Attendance file</label>
-              <input className="form-control" type="file" accept=".csv,.xls,.xlsx" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportSummary(null); }} />
-              <div className="form-text">Maximum file size: 15 MB. Supports raw punch rows and daily reports with IN-1/OUT-1 style columns when a date column is available.</div>
+              <label className="form-label" htmlFor="essl-attendance-file">Attendance file</label>
+              <input id="essl-attendance-file" className="form-control" type="file" accept=".csv,.xls,.xlsx"
+                onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportSummary(null); setImportPreview(null); }}
+              />
+              <div className="form-text">Maximum 15 MB. Supports ESSL reports with repeated daily headings and up to five IN/OUT pairs.</div>
             </div>
             <div className="col-md-4">
-              <button type="button" className="btn btn-primary w-100" disabled={!importFile || importing} onClick={async () => {
-                try {
-                  setImporting(true); setError(""); setNotice(""); setImportSummary(null);
-                  const formData = new FormData(); formData.append("file", importFile);
-                  const response = await fetch(`${ESSL_API_URL}/import-file`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: formData });
-                  const data = await response.json().catch(() => ({}));
-                  if (!response.ok) throw new Error(data?.detail || "Attendance file import failed.");
-                  setImportSummary(data);
-                  setNotice("Attendance file processed. Review the import summary and unmatched employee IDs.");
-                  await loadAdminData();
-                } catch (importError) {
-                  setError(importError.message || "Attendance file import failed.");
-                } finally { setImporting(false); }
-              }}>
-                {importing ? <><span className="spinner-border spinner-border-sm me-2" role="status"></span>Importing...</> : "Import Attendance File"}
+              <button type="button" className="btn btn-outline-primary w-100" disabled={!importFile || importing}
+                onClick={async () => {
+                  try {
+                    setImporting(true); setError(""); setNotice(""); setImportSummary(null); setImportPreview(null);
+                    const formData = new FormData(); formData.append("file", importFile);
+                    const response = await fetch(`${ESSL_API_URL}/preview-file`, {
+                      method: "POST", headers: { Authorization: `Bearer ${token}` }, body: formData,
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data?.detail || "Attendance file validation failed.");
+                    setImportPreview(data);
+                    setNotice("File validated. Review the employee mappings and punch preview before confirming import.");
+                  } catch (previewError) {
+                    setError(previewError.message || "Attendance file validation failed.");
+                  } finally { setImporting(false); }
+                }}>
+                {importing ? <><span className="spinner-border spinner-border-sm me-2" role="status" />Validating...</> : "Validate & Preview"}
               </button>
             </div>
           </div>
-          {importSummary && (
-            <div className="alert alert-info mt-3 mb-0">
-              <strong>Import completed</strong>
-              <div className="row mt-2 g-2">
-                <div className="col-md-4">Punch rows found: {importSummary.rows_with_punches}</div>
-                <div className="col-md-4">Punches imported: {importSummary.punches_imported}</div>
-                <div className="col-md-4">Duplicates in file: {importSummary.duplicate_punches_in_file}</div>
-                <div className="col-md-4">Invalid time values: {importSummary.invalid_punch_values}</div>
-                <div className="col-md-4">Attendance created: {importSummary.attendance_records_created}</div>
-                <div className="col-md-4">Attendance updated: {importSummary.attendance_records_updated}</div>
-                <div className="col-md-4">Protected existing records: {importSummary.attendance_records_protected}</div>
+          {importPreview && (
+            <div className="mt-3">
+              <div className="alert alert-info mb-3">
+                <strong>Validated: {importPreview.filename}</strong>
+                <div>Reporting period: {importPreview.reporting_period?.from_date} to {importPreview.reporting_period?.to_date}</div>
+                <div className="row g-2 mt-1">
+                  <div className="col-sm-4">Employees: {importPreview.employee_count}</div>
+                  <div className="col-sm-4">Employee/date records: {importPreview.daily_employee_records}</div>
+                  <div className="col-sm-4">Valid punches: {importPreview.valid_punches}</div>
+                  <div className="col-sm-4">Potential duplicate punches: {importPreview.potential_duplicate_punches || 0}</div>
+                  <div className="col-sm-4">Unmapped ESSL employees: {importPreview.unmapped_employee_count}</div>
+                  <div className="col-sm-4">Department differences: {importPreview.department_mismatch_count || 0}</div>
+                  <div className="col-sm-4">Invalid time values: {importPreview.invalid_punch_values}</div>
+                </div>
+                {importPreview.unmapped_employee_count > 0 && <div className="mt-2 text-danger">
+Only employees with saved ESSL mappings will be imported. You can import mapped employees now and map the remaining employees later; unmapped employees will be skipped and listed in the result.
+                </div>}
+                {(importPreview.department_mismatch_count || 0) > 0 && <div className="mt-2 text-warning-emphasis">
+                  Some mapped employees have different ESSL and HRMS departments. Review the differences below; the import will not change HRMS departments.
+                </div>}
               </div>
-              {importSummary.unmatched_employee_ids?.length > 0 && <div className="mt-2"><strong>Unmapped ESSL IDs:</strong> {importSummary.unmatched_employee_ids.join(", ")}</div>}
+              <h6>Employee mapping review</h6>
+              <div className="table-responsive mb-3" style={{ maxHeight: "240px", overflowY: "auto" }}>
+                <table className="table table-sm table-hover align-middle">
+                  <thead className="table-light" style={{ position: "sticky", top: 0, zIndex: 1 }}>
+                    <tr><th>ESSL Code</th><th>ESSL Name</th><th>ESSL Department</th><th>HRMS Employee</th><th>HRMS Department</th><th>Status</th></tr>
+                  </thead>
+                  <tbody>{(importPreview.employees || []).map((item) => (
+                    <tr key={item.essl_employee_id}>
+                      <td>{item.essl_employee_id}</td><td>{item.name || "—"}</td><td>{item.department || "—"}</td>
+                      <td>{item.hrms_employee_name ? `${item.hrms_employee_name} (${item.hrms_employee_id})` : "—"}</td>
+                      <td>{item.hrms_department || "—"}</td>
+                      <td><span className={`badge ${item.mapping_status === "mapped" ? "text-bg-success" : item.mapping_status === "department_mismatch" ? "text-bg-warning" : "text-bg-danger"}`}>{item.mapping_status === "department_mismatch" ? "Department differs" : item.mapping_status}</span></td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+              <h6>Punch preview (first {Math.min(importPreview.preview?.length || 0, importPreview.preview_limit || 100)} rows)</h6>
+              <div className="table-responsive mb-3" style={{ maxHeight: "240px", overflowY: "auto" }}>
+                <table className="table table-sm align-middle">
+                  <thead className="table-light" style={{ position: "sticky", top: 0, zIndex: 1 }}>
+                    <tr><th>ESSL Code</th><th>Name</th><th>Date</th><th>Time</th><th>Direction</th></tr>
+                  </thead>
+                  <tbody>{(importPreview.preview || []).map((item, index) => (
+                    <tr key={`${item.employee_code}-${item.attendance_date}-${item.punch_time}-${index}`}>
+                      <td>{item.employee_code}</td><td>{item.employee_name || "—"}</td><td>{item.attendance_date}</td><td>{item.punch_time}</td><td>{item.direction || "—"}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+              <button type="button" className="btn btn-primary" disabled={importing || (importPreview.mapped_employee_count ?? ((importPreview.employees || []).filter((item) => item.mapping_status !== "unmapped").length)) === 0}
+                onClick={async () => {
+                  try {
+                    setImporting(true); setError(""); setNotice(""); setImportSummary(null);
+                    const formData = new FormData(); formData.append("file", importFile);
+                    const response = await fetch(`${ESSL_API_URL}/import-file`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: formData });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data?.detail || "Attendance file import failed.");
+                    setImportSummary(data);
+                    setNotice("Attendance file imported. Review the result summary below.");
+                    await loadAdminData();
+                  } catch (importError) {
+                    setError(importError.message || "Attendance file import failed.");
+                  } finally { setImporting(false); }
+                }}>
+                {importing ? "Importing..." : "Confirm and Import Attendance"}
+              </button>
+              {importSummary && (
+                <div className="alert alert-success mt-3 mb-0">
+                  <strong>Import completed</strong>
+                  <div className="row mt-2 g-2">
+                    <div className="col-md-4">Punch rows found: {importSummary.rows_with_punches}</div>
+                    <div className="col-md-4">Punches imported: {importSummary.punches_imported}</div>
+                    <div className="col-md-4">Duplicates in file: {importSummary.duplicate_punches_in_file}</div>
+                    <div className="col-md-4">Invalid time values: {importSummary.invalid_punch_values}</div>
+                    <div className="col-md-4">Attendance created: {importSummary.attendance_records_created}</div>
+                    <div className="col-md-4">Attendance updated: {importSummary.attendance_records_updated}</div>
+                    <div className="col-md-4">Protected existing records: {importSummary.attendance_records_protected}</div>
+                  </div>
+                  {importSummary.unmatched_employee_ids?.length > 0 && <div className="mt-2"><strong>Unmapped ESSL IDs:</strong> {importSummary.unmatched_employee_ids.join(", ")}</div>}
+                </div>
+              )}
             </div>
+          )}
+          {importSummary && !importPreview && (
+            <div className="alert alert-info mt-3 mb-0">Import completed. {importSummary.punches_imported} punches imported.</div>
           )}
         </div>
 

@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
 import { useEffect, useMemo, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
@@ -12,6 +13,7 @@ const LEAVE_API_URL =
   HRONE_API_BASE + "/api/leave";
 
 function Profile({ onNavigate }) {
+  const weeklyOffDays = useCompanyWeeklyOffs();
   const [user, setUser] = useState(null);
   const [organizationData, setOrganizationData] = useState(null);
   const [organizationLoading, setOrganizationLoading] = useState(true);
@@ -2353,7 +2355,7 @@ function Profile({ onNavigate }) {
                             {Array.from({ length: monthLength }, (_, index) => {
                               const day = index + 1;
                               const holiday = holidaysByDay.get(day);
-                              const weekend = new Date(calendarYear, monthIndex, day).getDay() === 0;
+                              const weekend = isWeeklyOff(weeklyOffDays, new Date(calendarYear, monthIndex, day));
                               const isToday =
                                 calendarYear === currentYear &&
                                 monthIndex + 1 === currentMonth &&

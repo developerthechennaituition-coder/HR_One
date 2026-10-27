@@ -29,8 +29,11 @@ function formatClock(value) {
   }).format(date);
 }
 
-function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance" }) {
-  const [selectedDate, setSelectedDate] = useState(indiaToday);
+function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", date, onDateChange, showStatus = false, calendarDay = null, refreshKey = 0 }) {
+  // Optionally controlled by a parent (e.g. the My Attendance calendar).
+  const [internalDate, setInternalDate] = useState(indiaToday);
+  const selectedDate = date || internalDate;
+  const setSelectedDate = onDateChange || setInternalDate;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -60,7 +63,7 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance" }) {
     }
   }, [selectedDate, userId]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); }, [load, refreshKey]);
 
   const duration = (minutes) => `${Math.floor((minutes || 0) / 60)}h ${String((minutes || 0) % 60).padStart(2, "0")}m`;
 
@@ -95,6 +98,17 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance" }) {
 
         {data && (
           <>
+            {showStatus && (
+              <div className="d-flex flex-wrap gap-4 mb-3 small">
+                <div><span className="text-muted">Status</span><div className="fw-semibold fs-6">{(calendarDay?.attendance_date === selectedDate && calendarDay.status) || data.status || "Not Marked"}</div></div>
+                <div><span className="text-muted">Check-in / Check-out</span><div className="fw-semibold fs-6">{calendarDay?.attendance_date === selectedDate && calendarDay.has_record ? `${calendarDay.check_in_time || "Not recorded"} / ${calendarDay.check_out_time || "Not recorded"}` : "—"}</div></div>
+                <div><span className="text-muted">Attendance category</span><div className="fw-semibold fs-6">{data.attendance_type === "WFH" || data.attendance_source === "WFH_FACE_GPS" ? "Work From Home" : data.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(data.attendance_source) ? "Office" : "—"}</div></div>
+                <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" ? "Attendance request (no punch recorded)" : data.attendance_source || "—"}</div></div>
+                {calendarDay?.attendance_date === selectedDate && calendarDay.request && (
+                  <div><span className="text-muted">Attendance request</span><div className="fw-semibold fs-6">{calendarDay.request.request_number} · {calendarDay.request.status} ({calendarDay.request.requested_status})</div></div>
+                )}
+              </div>
+            )}
             <div className="row g-3 mb-3">
               <div className="col-6 col-xl-3">
                 <div className="rounded border p-3 h-100">

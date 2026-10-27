@@ -647,6 +647,11 @@ def calculate_monthly_payroll(payload: PayrollRunRequest,
     results, errors = [], []
     for profile in profiles:
         emp_id = profile["employee_id"]
+        # Do not read attendance while an HR attendance-request response is
+        # being written for this employee and period.
+        if db["attendance_requests"].find_one({"employee_id": emp_id, "status": "processing", "periods": period}, {"_id": 1}):
+            errors.append({"employee_id": emp_id, "employee_name": profile.get("employee_name", emp_id), "error": "An attendance request for this period is being applied. Retry payroll calculation in a moment."})
+            continue
         attendance = _attendance_summary_for_employee(emp_id, payload.month, payload.year, profile)
         # HR may confirm/adjust the automatically fetched values after reviewing
         # the attendance breakdown in the UI. Missing values use the database summary.
@@ -790,8 +795,18 @@ def payroll_action(record_id: str, payload: PayrollActionRequest,
     if payload.action == "paid":
         if not payload.payment_reference.strip(): raise HTTPException(status_code=422, detail="Payment reference is required to mark payroll as paid.")
         update["payment_reference"] = payload.payment_reference.strip()
-    changed = payroll_collection.update_one({"_id": row["_id"], "status": expected}, {"$set": update})
+    # An HR attendance-request decision made after calculation flags the draft
+    # as outdated; it must be disapproved and recalculated before approval.
+    outdated_detail = "Attendance changed after this payroll was calculated. Disapprove and recalculate it before approving."
+    if payload.action == "approve" and row.get("attendance_outdated"):
+        raise HTTPException(status_code=409, detail=outdated_detail)
+    query = {"_id": row["_id"], "status": expected}
+    if payload.action == "approve":
+        query["attendance_outdated"] = {"$ne": True}
+    changed = payroll_collection.update_one(query, {"$set": update})
     if changed.matched_count != 1:
+        if payload.action == "approve" and (payroll_collection.find_one({"_id": row["_id"]}) or {}).get("attendance_outdated"):
+            raise HTTPException(status_code=409, detail=outdated_detail)
         raise HTTPException(status_code=409, detail="Payroll status changed while this action was being submitted. Refresh and try again.")
     if payload.action == "paid":
         payslip_collection.update_one(

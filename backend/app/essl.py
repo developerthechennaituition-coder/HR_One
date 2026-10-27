@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -711,7 +712,7 @@ def _parse_excel_datetime(value: Any, selected_date: Any = None) -> datetime | N
     else:
         text = str(value).strip()
         result = None
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%B-%Y", "%d-%b-%Y", "%B %d %Y", "%b %d %Y", "%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
             try:
                 parsed = datetime.strptime(text, fmt)
                 if fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
@@ -734,14 +735,13 @@ def _parse_excel_datetime(value: Any, selected_date: Any = None) -> datetime | N
 
 
 def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[str, Any]], int]:
-    """Read CSV/XLS/XLSX rows; supports raw punch rows and daily IN/OUT report columns."""
+    """Read raw ESSL logs and repeated-date eTimeTrackLite daily reports."""
     ext = os.path.splitext(filename.casefold())[1]
     try:
         if ext == ".csv":
             text = content.decode("utf-8-sig", errors="replace")
-            sample = text[:4096]
             try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+                dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
             except csv.Error:
                 dialect = csv.excel
             rows = list(csv.reader(io.StringIO(text), dialect))
@@ -756,16 +756,12 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
             workbook = xlrd.open_workbook(file_contents=content)
             sheet = workbook.sheet_by_index(0)
             rows = [[sheet.cell_value(r, c) for c in range(sheet.ncols)] for r in range(sheet.nrows)]
-            # Convert Excel serial dates/times using workbook date mode.
             for r_idx, row in enumerate(rows):
                 for c_idx, value in enumerate(row):
                     if isinstance(value, (int, float)) and 0 < value < 80000:
-                        # Keep serials intact unless cell is formatted as a date/time.
-                        cell_type = sheet.cell_type(r_idx, c_idx)
-                        if cell_type == xlrd.XL_CELL_DATE:
+                        if sheet.cell_type(r_idx, c_idx) == xlrd.XL_CELL_DATE:
                             try:
-                                dt = xlrd.xldate.xldate_as_datetime(value, workbook.datemode)
-                                rows[r_idx][c_idx] = dt
+                                rows[r_idx][c_idx] = xlrd.xldate.xldate_as_datetime(value, workbook.datemode)
                             except Exception:
                                 pass
         else:
@@ -778,13 +774,103 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
     if not rows:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The uploaded file is empty.")
 
-    employee_names = {"employeeid", "employeecode", "esslemployeeid", "userid", "usercode", "empid", "empcode", "enrollid", "enrollmentno", "enrollmentnumber"}
+    def parse_report_date(row: list[Any]) -> date | None:
+        # eTimeTrackLite places the date after a standalone "Date" label,
+        # sometimes with blank/merged columns between the label and value.
+        if not row or _header_key(row[0]) != "date":
+            return None
+        for value in row[1:]:
+            if value is None or not str(value).strip():
+                continue
+            parsed = _parse_excel_datetime(value)
+            if parsed:
+                return parsed.date()
+            text = str(value).strip()
+            for fmt in ("%d-%B-%Y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%b %d %Y", "%B %d %Y"):
+                try:
+                    return datetime.strptime(text, fmt).date()
+                except ValueError:
+                    continue
+        return None
+
+    # eTimeTrackLite's daily report repeats a date banner and a table header
+    # for every day. Detect each section instead of assuming one global header.
+    report_sections: list[tuple[int, date, dict[str, int]]] = []
+    for idx, row in enumerate(rows):
+        section_date = parse_report_date(row)
+        if section_date is None:
+            continue
+        for header_idx in range(idx + 1, min(idx + 8, len(rows))):
+            header_row = rows[header_idx]
+            keys = {_header_key(value): col for col, value in enumerate(header_row)
+                    if value is not None and str(value).strip()}
+            if "ecode" in keys and "name" in keys and ("sno" in keys or "department" in keys):
+                report_sections.append((header_idx, section_date, keys))
+                break
+
+    result: list[dict[str, Any]] = []
+    invalid = 0
+    if report_sections:
+        for section_number, (header_idx, section_date, header_map) in enumerate(report_sections):
+            next_header_idx = report_sections[section_number + 1][0] if section_number + 1 < len(report_sections) else len(rows)
+            emp_col = header_map.get("ecode")
+            if emp_col is None:
+                continue
+            in_cols = sorted((idx, key) for key, idx in header_map.items()
+                             if re.fullmatch(r"in\d+", key))
+            out_cols = sorted((idx, key) for key, idx in header_map.items()
+                              if re.fullmatch(r"out\d+", key))
+            # Keep pair identity in each item, but do not fabricate missing halves.
+            for row_idx in range(header_idx + 1, next_header_idx):
+                row = rows[row_idx]
+                if parse_report_date(row) is not None:
+                    break
+                if emp_col >= len(row) or row[emp_col] is None or not str(row[emp_col]).strip():
+                    continue
+                raw_employee = row[emp_col]
+                if isinstance(raw_employee, float) and raw_employee.is_integer():
+                    employee_id = str(int(raw_employee))
+                else:
+                    employee_id = str(raw_employee).strip()
+                # A row is an employee record only if it has a code and some
+                # employee-like content; repeated report footer rows are ignored.
+                punch_columns = sorted(
+                    [(col, "IN") for col, _key in in_cols] +
+                    [(col, "OUT") for col, _key in out_cols]
+                )
+                punches_in_row: list[tuple[Any, str]] = []
+                for col, direction in punch_columns:
+                    if col < len(row) and row[col] not in (None, "") and str(row[col]).strip() not in {"-", "00:00", "00:00:00"}:
+                        punches_in_row.append((row[col], direction))
+                for raw_time, direction in punches_in_row:
+                    stamp = _parse_excel_datetime(raw_time, section_date)
+                    if stamp is None:
+                        invalid += 1
+                        continue
+                    result.append({
+                        "essl_employee_id": employee_id,
+                        "punch_at": stamp,
+                        "direction": direction,
+                        "source_row": row_idx + 1,
+                        "employee_name": str(row[header_map.get("name", -1)] or "").strip() if header_map.get("name", -1) < len(row) else "",
+                        "essl_department": str(row[header_map.get("department", -1)] or "").strip() if header_map.get("department", -1) < len(row) else "",
+                        "shift": str(row[header_map.get("shift", -1)] or "").strip() if header_map.get("shift", -1) < len(row) else "",
+                    })
+        if not result:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "The ESSL daily report sections were detected, but no valid punches were found. Check the date sections and IN/OUT columns.",
+            )
+        return result, invalid
+
+    # Fallback for flat punch exports and daily tables with one header row.
+    employee_names = {"employeeid", "employeecode", "esslemployeeid", "userid", "usercode", "empid", "empcode", "ecode", "enrollid", "enrollmentno", "enrollmentnumber"}
     date_names = {"date", "attendancedate", "punchdate", "transactiondate", "logdate", "workdate"}
     timestamp_names = {"punchtime", "timestamp", "datetime", "punchtimestamp", "transactiontime", "checkintime", "checkouttime", "datetimepunch"}
     time_names = {"time", "punchtime", "checkintime", "checkouttime"}
     header_index = None
     header_map: dict[str, int] = {}
-    for idx, row in enumerate(rows[:40]):
+    for idx, row in enumerate(rows[:100]):
         keys = {_header_key(v): col for col, v in enumerate(row) if v is not None and str(v).strip()}
         has_employee = any(k in employee_names for k in keys)
         has_time = any(k in timestamp_names or k in date_names or k.startswith("in") or k.startswith("out") for k in keys)
@@ -795,23 +881,17 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Could not identify the header row. Expected an Employee ID/Code column and a Punch Date/Time or IN/OUT columns.")
 
     def find_col(names: set[str]) -> int | None:
-        for name in names:
-            if name in header_map:
-                return header_map[name]
-        return None
+        return next((header_map[name] for name in names if name in header_map), None)
 
     emp_col = find_col(employee_names)
     date_col = find_col(date_names)
     stamp_col = find_col(timestamp_names)
     direction_col = find_col({"direction", "eventtype", "punchtype", "status", "inout", "verifytype"})
-    # Identify daily report columns such as IN-1 / OUT-1, IN-2 / OUT-2.
-    in_cols = sorted((idx, key) for key, idx in header_map.items() if key.startswith("in") and key[2:].isdigit())
-    out_cols = sorted((idx, key) for key, idx in header_map.items() if key.startswith("out") and key[3:].isdigit())
+    in_cols = sorted((idx, key) for key, idx in header_map.items() if re.fullmatch(r"in\d+", key))
+    out_cols = sorted((idx, key) for key, idx in header_map.items() if re.fullmatch(r"out\d+", key))
     if not in_cols and not out_cols and stamp_col is None and not any(k in header_map for k in time_names):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "No punch timestamp columns were found in this file.")
 
-    result: list[dict[str, Any]] = []
-    invalid = 0
     for row_num, row in enumerate(rows[header_index + 1:], start=header_index + 2):
         if emp_col is None or emp_col >= len(row):
             continue
@@ -824,7 +904,6 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
             direction = str(row[direction_col]).strip().upper() if direction_col is not None and direction_col < len(row) and row[direction_col] is not None else None
             values.append((row[stamp_col], direction))
         else:
-            # Some raw logs split date and time into separate columns.
             t_col = find_col(time_names)
             if t_col is not None and t_col < len(row) and row[t_col] not in (None, ""):
                 direction = str(row[direction_col]).strip().upper() if direction_col is not None and direction_col < len(row) and row[direction_col] is not None else None
@@ -840,10 +919,154 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
             if stamp is None:
                 invalid += 1
                 continue
+            if isinstance(employee, float) and employee.is_integer():
+                employee = str(int(employee))
             result.append({"essl_employee_id": str(employee).strip(), "punch_at": stamp, "direction": direction, "source_row": row_num})
     if not result:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"No valid punch timestamps were found. Invalid/empty punch values: {invalid}.")
     return result, invalid
+
+
+def _read_essl_report_employee_metadata(filename: str, content: bytes) -> dict[str, dict[str, str]]:
+    """Collect employee rows, including people who have no punches in the report."""
+    if os.path.splitext(filename.casefold())[1] != ".xlsx":
+        return {}
+    try:
+        from openpyxl import load_workbook
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        rows = [list(row) for row in workbook.active.iter_rows(values_only=True)]
+        workbook.close()
+    except Exception:
+        return {}
+    metadata: dict[str, dict[str, str]] = {}
+    for idx, row in enumerate(rows):
+        if not row or _header_key(row[0]) != "date":
+            continue
+        header_map: dict[str, int] | None = None
+        for header_idx in range(idx + 1, min(idx + 8, len(rows))):
+            candidate = {_header_key(value): col for col, value in enumerate(rows[header_idx])
+                         if value is not None and str(value).strip()}
+            if "ecode" in candidate and "name" in candidate:
+                header_map = candidate
+                break
+        if not header_map:
+            continue
+        for data_row in rows[header_idx + 1:]:
+            if data_row and _header_key(data_row[0]) == "date":
+                break
+            code_idx = header_map["ecode"]
+            if code_idx >= len(data_row) or data_row[code_idx] in (None, ""):
+                continue
+            raw_code = data_row[code_idx]
+            code = str(int(raw_code)) if isinstance(raw_code, float) and raw_code.is_integer() else str(raw_code).strip()
+            if not code:
+                continue
+            def cell(field: str) -> str:
+                col = header_map.get(field)
+                return str(data_row[col]).strip() if col is not None and col < len(data_row) and data_row[col] is not None else ""
+            metadata.setdefault(code, {
+                "essl_employee_id": code,
+                "name": cell("name"),
+                "department": cell("department"),
+                "shift": cell("shift"),
+            })
+    return metadata
+
+
+@router.post("/preview-file")
+async def preview_essl_attendance_file(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    """Validate and preview an ESSL file without writing attendance data."""
+    _require_essl_admin(authorization)
+    filename = file.filename or "attendance.xlsx"
+    content = await file.read()
+    if len(content) > 15 * 1024 * 1024:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "File size must not exceed 15 MB.")
+    punches, invalid_values = _read_attendance_upload(filename, content)
+    unique_employees: dict[str, dict[str, Any]] = _read_essl_report_employee_metadata(filename, content)
+    daily_keys: set[tuple[str, str]] = set()
+    seen_punches: set[tuple[str, datetime]] = set()
+    duplicate_punches = 0
+    for punch in punches:
+        code = str(punch["essl_employee_id"]).strip()
+        unique_employees.setdefault(code, {
+            "essl_employee_id": code,
+            "name": punch.get("employee_name") or "",
+            "department": punch.get("essl_department") or "",
+            "shift": punch.get("shift") or "",
+        })
+        daily_keys.add((code, punch["punch_at"].date().isoformat()))
+        punch_identity = (code, punch["punch_at"])
+        if punch_identity in seen_punches:
+            duplicate_punches += 1
+        seen_punches.add(punch_identity)
+    mapping = {
+        item["essl_employee_id_normalized"]: item
+        for item in users_collection.find({
+            "employee_id": {"$type": "string", "$ne": ""},
+            "essl_employee_id_normalized": {"$type": "string"},
+        }, {"essl_employee_id_normalized": 1, "name": 1, "employee_id": 1, "department": 1, "is_active": 1})
+    }
+    # Employee master records use `status` (for example, "Active") rather than
+    # consistently storing `is_active`. Do not filter on a field that may not
+    # exist; that was causing every HRMS department to appear blank in ESSL.
+    departments: dict[str, str] = {}
+    for item in employees_collection.find(
+        {"employee_id": {"$type": "string", "$ne": ""}},
+        {"employee_id": 1, "department": 1, "status": 1, "is_active": 1},
+    ):
+        employee_status = str(item.get("status", "Active")).strip().casefold()
+        if item.get("is_active") is False or employee_status in {"inactive", "terminated", "disabled"}:
+            continue
+        employee_key = str(item.get("employee_id", "")).strip()
+        department_name = str(item.get("department", "") or "").strip()
+        if employee_key and department_name:
+            departments[employee_key] = department_name
+    employee_rows = []
+    for code, item in sorted(unique_employees.items(), key=lambda pair: pair[0].casefold()):
+        mapped = mapping.get(_normalise_employee_id(code))
+        hrms_department = (mapped.get("department") or departments.get(mapped.get("employee_id"), "")) if mapped else ""
+        essl_department = str(item.get("department") or "").strip()
+        department_mismatch = bool(essl_department and hrms_department and
+                                   essl_department.casefold() != hrms_department.casefold())
+        employee_rows.append({
+            **item,
+            "mapping_status": "unmapped" if not mapped else ("department_mismatch" if department_mismatch else "mapped"),
+            "hrms_employee_id": mapped.get("employee_id", "") if mapped else "",
+            "hrms_employee_name": mapped.get("name", "") if mapped else "",
+            "hrms_department": hrms_department,
+            "department_mismatch": department_mismatch,
+        })
+    stamps = [punch["punch_at"].date().isoformat() for punch in punches]
+    return {
+        "filename": filename,
+        "status": "VALIDATED",
+        "reporting_period": {"from_date": min(stamps), "to_date": max(stamps)},
+        "employee_count": len(unique_employees),
+        "daily_employee_records": len(daily_keys),
+        "valid_punches": len(punches),
+        "potential_duplicate_punches": duplicate_punches,
+        "invalid_punch_values": invalid_values,
+        "unmapped_employee_count": sum(1 for item in employee_rows if item["mapping_status"] == "unmapped"),
+        "mapped_employee_count": sum(1 for item in employee_rows if item["mapping_status"] != "unmapped"),
+        "department_mismatch_count": sum(1 for item in employee_rows if item.get("department_mismatch")),
+        "employees": employee_rows,
+        "preview": [
+            {
+                "employee_code": punch["essl_employee_id"],
+                "employee_name": punch.get("employee_name", ""),
+                "attendance_date": punch["punch_at"].date().isoformat(),
+                "punch_time": punch["punch_at"].strftime("%H:%M:%S"),
+                "direction": punch.get("direction"),
+            }
+            for punch in punches[:100]
+        ],
+        "preview_limit": 100,
+        # Partial imports are supported: only block if no ESSL employee is mapped.
+        "requires_mapping_before_import": not any(item["mapping_status"] != "unmapped" for item in employee_rows),
+    }
 
 
 @router.post("/import-file")
@@ -863,7 +1086,7 @@ async def import_essl_attendance_file(
     mapping = {
         user["essl_employee_id_normalized"]: user
         for user in users_collection.find({
-            "role": {"$regex": "^employee$", "$options": "i"},
+            "employee_id": {"$type": "string", "$ne": ""},
             "essl_employee_id_normalized": {"$type": "string"},
         })
     }
@@ -1102,36 +1325,98 @@ def save_essl_config(
 def list_essl_employee_mappings(
     authorization: str | None = Header(default=None),
 ):
+    """List HRMS users with departments resolved from the authoritative HR data.
+
+    Department can be stored on the login user, employee master, employee
+    details, or as a department reference. Resolve these sources in priority
+    order without changing the underlying employee record.
+    """
     _require_essl_admin(authorization)
-    employees = users_collection.find(
-        {"role": {"$regex": "^employee$", "$options": "i"}},
+    employees = list(users_collection.find(
+        {"employee_id": {"$type": "string", "$ne": ""}},
         {
-            "name": 1,
-            "employee_id": 1,
-            "essl_employee_id": 1,
-            "is_active": 1,
-            "department": 1,
+            "name": 1, "employee_id": 1, "essl_employee_id": 1,
+            "is_active": 1, "department": 1, "department_id": 1,
+            "role": 1, "status": 1,
         },
-    ).sort("name", 1)
-    departments = {
-        record.get("employee_id"): record.get("department", "")
-        for record in employees_collection.find(
-            {"is_active": True},
-            {"employee_id": 1, "department": 1},
+    ).sort("name", 1))
+
+    def clean(value: Any) -> str:
+        if isinstance(value, dict):
+            return str(value.get("department_name") or value.get("name") or value.get("department") or "").strip()
+        return str(value or "").strip()
+
+    # Employee master keyed by employee_id is the authoritative source when
+    # the login-user record does not carry the department itself.
+    employee_master_by_id: dict[str, dict[str, Any]] = {}
+    for record in employees_collection.find(
+        {"employee_id": {"$type": "string", "$ne": ""}},
+        {"employee_id": 1, "department": 1, "department_id": 1, "status": 1, "is_active": 1},
+    ):
+        key = str(record.get("employee_id") or "").strip().casefold()
+        if key:
+            employee_master_by_id[key] = record
+
+    # Employee details may contain the latest department assignment.
+    details_collection = db["employee_details"]
+    details_by_employee_id: dict[str, dict[str, Any]] = {}
+    details_by_user_id: dict[str, dict[str, Any]] = {}
+    for record in details_collection.find({}, {
+        "employee_id": 1, "user_id": 1, "department": 1, "department_id": 1,
+    }):
+        employee_key = str(record.get("employee_id") or "").strip().casefold()
+        user_key = str(record.get("user_id") or "").strip()
+        if employee_key:
+            details_by_employee_id[employee_key] = record
+        if user_key:
+            details_by_user_id[user_key] = record
+
+    department_names_by_id: dict[str, str] = {}
+    for record in db["departments"].find({}, {"department_name": 1, "name": 1}):
+        department_id = str(record.get("_id") or "")
+        department_name = clean(record.get("department_name") or record.get("name"))
+        if department_id and department_name:
+            department_names_by_id[department_id] = department_name
+
+    result = []
+    for employee in employees:
+        employee_id = str(employee.get("employee_id") or "").strip()
+        employee_key = employee_id.casefold()
+        user_id = str(employee["_id"])
+        master = employee_master_by_id.get(employee_key, {})
+        details = details_by_user_id.get(user_id) or details_by_employee_id.get(employee_key) or {}
+
+        department = (
+            clean(employee.get("department"))
+            or clean(details.get("department"))
+            or clean(master.get("department"))
         )
-    }
-    return [
-        {
-            "user_id": str(employee["_id"]),
-            "name": employee.get("name", ""),
-            "employee_id": employee.get("employee_id", ""),
+        department_ref = (
+            employee.get("department_id")
+            or details.get("department_id")
+            or master.get("department_id")
+        )
+        if not department and department_ref is not None:
+            department = department_names_by_id.get(str(department_ref), "")
+        # Some installations store the department as an ObjectId string or
+        # reference in the department field rather than the display name.
+        if department and department in department_names_by_id:
+            department = department_names_by_id[department]
+
+        active = employee.get("is_active")
+        if active is None:
+            status_value = str(employee.get("status") or master.get("status") or "Active").strip().casefold()
+            active = status_value not in {"inactive", "terminated", "disabled"}
+        result.append({
+            "user_id": user_id,
+            "name": employee.get("name", "") or master.get("employee_name", ""),
+            "employee_id": employee_id,
             "essl_employee_id": employee.get("essl_employee_id", ""),
-            "is_active": bool(employee.get("is_active", False)),
-            "department": employee.get("department")
-            or departments.get(employee.get("employee_id"), ""),
-        }
-        for employee in employees
-    ]
+            "is_active": bool(active),
+            "role": employee.get("role", ""),
+            "department": department or "",
+        })
+    return result
 
 
 @router.put("/employees/{user_id}")
@@ -1146,7 +1431,7 @@ def update_essl_employee_mapping(
     employee = users_collection.find_one(
         {
             "_id": ObjectId(user_id),
-            "role": {"$regex": "^employee$", "$options": "i"},
+            "employee_id": {"$type": "string", "$ne": ""},
         }
     )
     if not employee:

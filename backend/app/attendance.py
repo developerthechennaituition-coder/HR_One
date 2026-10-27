@@ -84,6 +84,8 @@ WFH_MAX_LOCATION_ACCURACY_METERS = 100
 WFH_MAX_ALLOWED_RADIUS_METERS = 5000
 WFH_MAX_LOCATION_AGE_SECONDS = 120
 WFH_MAX_LOCATION_FUTURE_SKEW_SECONDS = 30
+WFH_LATE_CHECK_IN_REQUEST_TYPE = "wfh_late_check_in"
+WFH_LATE_CHECK_IN_EXTENSION = timedelta(hours=2)
 WFH_ATTENDANCE_ENABLED = os.getenv(
     "WFH_ATTENDANCE_ENABLED",
     "true",
@@ -105,6 +107,8 @@ wfh_face_templates_collection = db["wfh_face_templates"]
 wfh_liveness_challenges_collection = db["wfh_liveness_challenges"]
 wfh_email_tokens_collection = db["wfh_email_verification_tokens"]
 wfh_email_sessions_collection = db["wfh_email_verification_sessions"]
+# Shared with the Leave module's permission workflow (approval queue/decisions).
+permission_requests_collection = db["permission_requests"]
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +123,22 @@ COMPANY_START_TIME = os.getenv(
     "COMPANY_START_TIME",
     "09:00",
 )
+
+
+WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def company_weekly_off_weekdays() -> set[int]:
+    """Weekly-off weekdays (0=Monday) configured by HR Admin; none by default."""
+    policy = db["leave_policies"].find_one(
+        {"leave_type_id": "__company_policy__"},
+        {"weekly_off_weekdays": 1},
+    ) or {}
+    return {
+        WEEKDAY_NAMES.index(day)
+        for day in policy.get("weekly_off_weekdays") or []
+        if day in WEEKDAY_NAMES
+    }
 
 
 def company_now() -> datetime:
@@ -372,6 +392,14 @@ def ensure_attendance_indexes() -> None:
     wfh_email_tokens_collection.create_index([("user_id", 1), ("created_at", -1)])
     wfh_email_sessions_collection.create_index("token_hash", unique=True)
     wfh_email_sessions_collection.create_index("expires_at", expireAfterSeconds=0)
+    # One late check-in request per employee per day, so repeated attempts
+    # cannot create duplicate requests/notifications or repeated extensions.
+    permission_requests_collection.create_index(
+        [("user_id", 1), ("permission_date", 1)],
+        unique=True,
+        partialFilterExpression={"request_type": WFH_LATE_CHECK_IN_REQUEST_TYPE},
+        name="uniq_wfh_late_check_in_per_day",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +523,7 @@ def _leave_covers(
     Determine whether a leave actually covers a particular date.
 
     New leave records contain leave_dates.
-    Older leave records may not, so Monday-Friday is used as fallback.
+    Older leave records may not, so HR-configured weekly offs are excluded.
     """
 
     dates = leave.get("leave_dates")
@@ -504,7 +532,8 @@ def _leave_covers(
         return date_iso in dates
 
     return (
-        date.fromisoformat(date_iso).weekday() < 5
+        date.fromisoformat(date_iso).weekday()
+        not in company_weekly_off_weekdays()
     )
 
 
@@ -1225,6 +1254,163 @@ def _today_wfh_attendance(user_id: str) -> dict[str, Any] | None:
     )
 
 
+def _wfh_check_in_deadlines(
+    user: dict[str, Any],
+    now_local: datetime,
+) -> tuple[datetime, datetime, datetime]:
+    """Return today's earliest check-in, normal deadline and late-permission deadline."""
+    scheduled_start = time.fromisoformat(str(user["wfh_permitted_start_time"]))
+    scheduled_start_dt = datetime.combine(now_local.date(), scheduled_start, tzinfo=now_local.tzinfo)
+    earliest = scheduled_start_dt - timedelta(minutes=15)
+    latest_normal = scheduled_start_dt + timedelta(hours=1)
+    # An approved late permission extends the normal deadline (not the current
+    # time) by two hours, but never past the employee's scheduled WFH end time.
+    extended = latest_normal + WFH_LATE_CHECK_IN_EXTENSION
+    end_time = user.get("wfh_permitted_end_time")
+    if end_time:
+        scheduled_end_dt = datetime.combine(now_local.date(), time.fromisoformat(str(end_time)), tzinfo=now_local.tzinfo)
+        if latest_normal < scheduled_end_dt < extended:
+            extended = scheduled_end_dt
+    return earliest, latest_normal, extended
+
+
+def _wfh_late_check_in_request(user_id: str, attendance_date: str) -> dict[str, Any] | None:
+    return permission_requests_collection.find_one(
+        {
+            "user_id": user_id,
+            "permission_date": attendance_date,
+            "request_type": WFH_LATE_CHECK_IN_REQUEST_TYPE,
+        }
+    )
+
+
+def _wfh_late_check_in_status(user: dict[str, Any]) -> dict[str, Any] | None:
+    """Today's late check-in permission state for the employee WFH page."""
+    if not user.get("wfh_permitted_start_time"):
+        return None
+    now_local = company_now()
+    _, latest_normal, extended = _wfh_check_in_deadlines(user, now_local)
+    request = _wfh_late_check_in_request(str(user["_id"]), now_local.date().isoformat())
+    if request and request.get("end_time"):
+        extended = datetime.combine(now_local.date(), time.fromisoformat(str(request["end_time"])), tzinfo=now_local.tzinfo)
+    return {
+        "attendance_date": now_local.date().isoformat(),
+        "normal_deadline": latest_normal.strftime("%H:%M"),
+        "extended_deadline": extended.strftime("%H:%M"),
+        "is_late": now_local > latest_normal,
+        "is_expired": now_local > extended,
+        "request_id": str(request["_id"]) if request else None,
+        "status": request.get("status") if request else None,
+        "requested_at": request.get("created_at") if request else None,
+        "decided_at": request.get("decided_at") if request else None,
+        "decision_remarks": request.get("decision_remarks") if request else None,
+    }
+
+
+def _submit_wfh_late_check_in_request(
+    user: dict[str, Any],
+    now_local: datetime,
+    earliest: datetime,
+    latest_normal: datetime,
+    extended: datetime,
+) -> None:
+    # Reuse the Leave module's permission workflow so the request appears in the
+    # existing approval queue and decision endpoints. Imported lazily because
+    # app.leave imports this module.
+    from app.leave import _audit, _get_reporting_manager_id, _permission_notify
+
+    user_id = str(user["_id"])
+    manager_id = _get_reporting_manager_id(user)
+    manager = (
+        users_collection.find_one({"_id": ObjectId(manager_id), "is_active": True})
+        if manager_id and ObjectId.is_valid(manager_id)
+        else None
+    )
+    if not manager or str(manager["_id"]) == user_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "You are outside the normal WFH check-in window. Late check-in needs reporting-manager approval, "
+            "but no active reporting manager is assigned to you. Please contact HR Admin.",
+        )
+    manager_id = str(manager["_id"])
+    attendance_date = now_local.date().isoformat()
+    attempted_at = now_local.strftime("%H:%M")
+    window = f"{earliest.strftime('%H:%M')}–{latest_normal.strftime('%H:%M')}"
+    extension_minutes = int((extended - latest_normal).total_seconds() // 60)
+    extension = f"{extension_minutes // 60}h {extension_minutes % 60:02d}m"
+    now = now_local.astimezone(timezone.utc)
+    record = {
+        "user_id": user_id,
+        "reporting_manager_id": manager_id,
+        "request_type": WFH_LATE_CHECK_IN_REQUEST_TYPE,
+        "permission_date": attendance_date,
+        "start_time": latest_normal.strftime("%H:%M"),
+        "end_time": extended.strftime("%H:%M"),
+        "reason": (
+            f"WFH late check-in attempted at {attempted_at}. Normal check-in window: {window}. "
+            f"Requested {extension} extension until {extended.strftime('%H:%M')}."
+        ),
+        "status": "pending",
+        "check_in_attempted_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        result = permission_requests_collection.insert_one(record)
+    except DuplicateKeyError:
+        # A concurrent attempt already created (and notified) today's request.
+        return
+    request_id = str(result.inserted_id)
+
+    employee_master = db["employees"].find_one({"employee_id": str(user.get("employee_id") or "")}) or {}
+    employee_details = db["employee_details"].find_one({"user_id": user_id}) or {}
+    department = user.get("department") or employee_master.get("department") or employee_details.get("department")
+    employee_label = f"{user.get('name') or 'Employee'} ({user.get('employee_id') or 'No employee ID'})"
+    message = (
+        f"{employee_label}{f', {department}' if department else ''} attempted to check in after the permitted "
+        f"WFH attendance window on {attendance_date}. Scheduled start: {user.get('wfh_permitted_start_time')}; "
+        f"normal check-in window: {window}; attempted at: {attempted_at}. Requested permission: {extension} "
+        f"extension, check-in allowed until {extended.strftime('%H:%M')} if approved. Please review the request "
+        "in Leave > Permission > Permission Approval Queue and approve or reject the additional check-in permission."
+    )
+    try:
+        _permission_notify(manager_id, "WFH Late Check-In Approval Required", message, request_id)
+    except Exception as exc:
+        # Do not leave a pending request the manager was never told about.
+        logger.exception("Unable to notify reporting manager about WFH late check-in request %s", request_id)
+        permission_requests_collection.delete_one({"_id": result.inserted_id, "status": "pending"})
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Your late check-in request could not be sent to your reporting manager. Please try again.",
+        ) from exc
+    _audit(user, "WFH_LATE_CHECK_IN_REQUESTED", request_id, {"permission_date": attendance_date, "reporting_manager_id": manager_id})
+
+
+def _assert_wfh_late_check_in_permitted(
+    user: dict[str, Any],
+    now_local: datetime,
+    earliest: datetime,
+    latest_normal: datetime,
+    extended: datetime,
+) -> None:
+    request = _wfh_late_check_in_request(str(user["_id"]), now_local.date().isoformat())
+    request_status = request.get("status") if request else None
+    if request_status == "approved":
+        # Honour the deadline the manager approved for this employee and date.
+        approved_until = datetime.combine(now_local.date(), time.fromisoformat(str(request["end_time"])), tzinfo=now_local.tzinfo)
+        if now_local <= approved_until:
+            return
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Your approved late WFH check-in permission for today expired at {request['end_time']}.")
+    if request_status == "pending":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Your late WFH check-in request for today is awaiting reporting-manager approval. Check-in will be available after approval, until {request.get('end_time')}.")
+    if request:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your reporting manager rejected late WFH check-in permission for today. Check-in is not available outside the normal WFH check-in window.")
+    if now_local > extended:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"The WFH check-in window closed at {latest_normal.strftime('%H:%M')}, and the late check-in permission period ended at {extended.strftime('%H:%M')}. Please contact HR Admin.")
+    _submit_wfh_late_check_in_request(user, now_local, earliest, latest_normal, extended)
+    raise HTTPException(status.HTTP_403_FORBIDDEN, f"You are outside the normal WFH check-in window. A reporting manager must approve late-time permission before check-in can proceed. Your request has been sent to your reporting manager; once approved, you can check in until {extended.strftime('%H:%M')}.")
+
+
 def _assert_wfh_action_allowed(
     user: dict[str, Any],
     purpose: str,
@@ -1245,16 +1431,15 @@ def _assert_wfh_action_allowed(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "WFH start and end times have not been configured. Please contact HR Admin.")
     # Start/end times describe the daily schedule. Check-in gets a separate
     # grace window; check-out remains possible after the scheduled end time.
+    late_check_in = False
     if purpose == "check_in":
         now_local = company_now()
-        scheduled_start = time.fromisoformat(str(start_time))
-        scheduled_start_dt = datetime.combine(now_local.date(), scheduled_start, tzinfo=now_local.tzinfo)
-        earliest = scheduled_start_dt - timedelta(minutes=15)
-        latest_normal = scheduled_start_dt + timedelta(hours=1)
+        earliest, latest_normal, extended = _wfh_check_in_deadlines(user, now_local)
         if now_local < earliest:
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"WFH check-in opens 15 minutes before your scheduled start time ({start_time}).")
-        if now_local > latest_normal:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "You are outside the normal WFH check-in window. A reporting manager must approve late-time permission before check-in can proceed.")
+        # Decided after the duplicate/leave checks below, so an approval request
+        # is raised only for a genuine check-in attempt.
+        late_check_in = now_local > latest_normal
     attendance = _today_wfh_attendance(user_id)
     if purpose == "check_in":
         if attendance:
@@ -1276,6 +1461,8 @@ def _assert_wfh_action_allowed(
                 status.HTTP_409_CONFLICT,
                 "You are on approved full-day leave and cannot mark WFH attendance.",
             )
+        if late_check_in:
+            _assert_wfh_late_check_in_permitted(user, now_local, earliest, latest_normal, extended)
     elif purpose == "check_out":
         if (
             not attendance
@@ -1523,6 +1710,7 @@ def get_my_wfh_settings(
         ),
         "attendance_already_marked": record is not None,
         "wfh_breaks": (record or {}).get("wfh_breaks", []),
+        "late_check_in_permission": _wfh_late_check_in_status(user),
     }
 
 
@@ -2287,6 +2475,10 @@ def wfh_check_in(
     now = company_now()
     verified_at = now.astimezone(timezone.utc)
     date_iso = now.date().isoformat()
+    # Link the approved late permission that authorised this check-in (audit trail).
+    late_permission = None
+    if user.get("wfh_permitted_start_time") and now > _wfh_check_in_deadlines(user, now)[1]:
+        late_permission = _wfh_late_check_in_request(user_id, date_iso)
     try:
         result = attendance_collection.insert_one(
             {
@@ -2315,6 +2507,11 @@ def wfh_check_in(
                 "check_in_approved_radius_meters": radius,
                 "check_in_approved_location_name": approved_location_name,
                 "check_in_verified_at": verified_at,
+                "late_check_in_permission_request_id": (
+                    str(late_permission["_id"])
+                    if late_permission and late_permission.get("status") == "approved"
+                    else None
+                ),
                 "marked_by": user_id,
                 "created_at": verified_at,
                 "updated_at": verified_at,

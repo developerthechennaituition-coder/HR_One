@@ -1,6 +1,9 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
+import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
+import MyAttendanceRequests from "../components/MyAttendanceRequests";
+import { getAttendanceCalendar } from "../services/attendanceRequestApi";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
@@ -25,6 +28,7 @@ const formatTime = (time) => {
 const getSource = (record) => {
   if (record?.attendance_source === "ESSL") return "ESSL";
   if (record?.attendance_source === "MANUAL") return "Manual";
+  if (record?.attendance_source === "ATTENDANCE_REQUEST") return "Attendance Request";
   if (record?.attendance_source === "WFH_FACE_GPS") {
     return "WFH · Face + Liveness + GPS";
   }
@@ -35,6 +39,7 @@ const getAttendanceType = (record) => {
   if (record?.attendance_type === "WFH" || record?.attendance_source === "WFH_FACE_GPS") {
     return "Work From Home";
   }
+  if (record?.attendance_source === "ATTENDANCE_REQUEST") return "Not Recorded";
   if (record?.attendance_type === "OFFICE" || record?.attendance_source) {
     return "Work From Office";
   }
@@ -81,6 +86,57 @@ function EmployeeAttendance({ session, onNavigate }) {
   useEffect(() => {
     loadAttendance();
   }, [loadAttendance]);
+
+  // Calendar, Detailed Attendance by Date and the request form share one
+  // selected date and the same backend calendar data.
+  const [calendarYear, setCalendarYear] = useState(year);
+  const [calendarMonth, setCalendarMonth] = useState(month);
+  const [calendar, setCalendar] = useState(null);
+  const [calendarLoading, setCalendarLoading] = useState(true);
+  const [calendarError, setCalendarError] = useState("");
+  const [selectedDate, setSelectedDate] = useState(todayDate);
+  const [requestFormOpen, setRequestFormOpen] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const loadCalendar = useCallback(async () => {
+    setCalendarLoading(true);
+    try {
+      setCalendar(await getAttendanceCalendar(calendarYear, calendarMonth));
+      setCalendarError("");
+    } catch (loadError) {
+      setCalendar(null);
+      setCalendarError(loadError.message || "Unable to load the attendance calendar.");
+    } finally {
+      setCalendarLoading(false);
+    }
+  }, [calendarMonth, calendarYear]);
+
+  useEffect(() => {
+    loadCalendar();
+  }, [loadCalendar]);
+
+  const selectDate = (iso) => {
+    if (!iso) return;
+    setSelectedDate(iso);
+    const [selectedYear, selectedMonth] = iso.split("-").map(Number);
+    if (selectedYear !== calendarYear || selectedMonth !== calendarMonth) {
+      setCalendarYear(selectedYear);
+      setCalendarMonth(selectedMonth);
+    }
+  };
+
+  const changeCalendarMonth = (nextYear, nextMonth) => {
+    setCalendarYear(nextYear);
+    setCalendarMonth(nextMonth);
+    setRequestFormOpen(false);
+  };
+
+  const refreshAll = async () => {
+    setRefreshKey((value) => value + 1);
+    await Promise.all([loadAttendance(), loadCalendar()]);
+  };
+
+  const selectedCalendarDay = calendar?.days?.find((day) => day.attendance_date === selectedDate) || null;
 
   useEffect(() => {
     if (!token) return;
@@ -153,8 +209,16 @@ function EmployeeAttendance({ session, onNavigate }) {
           </button>
           <button
             type="button"
+            className="btn btn-outline-primary"
+            onClick={() => setRequestFormOpen(true)}
+            disabled={!calendar}
+          >
+            Attendance Request
+          </button>
+          <button
+            type="button"
             className="btn btn-outline-secondary"
-            onClick={loadAttendance}
+            onClick={refreshAll}
           >
             Refresh
           </button>
@@ -258,8 +322,38 @@ function EmployeeAttendance({ session, onNavigate }) {
         </div>
       </div>
 
-      <AttendanceDayBreakdown userId="me" title="Detailed attendance by date" />
-      
+      {calendarError && <div className="alert alert-danger" role="alert">{calendarError}</div>}
+      <MyAttendanceCalendar
+        year={calendarYear}
+        month={calendarMonth}
+        maxYear={year}
+        maxMonth={month}
+        calendar={calendar}
+        loading={calendarLoading}
+        selectedDate={selectedDate}
+        onSelectDate={selectDate}
+        onMonthChange={changeCalendarMonth}
+      />
+
+      <AttendanceDayBreakdown
+        userId="me"
+        title="Detailed attendance by date"
+        date={selectedDate}
+        onDateChange={selectDate}
+        showStatus
+        calendarDay={selectedCalendarDay}
+        refreshKey={refreshKey}
+      />
+
+      <MyAttendanceRequests
+        calendar={calendar}
+        year={calendarYear}
+        month={calendarMonth}
+        open={requestFormOpen}
+        onOpenChange={setRequestFormOpen}
+        onChanged={loadCalendar}
+        refreshKey={refreshKey}
+      />
     </div>
   );
 }

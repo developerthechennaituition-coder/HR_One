@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { isWeeklyOff, useCompanyWeeklyOffs, weeklyOffLabel } from "../services/weeklyOff";
 import { useEffect, useMemo, useState } from "react";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
 
@@ -59,6 +60,7 @@ const readError = async (response) => {
 };
 
 function HolidayCalendarSetup({ currentUser }) {
+  const weeklyOffDays = useCompanyWeeklyOffs();
   const [companies, setCompanies] = useState([]);
   const [employees, setEmployees] = useState([]);
   const [calendars, setCalendars] = useState([]);
@@ -297,7 +299,7 @@ function HolidayCalendarSetup({ currentUser }) {
             const day = index + 1;
             const key = `${year}-${String(monthIndex + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
             const holiday = holidaysByDate.get(key);
-            const weekend = new Date(year, monthIndex, day).getDay() === 0;
+            const weekend = isWeeklyOff(weeklyOffDays, new Date(year, monthIndex, day));
             const localToday = new Date();
             const isToday = localToday.getFullYear() === year &&
               localToday.getMonth() === monthIndex && localToday.getDate() === day;
@@ -1097,7 +1099,7 @@ function HolidayCalendarSetup({ currentUser }) {
                     <div className="d-flex flex-wrap gap-3 small">
                       <span><i className="bi bi-square-fill text-success me-1" />Company holiday</span>
                       <span><i className="bi bi-square-fill text-info me-1" />Public holiday</span>
-                      <span><i className="bi bi-circle-fill text-danger me-1" />Sunday</span>
+                      <span><i className="bi bi-circle-fill text-danger me-1" />{weeklyOffLabel(weeklyOffDays)}</span>
                       <span><i className="bi bi-square border border-primary border-2 me-1" />Today</span>
                     </div>
                   </div>

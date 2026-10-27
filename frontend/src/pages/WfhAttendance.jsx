@@ -111,6 +111,20 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
     loadSettings();
   }, [loadSettings]);
 
+  // Revalidate while a late check-in request awaits a decision or an approved
+  // extension is running, so approval/expiry is reflected without a manual refresh.
+  const latePermissionStatus = settings?.late_check_in_permission?.status;
+  const awaitingLateCheckIn =
+    !settings?.attendance_already_marked &&
+    (latePermissionStatus === "pending" || latePermissionStatus === "approved");
+  useEffect(() => {
+    if (!awaitingLateCheckIn) return undefined;
+    const timer = window.setInterval(() => {
+      if (!workingRef.current) loadSettings();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [awaitingLateCheckIn, loadSettings]);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -510,6 +524,8 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
         setFallbackRequestPurpose(action);
         setShowFallbackOptions(false);
         setError(requestError.message || "Unable to mark WFH attendance.");
+        // A late attempt may have raised a manager approval request; show its status.
+        if (action === "check_in") loadSettings();
       }
     } finally {
       workingRef.current = false;
@@ -603,10 +619,19 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
   );
   const canStartBreak = Boolean(attendance?.check_in_time && !attendance?.check_out_time && !activeBreak);
   const canEndBreak = Boolean(attendance?.check_in_time && !attendance?.check_out_time && activeBreak);
+  const latePermission = settings?.late_check_in_permission;
+  // Outside the normal window, Check In stays available only to raise the first
+  // approval request or while an approved extension is still valid.
+  const lateCheckInBlocked = Boolean(
+    latePermission?.is_late &&
+      (latePermission.is_expired ||
+        (latePermission.status && latePermission.status !== "approved")),
+  );
   const canCheckIn =
     settings?.is_wfh_enabled &&
     settings?.face_registered &&
-    !settings?.attendance_already_marked;
+    !settings?.attendance_already_marked &&
+    !lateCheckInBlocked;
   const canCheckOut =
     settings?.is_wfh_enabled &&
     settings?.face_registered &&
@@ -644,9 +669,38 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
           {settings.wfh_permitted_end_time && <> · Ends {settings.wfh_permitted_end_time}</>}
         </div>
       )}
+      {latePermission?.is_late && !settings?.attendance_already_marked && (
+        latePermission.status === "approved" && !latePermission.is_expired ? (
+          <div className="alert alert-success py-2" role="status">
+            Late check-in approved by your reporting manager. You can check in until <strong>{formatTime(latePermission.extended_deadline)}</strong>.
+          </div>
+        ) : latePermission.status === "approved" ? (
+          <div className="alert alert-danger py-2" role="status">
+            Your approved late check-in permission expired at <strong>{formatTime(latePermission.extended_deadline)}</strong>. Check-in is no longer available today.
+          </div>
+        ) : latePermission.status === "pending" ? (
+          <div className="alert alert-warning py-2" role="status">
+            Late check-in request submitted to your reporting manager and awaiting approval. Check-in is disabled until it is approved
+            {latePermission.is_expired ? "; the late check-in period has now ended." : <>, and will then be available until <strong>{formatTime(latePermission.extended_deadline)}</strong>.</>}
+          </div>
+        ) : latePermission.status === "rejected" ? (
+          <div className="alert alert-danger py-2" role="status">
+            Your reporting manager rejected late check-in permission for today. Check-in is not available outside the normal window (closed at {formatTime(latePermission.normal_deadline)}).
+            {latePermission.decision_remarks && <div className="small mt-1">Remarks: {latePermission.decision_remarks}</div>}
+          </div>
+        ) : latePermission.is_expired ? (
+          <div className="alert alert-danger py-2" role="status">
+            The WFH check-in window closed at {formatTime(latePermission.normal_deadline)} and the late check-in permission period ended at {formatTime(latePermission.extended_deadline)}. Please contact HR Admin.
+          </div>
+        ) : (
+          <div className="alert alert-warning py-2" role="status">
+            The normal WFH check-in window closed at <strong>{formatTime(latePermission.normal_deadline)}</strong>. Late check-in requires reporting-manager approval. Select Check In to send an approval request to your reporting manager.
+          </div>
+        )
+      )}
       {error && <div className="alert alert-danger" role="alert">{error}</div>}
       {notice && <div className="alert alert-success" role="status">{notice}</div>}
-      {fallbackRequestPurpose && !fallbackPurpose && (
+      {fallbackRequestPurpose && !fallbackPurpose && !(fallbackRequestPurpose === "check_in" && lateCheckInBlocked) && (
         <div className="alert alert-warning" role="region" aria-label="Alternative WFH verification options">
           <div className="d-flex flex-column flex-lg-row align-items-lg-start justify-content-between gap-3">
             <div>
