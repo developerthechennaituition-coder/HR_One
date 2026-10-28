@@ -848,6 +848,20 @@ def get_team_member_attendance(
             )
             approved_leaves.append(serialized_leave)
 
+    # Published holidays that apply to this member (religion + assigned calendar).
+    holidays = []
+    if year is not None and month is not None:
+        from calendar import monthrange
+        from datetime import date
+
+        from app.leave import _holiday_names
+
+        month_holidays = _holiday_names(member, date(year, month, 1), date(year, month, monthrange(year, month)[1]))
+        holidays = [
+            {"holiday_date": day.isoformat(), "holiday_name": name}
+            for day, name in sorted(month_holidays.items())
+        ]
+
     attendance_type=attendance_collection.distinct(
         "attendance_type",
         {"user_id": member_id},
@@ -875,5 +889,6 @@ def get_team_member_attendance(
             for record in records
         ],
         "approved_leaves": approved_leaves,
+        "holidays": holidays,
         "attendance_type":attendance_type,
     }

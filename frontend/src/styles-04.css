@@ -228,6 +228,16 @@
   color: #0b3d4a;
 }
 
+.team-selected-status.weeklyoff {
+  background: #eef0f2;
+  color: #495057;
+}
+
+.team-selected-status.notapplicable {
+  background: #fff1e6;
+  color: #b45309;
+}
+
 .team-selected-status.notmarked {
   background: #fff4df;
   color: #7a5a2f;

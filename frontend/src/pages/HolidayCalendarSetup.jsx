@@ -14,6 +14,7 @@ const emptyCalendar = {
   country: "India",
   state: "Tamil Nadu",
   description: "",
+  religion: "",
 };
 
 const emptyHoliday = {
@@ -81,6 +82,12 @@ function HolidayCalendarSetup({ currentUser }) {
   const [feedback, setFeedback] = useState({ type: "", message: "" });
   const [suggestedHolidays, setSuggestedHolidays] = useState([]);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  // Religions come from employee records; years are limited by the backend.
+  const [options, setOptions] = useState({ religions: [], allowed_years: [], existing_calendars: [] });
+  // In-page confirmation (optionally asking for a reason) instead of browser prompts.
+  const [confirmDialog, setConfirmDialog] = useState(null);
+  const [confirmReason, setConfirmReason] = useState("");
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const canManage = ["hr admin", "administrator"].includes(
     String(currentUser?.role || "").trim().toLowerCase(),
   );
@@ -88,6 +95,41 @@ function HolidayCalendarSetup({ currentUser }) {
   const selectedCalendar = calendars.find(
     (calendar) => calendar.id === selectedCalendarId,
   );
+  const isReligionCalendar = Boolean(selectedCalendar?.religion_key);
+  const calendarTitle = (calendar) =>
+    calendar.religion ? `${calendar.religion} · ${calendar.calendar_year}` : `${calendar.calendar_year} · Company-wide`;
+  const duplicateCalendar = !editingCalendarId && calendarForm.religion
+    ? calendars.find((calendar) =>
+        String(calendar.religion || "").toLowerCase() === calendarForm.religion.toLowerCase() &&
+        Number(calendar.calendar_year) === Number(calendarForm.calendar_year))
+    : null;
+
+  const askConfirm = (dialog) => {
+    setConfirmReason("");
+    setConfirmDialog(dialog);
+  };
+
+  const runConfirm = async () => {
+    if (!confirmDialog) return;
+    if (confirmDialog.requireReason && confirmReason.trim().length < 3) return;
+    setConfirmBusy(true);
+    try {
+      await confirmDialog.onConfirm(confirmReason.trim());
+      setConfirmDialog(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
+  const loadOptions = async () => {
+    if (!canManage) return;
+    try {
+      const response = await fetch(`${API_ROOT}/holiday-calendars/options`);
+      if (response.ok) setOptions(await response.json());
+    } catch {
+      // The form explains that religions could not be loaded.
+    }
+  };
   const companyName = (companyId) =>
     companies.find((company) => company.id === companyId)?.company ||
     "Unknown company";
@@ -252,6 +294,7 @@ function HolidayCalendarSetup({ currentUser }) {
 
   useEffect(() => {
     loadData();
+    loadOptions();
   }, []);
 
   useEffect(() => {
@@ -272,7 +315,7 @@ function HolidayCalendarSetup({ currentUser }) {
     return calendars.filter(
       (calendar) =>
         !search ||
-        `${calendar.calendar_name} ${calendar.location} ${companyName(calendar.company_id)}`
+        `${calendar.calendar_name} ${calendar.religion || ""} ${calendar.calendar_year} ${calendar.location} ${companyName(calendar.company_id)}`
           .toLowerCase()
           .includes(search),
     );
@@ -329,8 +372,13 @@ function HolidayCalendarSetup({ currentUser }) {
     setEditingCalendarId(calendar?.id || null);
     setCalendarForm(
       calendar
-        ? { ...calendar }
-        : { ...emptyCalendar, company_id: companies[0]?.id || "" },
+        ? { ...calendar, religion: calendar.religion || "", description: calendar.description || "" }
+        : {
+            ...emptyCalendar,
+            company_id: companies[0]?.id || "",
+            location: companies[0]?.location || "",
+            calendar_year: options.allowed_years[0] || new Date().getFullYear(),
+          },
     );
     setIsCalendarFormOpen(true);
     setFeedback({ type: "", message: "" });
@@ -376,12 +424,17 @@ function HolidayCalendarSetup({ currentUser }) {
       !calendarForm.company_id ||
       !calendarForm.location.trim() ||
       !calendarForm.calendar_name.trim() ||
-      !calendarForm.calendar_year
+      !calendarForm.calendar_year ||
+      (!editingCalendarId && !calendarForm.religion)
     ) {
       setFeedback({
         type: "danger",
-        message: "Company, location, calendar name and year are required.",
+        message: "Religion, company, location, calendar name and year are required.",
       });
+      return;
+    }
+    if (duplicateCalendar) {
+      setFeedback({ type: "danger", message: `A ${duplicateCalendar.religion} calendar for ${duplicateCalendar.calendar_year} already exists. Open it to make changes.` });
       return;
     }
     setIsSaving(true);
@@ -397,6 +450,7 @@ function HolidayCalendarSetup({ currentUser }) {
             ...calendarForm,
             calendar_year: Number(calendarForm.calendar_year),
             description: calendarForm.description || null,
+            religion: calendarForm.religion || null,
           }),
         },
       );
@@ -412,9 +466,12 @@ function HolidayCalendarSetup({ currentUser }) {
       setSelectedCalendarId(savedCalendar.id);
       setFeedback({
         type: "success",
-        message: `${savedCalendar.calendar_name} ${editingCalendarId ? "updated" : "created"} successfully.`,
+        message: editingCalendarId
+          ? `${savedCalendar.calendar_name} updated successfully.`
+          : `${savedCalendar.calendar_name} created as a draft. Add holidays, then publish it.`,
       });
       setIsCalendarFormOpen(false);
+      loadOptions();
     } catch (error) {
       setFeedback({
         type: "danger",
@@ -438,25 +495,51 @@ function HolidayCalendarSetup({ currentUser }) {
       });
       return;
     }
+    if (!holidayForm.holiday_date.startsWith(String(selectedCalendar.calendar_year))) {
+      setFeedback({ type: "danger", message: `The holiday date must be in ${selectedCalendar.calendar_year}.` });
+      return;
+    }
+    if (editingHolidayId && selectedCalendar.status === "Published") {
+      askConfirm({
+        title: "Update published holiday",
+        message: `Employees${isReligionCalendar ? ` of the ${selectedCalendar.religion} religion` : ""} will be notified of this change.`,
+        confirmLabel: "Save changes",
+        requireReason: true,
+        onConfirm: (reason) => submitHoliday(reason),
+      });
+      return;
+    }
+    if (!editingHolidayId && selectedCalendar.status === "Published") {
+      askConfirm({
+        title: "Add holiday to published calendar",
+        message: `${holidayForm.holiday_name.trim()} becomes an official holiday immediately and employees${isReligionCalendar ? ` of the ${selectedCalendar.religion} religion` : ""} will be notified.`,
+        confirmLabel: "Add holiday",
+        onConfirm: () => submitHoliday(null),
+      });
+      return;
+    }
+    await submitHoliday(null);
+  };
+
+  const submitHoliday = async (reason) => {
     setIsSaving(true);
     try {
-      const reason = editingHolidayId && selectedCalendar.status === "Published"
-        ? window.prompt("Reason required for this published holiday amendment:")
-        : null;
-      if (editingHolidayId && selectedCalendar.status === "Published" && !reason?.trim()) {
-        throw new Error("A reason is required to change a published holiday.");
-      }
+      const religionType = holidayForm.holiday_type === "Religion";
       const payload = {
         ...holidayForm,
         calendar_id: selectedCalendar.id,
         description: holidayForm.description || null,
-        applicability: holidayForm.holiday_type === "Religion"
-          ? "Selected Religions"
-          : holidayForm.applicability || "All Employees",
-        applicable_religions: holidayForm.holiday_type === "Religion" ||
-          holidayForm.applicability === "Selected Religions"
-          ? (holidayForm.applicable_religion || "").split(",").map((item) => item.trim()).filter(Boolean)
-          : [],
+        // Holidays in a religion calendar apply to that whole religion.
+        applicability: isReligionCalendar
+          ? "All Employees"
+          : religionType
+            ? "Selected Religions"
+            : holidayForm.applicability || "All Employees",
+        applicable_religions: isReligionCalendar
+          ? [selectedCalendar.religion]
+          : religionType || holidayForm.applicability === "Selected Religions"
+            ? (holidayForm.applicable_religion || "").split(",").map((item) => item.trim()).filter(Boolean)
+            : [],
         applicable_employee_groups: (holidayForm.applicable_employee_groups_text || "")
           .split(",").map((item) => item.trim()).filter(Boolean),
         is_company_holiday: Boolean(holidayForm.is_company_holiday),
@@ -464,7 +547,7 @@ function HolidayCalendarSetup({ currentUser }) {
       delete payload.applicable_employee_groups_text;
       const response = await fetch(
         editingHolidayId
-          ? `${API_ROOT}/holidays/${editingHolidayId}${reason ? `?reason=${encodeURIComponent(reason.trim())}` : ""}`
+          ? `${API_ROOT}/holidays/${editingHolidayId}${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`
           : `${API_ROOT}/holiday-calendars/${selectedCalendar.id}/holidays`,
         {
           method: editingHolidayId ? "PUT" : "POST",
@@ -498,14 +581,18 @@ function HolidayCalendarSetup({ currentUser }) {
     }
   };
 
-  const deactivateCalendar = async () => {
-    if (
-      !selectedCalendar ||
-      !window.confirm(
-        `Deactivate ${selectedCalendar.calendar_name}? It will be hidden from active calendars.`,
-      )
-    )
-      return;
+  const deactivateCalendar = () => {
+    if (!selectedCalendar) return;
+    askConfirm({
+      title: "Delete draft calendar",
+      message: `Delete the draft ${selectedCalendar.calendar_name}? It is hidden from active calendars and kept for audit.`,
+      confirmLabel: "Delete draft",
+      variant: "danger",
+      onConfirm: performDeactivateCalendar,
+    });
+  };
+
+  const performDeactivateCalendar = async () => {
     try {
       const response = await fetch(
         `${API_ROOT}/holiday-calendars/${selectedCalendar.id}`,
@@ -519,8 +606,9 @@ function HolidayCalendarSetup({ currentUser }) {
       setSelectedCalendarId(remaining[0]?.id || "");
       setFeedback({
         type: "success",
-        message: `${selectedCalendar.calendar_name} deactivated successfully.`,
+        message: `${selectedCalendar.calendar_name} deleted. It is kept for audit history.`,
       });
+      loadOptions();
     } catch (error) {
       setFeedback({
         type: "danger",
@@ -529,10 +617,21 @@ function HolidayCalendarSetup({ currentUser }) {
     }
   };
 
-  const publishCalendar = async () => {
-    if (!selectedCalendar || !window.confirm(
-      `Publish the ${selectedCalendar.calendar_year} holiday calendar? Employees will be able to view eligible holidays.`,
-    )) return;
+  const publishCalendar = () => {
+    if (!selectedCalendar) return;
+    const liveCount = holidays.filter((item) => item.status !== "Cancelled").length;
+    askConfirm({
+      title: "Publish holiday calendar",
+      message: isReligionCalendar
+        ? `Publish ${calendarTitle(selectedCalendar)} with ${liveCount} holiday(s)? It applies to every employee whose religion is ${selectedCalendar.religion}, appears in their attendance calendar and they are notified.`
+        : `Publish the ${selectedCalendar.calendar_year} holiday calendar? Employees will be able to view eligible holidays.`,
+      confirmLabel: "Publish",
+      variant: "success",
+      onConfirm: performPublishCalendar,
+    });
+  };
+
+  const performPublishCalendar = async () => {
     try {
       const response = await fetch(
         `${API_ROOT}/holiday-calendars/${selectedCalendar.id}/publish`,
@@ -546,22 +645,31 @@ function HolidayCalendarSetup({ currentUser }) {
       setHolidays((current) => current.map((item) =>
         item.status === "Cancelled" ? item : { ...item, status: "Published" },
       ));
-      setFeedback({ type: "success", message: `${published.calendar_year} calendar published successfully.` });
+      setFeedback({ type: "success", message: `${calendarTitle(published)} published successfully.` });
+      loadOptions();
     } catch (error) {
       setFeedback({ type: "danger", message: error.message || "Unable to publish the calendar." });
     }
   };
 
-  const deactivateHoliday = async (holiday) => {
-    const reason = selectedCalendar?.status === "Published"
-      ? window.prompt(`Reason for cancelling ${holiday.holiday_name}:`)
-      : null;
-    if (selectedCalendar?.status === "Published" && !reason?.trim()) return;
-    if (!window.confirm(`Remove ${holiday.holiday_name} from this calendar?`))
-      return;
+  const deactivateHoliday = (holiday) => {
+    const published = selectedCalendar?.status === "Published";
+    askConfirm({
+      title: "Delete holiday",
+      message: published
+        ? `Remove ${holiday.holiday_name} from this published calendar? It becomes a working day and affected employees are notified. Attendance already recorded is not changed.`
+        : `Remove ${holiday.holiday_name} from this draft calendar?`,
+      confirmLabel: "Delete holiday",
+      variant: "danger",
+      requireReason: published,
+      onConfirm: (reason) => performDeactivateHoliday(holiday, reason),
+    });
+  };
+
+  const performDeactivateHoliday = async (holiday, reason) => {
     try {
       const response = await fetch(
-        `${API_ROOT}/holidays/${holiday.id}${reason ? `?reason=${encodeURIComponent(reason.trim())}` : ""}`,
+        `${API_ROOT}/holidays/${holiday.id}${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`,
         { method: "DELETE" },
       );
       if (!response.ok) throw new Error(await readError(response));
@@ -609,13 +717,17 @@ function HolidayCalendarSetup({ currentUser }) {
     }
   };
 
-  const unassignEmployee = async (assignment) => {
-    if (
-      !window.confirm(
-        `Remove ${employeeName(assignment.employee_id)} from this calendar?`,
-      )
-    )
-      return;
+  const unassignEmployee = (assignment) => {
+    askConfirm({
+      title: "Remove assignment",
+      message: `Remove ${employeeName(assignment.employee_id)} from this calendar?`,
+      confirmLabel: "Remove",
+      variant: "danger",
+      onConfirm: () => performUnassignEmployee(assignment),
+    });
+  };
+
+  const performUnassignEmployee = async (assignment) => {
     try {
       const response = await fetch(
         `${API_ROOT}/employee-holiday-calendars/${assignment.id}`,
@@ -641,7 +753,7 @@ function HolidayCalendarSetup({ currentUser }) {
           <p className="eyebrow mb-1">Organization Setup</p>
           <h2 className="mb-1">Holiday Calendar</h2>
           <p className="text-muted mb-0">
-            Manage location-based holidays and employee calendar assignments.
+            Create one holiday calendar per religion and year. Published holidays apply automatically to employees of that religion.
           </p>
         </div>
         {canManage && <button
@@ -706,11 +818,13 @@ function HolidayCalendarSetup({ currentUser }) {
                       </span>
                       <span className="holiday-calendar-copy">
                         <strong>{calendar.calendar_name}</strong>
+                        <small>{calendarTitle(calendar)}</small>
                         <small>
-                          {companyName(calendar.company_id)} ·{" "}
-                          {calendar.location}
+                          <span className={`badge ${calendar.status === "Published" ? "text-bg-success" : "text-bg-secondary"} me-1`}>
+                            {calendar.status || "Draft"}
+                          </span>
+                          {companyName(calendar.company_id)} · {calendar.location}
                         </small>
-                        <small>{calendar.calendar_year}</small>
                       </span>
                       <i className="bi bi-chevron-right" />
                     </button>
@@ -729,7 +843,7 @@ function HolidayCalendarSetup({ currentUser }) {
                   <div className="d-flex flex-wrap justify-content-between align-items-start gap-3">
                     <div>
                       <p className="eyebrow mb-1">
-                        {selectedCalendar.calendar_year} calendar
+                        {calendarTitle(selectedCalendar)}
                       </p>
                       <h4 className="mb-1">{selectedCalendar.calendar_name}</h4>
                       <p className="text-muted mb-0">
@@ -744,8 +858,14 @@ function HolidayCalendarSetup({ currentUser }) {
                           {selectedCalendar.description}
                         </p>
                       )}
+                      {selectedCalendar.published_at && (
+                        <p className="small text-muted mt-1 mb-0">
+                          Published {new Date(selectedCalendar.published_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" })}
+                          {selectedCalendar.updated_at ? ` · Last edited ${new Date(selectedCalendar.updated_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" })}` : ""}
+                        </p>
+                      )}
                     </div>
-                    <div className="holiday-actions d-flex gap-2">
+                    <div className="holiday-actions d-flex flex-wrap align-items-center gap-2">
                       <span className={`badge ${selectedCalendar.status === "Published" ? "text-bg-success" : "text-bg-secondary"}`}>
                         {selectedCalendar.status || "Draft"}
                       </span>
@@ -753,27 +873,26 @@ function HolidayCalendarSetup({ currentUser }) {
                         type="button"
                         className="btn btn-sm btn-success"
                         onClick={publishCalendar}
+                        disabled={isSaving}
                       >
                         Publish
                       </button>}
-                      {canManage && selectedCalendar.status !== "Published" && <>
-                      <button
+                      {canManage && <button
                         type="button"
                         className="btn btn-sm btn-outline-primary"
                         onClick={() => openCalendarForm(selectedCalendar)}
                       >
                         <i className="bi bi-pencil me-1" />
                         Edit
-                      </button>
-                      <button
+                      </button>}
+                      {canManage && selectedCalendar.status !== "Published" && <button
                         type="button"
                         className="btn btn-sm btn-outline-danger"
                         onClick={deactivateCalendar}
                       >
-                        <i className="bi bi-archive me-1" />
-                        Deactivate
-                      </button>
-                      </>}
+                        <i className="bi bi-trash3 me-1" />
+                        Delete draft
+                      </button>}
                     </div>
                   </div>
                 </div>
@@ -787,16 +906,16 @@ function HolidayCalendarSetup({ currentUser }) {
                         {holidays.length} holidays in this calendar
                       </small>
                     </div>
-                    {canManage && selectedCalendar.status !== "Published" && (
+                    {canManage && (selectedCalendar.status !== "Published" || isReligionCalendar) && (
                       <div className="d-flex flex-wrap gap-2">
-                        <button
+                        {selectedCalendar.status !== "Published" && <button
                           type="button"
                           className="btn btn-outline-primary btn-sm"
                           onClick={loadPublicHolidaySuggestions}
                           disabled={loadingSuggestions}
                         >
                           {loadingSuggestions ? "Loading suggestions..." : "Suggest public holidays"}
-                        </button>
+                        </button>}
                         <button
                           type="button"
                           className="btn btn-primary btn-sm"
@@ -860,7 +979,8 @@ function HolidayCalendarSetup({ currentUser }) {
                             id="holiday-date"
                             className="form-control"
                             type="date"
-                            min={new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })}
+                            min={[new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }), `${selectedCalendar.calendar_year}-01-01`].sort()[1]}
+                            max={`${selectedCalendar.calendar_year}-12-31`}
                             name="holiday_date"
                             value={holidayForm.holiday_date}
                             onChange={handleHolidayChange}
@@ -895,6 +1015,12 @@ function HolidayCalendarSetup({ currentUser }) {
                             <option>Religion</option>
                           </select>
                         </div>
+                        {isReligionCalendar ? (
+                          <div className="col-md-8">
+                            <span className="form-label d-block">Applies to</span>
+                            <div className="form-control bg-light">All employees whose religion is {selectedCalendar.religion}</div>
+                          </div>
+                        ) : <>
                         <div className="col-md-4">
                           <label className="form-label" htmlFor="holiday-applicability">
                             Applicability
@@ -942,6 +1068,7 @@ function HolidayCalendarSetup({ currentUser }) {
                             />
                           </div>
                         )}
+                        </>}
                         <div className="col-md-8">
                           <label
                             className="form-label"
@@ -1039,7 +1166,7 @@ function HolidayCalendarSetup({ currentUser }) {
                                   {holiday.holiday_date.slice(0, 4)}
                                 </small>
                               </td>
-                              <td>
+                              <td style={{ minWidth: 160, overflowWrap: "break-word" }}>
                                 <strong>{holiday.holiday_name}</strong>
                                 {holiday.is_optional && (
                                   <span className="badge text-bg-light ms-2">
@@ -1055,7 +1182,7 @@ function HolidayCalendarSetup({ currentUser }) {
                               <td className="text-muted">
                                 {holiday.description || "—"}
                                 <small className="d-block">
-                                  {holiday.status || "Draft"} · {holiday.applicability || "All Employees"}
+                                  {holiday.status || "Draft"} · {isReligionCalendar ? `${selectedCalendar.religion} employees` : holiday.applicability || "All Employees"}
                                   {holiday.is_company_holiday ? " · Company holiday" : ""}
                                 </small>
                               </td>
@@ -1110,6 +1237,19 @@ function HolidayCalendarSetup({ currentUser }) {
                   </div>
                 </div>
               </div>
+              {isReligionCalendar ? (
+                <div className="card holiday-card border-0 shadow-sm">
+                  <div className="card-body p-4">
+                    <h5 className="mb-1">Who this calendar applies to</h5>
+                    <p className="text-muted mb-0">
+                      Every active employee whose religion is <strong>{selectedCalendar.religion}</strong> in Employee Master.
+                      {selectedCalendar.status === "Published"
+                        ? " Their attendance calendar shows these holidays, and they are notified when holidays are added, changed or removed."
+                        : " Nothing is visible to employees until the calendar is published."}
+                    </p>
+                  </div>
+                </div>
+              ) : (
               <div className="card holiday-card border-0 shadow-sm">
                 <div className="card-body p-0">
                   <div className="holiday-section-header d-flex flex-wrap justify-content-between align-items-center gap-3 p-4">
@@ -1200,6 +1340,7 @@ function HolidayCalendarSetup({ currentUser }) {
                   </div>
                 </div>
               </div>
+              )}
             </>
           ) : (
             <div className="card holiday-card border-0 shadow-sm">
@@ -1207,7 +1348,7 @@ function HolidayCalendarSetup({ currentUser }) {
                 <i className="bi bi-calendar2-x" />
                 <h5>No holiday calendar selected</h5>
                 <p className="text-muted">
-                  Create a calendar for a company and location to start adding
+                  Create a holiday calendar for a religion and year to start adding
                   holidays.
                 </p>
                 {canManage && <button
@@ -1246,6 +1387,67 @@ function HolidayCalendarSetup({ currentUser }) {
             </div>
             <form onSubmit={saveCalendar}>
               <div className="row g-3">
+                <div className="col-md-6">
+                  <label className="form-label" htmlFor="calendar-religion">
+                    Religion
+                  </label>
+                  <select
+                    id="calendar-religion"
+                    className="form-select"
+                    name="religion"
+                    value={calendarForm.religion || ""}
+                    onChange={handleCalendarChange}
+                    disabled={Boolean(editingCalendarId) && (selectedCalendar?.status === "Published" || !selectedCalendar?.religion_key)}
+                    required={!editingCalendarId}
+                  >
+                    <option value="">{editingCalendarId && !calendarForm.religion ? "Company-wide (existing calendar)" : "Select religion"}</option>
+                    {[...new Set([...options.religions, ...(calendarForm.religion ? [calendarForm.religion] : [])])].map((religion) => (
+                      <option key={religion} value={religion}>{religion}</option>
+                    ))}
+                  </select>
+                  <div className="form-text">
+                    {options.religions.length
+                      ? "Only religions assigned to active employees are listed."
+                      : "No employee has a religion recorded yet. Add it in Employee Master first."}
+                  </div>
+                </div>
+                <div className="col-md-6">
+                  <label className="form-label" htmlFor="calendar-year">
+                    Calendar year
+                  </label>
+                  <select
+                    id="calendar-year"
+                    className="form-select"
+                    name="calendar_year"
+                    value={calendarForm.calendar_year}
+                    onChange={handleCalendarChange}
+                    disabled={Boolean(editingCalendarId) && selectedCalendar?.status === "Published"}
+                  >
+                    {[...new Set([...options.allowed_years, Number(calendarForm.calendar_year)])].filter(Boolean).map((year) => (
+                      <option key={year} value={year} disabled={!options.allowed_years.includes(year)}>{year}</option>
+                    ))}
+                  </select>
+                  <div className="form-text">
+                    {options.allowed_years.length
+                      ? `Calendars can be created only for ${options.allowed_years[0]} (current year) and ${options.allowed_years[1]} (next year).`
+                      : "Allowed years could not be loaded."}
+                    {editingCalendarId && selectedCalendar?.status === "Published" ? " The religion and year of a published calendar are fixed." : ""}
+                  </div>
+                </div>
+                {duplicateCalendar && (
+                  <div className="col-12">
+                    <div className="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2 py-2 mb-0">
+                      <span>A {duplicateCalendar.religion} calendar for {duplicateCalendar.calendar_year} already exists ({duplicateCalendar.status || "Draft"}).</span>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline-dark"
+                        onClick={() => { setSelectedCalendarId(duplicateCalendar.id); setIsCalendarFormOpen(false); }}
+                      >
+                        Open existing calendar
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <div className="col-md-6">
                   <label className="form-label" htmlFor="calendar-country">
                     Country
@@ -1335,22 +1537,7 @@ function HolidayCalendarSetup({ currentUser }) {
                     name="calendar_name"
                     value={calendarForm.calendar_name}
                     onChange={handleCalendarChange}
-                    placeholder="e.g. India Public Holidays"
-                  />
-                </div>
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-year">
-                    Calendar year
-                  </label>
-                  <input
-                    id="calendar-year"
-                    className="form-control"
-                    type="number"
-                    min="2000"
-                    max="2100"
-                    name="calendar_year"
-                    value={calendarForm.calendar_year}
-                    onChange={handleCalendarChange}
+                    placeholder="e.g. Hindu Festival Holidays"
                   />
                 </div>
                 <div className="col-12">
@@ -1378,12 +1565,44 @@ function HolidayCalendarSetup({ currentUser }) {
                 <button
                   type="submit"
                   className="btn btn-primary"
-                  disabled={isSaving}
+                  disabled={isSaving || Boolean(duplicateCalendar)}
                 >
-                  {isSaving ? "Saving..." : "Save calendar"}
+                  {isSaving ? "Saving..." : editingCalendarId ? "Save calendar" : "Create draft calendar"}
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {confirmDialog && (
+        <div className="modal d-block" tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="holiday-confirm-title"
+          style={{ backgroundColor: "rgba(15, 23, 42, 0.45)" }}>
+          <div className="modal-dialog modal-dialog-centered">
+            <div className="modal-content">
+              <div className="modal-header">
+                <h5 className="modal-title" id="holiday-confirm-title">{confirmDialog.title}</h5>
+                <button type="button" className="btn-close" aria-label="Close" onClick={() => setConfirmDialog(null)} disabled={confirmBusy} />
+              </div>
+              <div className="modal-body">
+                <p className="mb-2">{confirmDialog.message}</p>
+                {confirmDialog.requireReason && (
+                  <>
+                    <label className="form-label" htmlFor="holiday-confirm-reason">Reason (shown to employees)</label>
+                    <textarea id="holiday-confirm-reason" className="form-control" rows="2" maxLength={500}
+                      value={confirmReason} onChange={(event) => setConfirmReason(event.target.value)} autoFocus />
+                    {confirmReason.trim().length < 3 && <div className="form-text">Enter at least 3 characters.</div>}
+                  </>
+                )}
+              </div>
+              <div className="modal-footer flex-wrap">
+                <button type="button" className="btn btn-outline-secondary" onClick={() => setConfirmDialog(null)} disabled={confirmBusy}>Cancel</button>
+                <button type="button" className={`btn btn-${confirmDialog.variant || "primary"}`} onClick={runConfirm}
+                  disabled={confirmBusy || (confirmDialog.requireReason && confirmReason.trim().length < 3)}>
+                  {confirmBusy ? "Working..." : confirmDialog.confirmLabel || "Confirm"}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

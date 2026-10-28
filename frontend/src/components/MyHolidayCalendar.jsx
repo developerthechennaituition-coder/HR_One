@@ -1,0 +1,158 @@
+import { HRONE_API_BASE } from "../config/api.js";
+import { useCallback, useEffect, useState } from "react";
+import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
+import { isWeeklyOff } from "../services/weeklyOff";
+
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+const formatHolidayDate = (iso) =>
+  new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
+
+/**
+ * The signed-in employee's holidays: the published calendar for their own
+ * religion (resolved by the backend) plus the company-wide calendar, if any.
+ */
+function MyHolidayCalendar({ companyCalendar, weeklyOffDays = [], todayKey, canManage = false, onManage }) {
+  const [year, setYear] = useState(null);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [view, setView] = useState("list");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`${HRONE_API_BASE}/api/my-holidays${year ? `?year=${year}` : ""}`);
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body?.detail || "Unable to load your holiday calendar.");
+      setData(body);
+      if (!year) setYear(body.year);
+    } catch (err) {
+      setError(err.message || "Unable to load your holiday calendar.");
+    } finally {
+      setLoading(false);
+    }
+  }, [year]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Pick up newly published changes when the employee returns to the tab.
+  useEffect(() => {
+    const refresh = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", refresh);
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, [load]);
+
+  const companyHolidays = companyCalendar?.year === year ? companyCalendar?.holidays || [] : [];
+  const holidays = [
+    ...(data?.holidays || []).map((item) => ({ ...item, source: `${data.religion} calendar` })),
+    ...companyHolidays
+      .filter((item) => !(data?.holidays || []).some((own) => own.holiday_date === String(item.holiday_date).slice(0, 10)))
+      .map((item) => ({ ...item, holiday_date: String(item.holiday_date).slice(0, 10), source: "Company calendar" })),
+  ].sort((left, right) => left.holiday_date.localeCompare(right.holiday_date));
+  const byDate = new Map(holidays.map((item) => [item.holiday_date, item]));
+
+  const emptyMessage = !data?.religion
+    ? "Your religion is not recorded in your employee profile, so no religion holiday calendar applies yet. Please contact HR Admin."
+    : !data?.calendar
+      ? `No ${data.religion} holiday calendar has been published for ${year} yet.`
+      : `The ${data.religion} holiday calendar for ${year} has no holidays.`;
+
+  return (
+    <section className="mt-5" aria-labelledby="employee-holidays-heading">
+      <hr className="mb-4" />
+      <div className="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-3">
+        <div className="min-w-0">
+          <h5 id="employee-holidays-heading" className="mb-1">Holiday Calendar</h5>
+          <p className="text-muted mb-0 small">
+            {data?.religion ? `${data.religion} holiday calendar` : "Religion not recorded"}
+            {data?.calendar?.calendar_name ? ` · ${data.calendar.calendar_name}` : ""}
+          </p>
+        </div>
+        <div className="d-flex flex-wrap align-items-center gap-2">
+          <div className="btn-group btn-group-sm" role="group" aria-label="Holiday calendar year">
+            {(data?.allowed_years || []).map((item) => (
+              <button key={item} type="button" className={`btn ${item === year ? "btn-primary" : "btn-outline-primary"}`}
+                onClick={() => setYear(item)} disabled={loading} aria-pressed={item === year}>{item}</button>
+            ))}
+          </div>
+          <div className="btn-group btn-group-sm" role="group" aria-label="Holiday view">
+            <button type="button" className={`btn ${view === "list" ? "btn-secondary" : "btn-outline-secondary"}`} onClick={() => setView("list")} aria-pressed={view === "list"}>
+              <i className="bi bi-list-ul me-1" aria-hidden="true" />List
+            </button>
+            <button type="button" className={`btn ${view === "calendar" ? "btn-secondary" : "btn-outline-secondary"}`} onClick={() => setView("calendar")} aria-pressed={view === "calendar"}>
+              <i className="bi bi-calendar3 me-1" aria-hidden="true" />Calendar
+            </button>
+          </div>
+          {canManage && (
+            <button type="button" className="btn btn-sm btn-outline-primary" onClick={onManage}>Manage holiday calendars</button>
+          )}
+        </div>
+      </div>
+
+      {error && <div className="alert alert-danger py-2" role="alert">{error}</div>}
+      {loading && !data ? (
+        <div className="text-muted small py-3"><span className="spinner-border spinner-border-sm me-2" role="status" />Loading holidays…</div>
+      ) : !holidays.length ? (
+        <div className="border rounded p-3 text-muted small">{emptyMessage}</div>
+      ) : view === "list" ? (
+        <div className="list-group">
+          {holidays.map((holiday) => (
+            <div className={`list-group-item d-flex flex-wrap justify-content-between align-items-center gap-2 ${holiday.holiday_date < todayKey ? "text-muted" : ""}`} key={`${holiday.source}-${holiday.id || holiday.holiday_date}`}>
+              <div className="min-w-0" style={{ overflowWrap: "break-word" }}>
+                <strong>{holiday.holiday_name}</strong>
+                {holiday.is_optional && <span className="badge text-bg-light border ms-2">Optional</span>}
+                {holiday.description && <div className="small text-muted">{holiday.description}</div>}
+              </div>
+              <div className="text-end small">
+                <div className="fw-semibold">{formatHolidayDate(holiday.holiday_date)}</div>
+                <div className="text-muted">{holiday.source}{holiday.holiday_type ? ` · ${holiday.holiday_type}` : ""}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <>
+          <div className="d-flex flex-wrap gap-3 small mb-2">
+            <span><i className="bi bi-square-fill text-info me-1" />Holiday</span>
+            <span><i className="bi bi-circle-fill text-danger me-1" />Weekly off</span>
+            <span><i className="bi bi-square border border-primary border-2 me-1" />Today</span>
+          </div>
+          <div className="row row-cols-1 row-cols-sm-2 row-cols-xl-3 g-3">
+            {MONTH_NAMES.map((monthName, monthIndex) => {
+              const firstWeekday = new Date(year, monthIndex, 1).getDay();
+              const monthLength = new Date(year, monthIndex + 1, 0).getDate();
+              return (
+                <div className="col" key={monthName}>
+                  <div className="border rounded p-2 h-100">
+                    <h6 className="text-center">{monthName} {year}</h6>
+                    <div className="d-grid" style={{ gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 2 }}>
+                      {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => <small className="text-center text-muted" key={`${day}-${index}`}>{day}</small>)}
+                      {Array.from({ length: firstWeekday }, (_, index) => <span aria-hidden="true" key={`blank-${index}`} />)}
+                      {Array.from({ length: monthLength }, (_, index) => {
+                        const day = index + 1;
+                        const key = `${year}-${String(monthIndex + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+                        const holiday = byDate.get(key);
+                        const weekend = isWeeklyOff(weeklyOffDays, new Date(year, monthIndex, day));
+                        return (
+                          <span key={day} title={holiday?.holiday_name || ""}
+                            aria-label={holiday ? `${key}: ${holiday.holiday_name}` : undefined}
+                            className={`text-center rounded ${holiday ? "bg-info-subtle fw-semibold" : weekend ? "text-danger" : ""} ${key === todayKey ? "border border-primary border-2" : ""}`}>
+                            {day}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+export default MyHolidayCalendar;

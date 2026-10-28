@@ -2,6 +2,7 @@ import { HRONE_API_BASE } from "../config/api.js";
 import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
 import { useEffect, useMemo, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
+import MyHolidayCalendar from "../components/MyHolidayCalendar";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
 
 const API_URL = HRONE_API_BASE + "/api/auth/me";
@@ -500,6 +501,16 @@ function Profile({ onNavigate }) {
       text: "#0b3d4a",
     },
 
+    weeklyoff: {
+      background: "#6c757d",
+      text: "#ffffff",
+    },
+
+    notapplicable: {
+      background: "#fd7e14",
+      text: "#ffffff",
+    },
+
     notmarked: {
       background: "#F0E0C8",
       text: "#7a5a2f",
@@ -641,6 +652,42 @@ function Profile({ onNavigate }) {
    * in the calendar.
    * ============================================================
    */
+
+  /*
+   * ============================================================
+   * PUBLISHED HOLIDAYS FOR THE CALENDAR YEAR
+   * ============================================================
+   * The backend resolves the employee's own religion calendar;
+   * the company-wide calendar comes from organization details.
+   */
+
+  const [religionHolidays, setReligionHolidays] = useState([]);
+
+  useEffect(() => {
+    let active = true;
+    fetch(`${HRONE_API_BASE}/api/my-holidays?year=${selectedYear}`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((body) => {
+        if (active) setReligionHolidays(Array.isArray(body?.holidays) ? body.holidays : []);
+      })
+      .catch(() => {
+        if (active) setReligionHolidays([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedYear]);
+
+  const holidayByDate = useMemo(() => {
+    const map = {};
+    (organizationData?.holiday_calendar?.holidays || []).forEach((holiday) => {
+      map[String(holiday.holiday_date).slice(0, 10)] = holiday.holiday_name;
+    });
+    religionHolidays.forEach((holiday) => {
+      map[holiday.holiday_date] = holiday.holiday_name;
+    });
+    return map;
+  }, [organizationData, religionHolidays]);
 
   const approvedLeaveByDate = useMemo(() => {
     const map = {};
@@ -795,6 +842,30 @@ function Profile({ onNavigate }) {
       };
     }
 
+    // Published holiday without an attendance record.
+    if (holidayByDate[dateString]) {
+      return {
+        attendance_date: dateString,
+        status: "Holiday",
+        holiday_name: holidayByDate[dateString],
+        is_calendar_holiday: true,
+      };
+    }
+
+    // HR-configured weekly-off weekday without an attendance record.
+    if (
+      isWeeklyOff(
+        weeklyOffDays,
+        new Date(`${dateString}T00:00:00`),
+      )
+    ) {
+      return {
+        attendance_date: dateString,
+        status: "Weekly Off",
+        is_weekly_off: true,
+      };
+    }
+
     return null;
   };
 
@@ -827,7 +898,44 @@ function Profile({ onNavigate }) {
       return "holiday";
     }
 
+    if (statusValue === "weekly off") {
+      return "weeklyoff";
+    }
+
+    if (statusValue === "not applicable") {
+      return "notapplicable";
+    }
+
     return "notmarked";
+  };
+
+  /*
+   * Calendar card label. Not Marked dates show no label; leave
+   * shows its leave type code (CL, ML).
+   */
+
+  const getCalendarLabel = (record) => {
+    const statusKey = getStatusKey(record);
+
+    if (statusKey === "notmarked") {
+      return "";
+    }
+
+    if (statusKey === "leave") {
+      return record.leave_type_code || "Leave";
+    }
+
+    if (statusKey === "holiday" && (record.holiday_name || holidayByDate[record.attendance_date])) {
+      return record.holiday_name || holidayByDate[record.attendance_date];
+    }
+
+    return {
+      present: "Present",
+      absent: "Absent",
+      holiday: "Holiday",
+      weeklyoff: "Weekly Off",
+      notapplicable: "Not Applicable",
+    }[statusKey];
   };
 
   /*
@@ -986,6 +1094,9 @@ function Profile({ onNavigate }) {
     const shortDay =
       getShortDayName(day);
 
+    const calendarLabel =
+      getCalendarLabel(record);
+
     return (
       <button
         type="button"
@@ -1068,7 +1179,7 @@ function Profile({ onNavigate }) {
             Show Leave Type Code on approved leave calendar day
         ---------------------------------------------------- */}
 
-       {/*{record?.is_approved_leave && (
+        {calendarLabel && (
           <div
             style={{
               fontSize: "9px",
@@ -1081,10 +1192,9 @@ function Profile({ onNavigate }) {
               whiteSpace: "nowrap",
             }}
           >
-            {record.leave_type_code ||
-              "Leave"}
+            {calendarLabel}
           </div>
-        )} */}
+        )}
       </button>
     );
   };
@@ -1585,6 +1695,14 @@ function Profile({ onNavigate }) {
                     {
                       key: "holiday",
                       label: "Holiday",
+                    },
+                    {
+                      key: "weeklyoff",
+                      label: "Weekly Off",
+                    },
+                    {
+                      key: "notapplicable",
+                      label: "Not Applicable",
                     },
                     {
                       key: "notmarked",
@@ -2192,12 +2310,61 @@ function Profile({ onNavigate }) {
                             </p>
 
                             <p className="text-muted mt-2 mb-0">
-                              This date is marked as a holiday.
+                              {holidayByDate[selectedAttendanceDate]
+                                ? `${holidayByDate[selectedAttendanceDate]} — published holiday.`
+                                : "This date is marked as a holiday."}
                             </p>
 
                           </div>
                         </div>
                       )}
+
+                    {/* ==================================================
+                        WEEKLY OFF / NOT APPLICABLE
+                    ================================================== */}
+
+                    {["weeklyoff", "notapplicable"].includes(
+                      getStatusKey(selectedRecord),
+                    ) && (
+                      <div
+                        className="card"
+                        style={{
+                          borderColor:
+                            statusColors[
+                              getStatusKey(selectedRecord)
+                            ].background,
+                        }}
+                      >
+                        <div className="card-body">
+                          <h6
+                            className="mb-2"
+                            style={{
+                              color:
+                                statusColors[
+                                  getStatusKey(selectedRecord)
+                                ].background,
+                            }}
+                          >
+                            {getCalendarLabel(selectedRecord)}
+                          </h6>
+
+                          <p className="mb-0">
+                            Date:{" "}
+                            <strong>
+                              {formatDateForDisplay(
+                                selectedAttendanceDate,
+                              )}
+                            </strong>
+                          </p>
+
+                          <p className="text-muted mt-2 mb-0">
+                            {getStatusKey(selectedRecord) === "weeklyoff"
+                              ? "This date is a weekly off."
+                              : "HR Admin marked this date as Not Applicable; it is counted as Loss of Pay."}
+                          </p>
+                        </div>
+                      </div>
+                    )}
 
                     {/* ==================================================
                         NOT MARKED
@@ -2249,7 +2416,12 @@ function Profile({ onNavigate }) {
             )}
           </div>
 
-          <AttendanceDayBreakdown userId="me" title="Daily working time and breaks" />
+          <AttendanceDayBreakdown
+            userId="me"
+            title="Daily working time and breaks"
+            date={selectedAttendanceDate || undefined}
+            onDateChange={setSelectedAttendanceDate}
+          />
 
 
           <section className="mt-5" aria-labelledby="organization-information-heading">
@@ -2287,100 +2459,15 @@ function Profile({ onNavigate }) {
             )}
           </section>
 
-          <section className="mt-5" aria-labelledby="employee-holidays-heading">
-            <hr className="mb-4" />
-            <div className="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-3">
-              <div>
-                <h5 id="employee-holidays-heading" className="mb-1">Holiday Calendar</h5>
-                <p className="text-muted mb-0">
-                  Applicable calendar: {organizationData?.holiday_calendar?.year || currentYear}
-                  {organizationData?.holiday_calendar?.calendar?.state
-                    ? ` · ${organizationData.holiday_calendar.calendar.state}, ${organizationData.holiday_calendar.calendar.country}`
-                    : ""}
-                </p>
-              </div>
-              {["hr admin", "administrator"].includes(
-                String(user?.role || "").trim().toLowerCase(),
-              ) && (
-                <button
-                  type="button"
-                  className="btn btn-sm btn-outline-primary"
-                  onClick={() => onNavigate?.("holiday-calendar")}
-                >
-                  Manage yearly calendar
-                </button>
-              )}
-            </div>
-            {organizationData?.holiday_calendar?.holidays?.length ? (
-              <>
-                <div className="list-group mb-4">
-                  {organizationData.holiday_calendar.holidays
-                    .filter((holiday) => holiday.holiday_date >= todayDateKey)
-                    .slice(0, 8)
-                    .map((holiday) => (
-                      <div
-                        className="list-group-item d-flex flex-wrap justify-content-between gap-2"
-                        key={holiday.id}
-                      >
-                        <strong>{holiday.holiday_name}</strong>
-                        <span className="text-muted">
-                          {new Date(`${holiday.holiday_date}T00:00:00`).toLocaleDateString("en-IN", {
-                            weekday: "long", day: "numeric", month: "long",
-                          })} · {holiday.holiday_type}
-                        </span>
-                      </div>
-                    ))}
-                </div>
-                <div className="row row-cols-1 row-cols-sm-2 row-cols-xl-3 g-3">
-                  {Array.from({ length: 12 }, (_, monthIndex) => {
-                    const calendarYear = organizationData.holiday_calendar.year || currentYear;
-                    const firstWeekday = new Date(calendarYear, monthIndex, 1).getDay();
-                    const monthLength = new Date(calendarYear, monthIndex + 1, 0).getDate();
-                    const holidaysByDay = new Map(
-                      organizationData.holiday_calendar.holidays
-                        .filter((holiday) => Number(holiday.holiday_date.slice(5, 7)) === monthIndex + 1)
-                        .map((holiday) => [Number(holiday.holiday_date.slice(8, 10)), holiday]),
-                    );
-                    return (
-                      <div className="col" key={monthIndex}>
-                        <div className="border rounded p-2 h-100">
-                          <h6 className="text-center">{monthNames[monthIndex]} {calendarYear}</h6>
-                          <div className="d-grid" style={{ gridTemplateColumns: "repeat(7, 1fr)", gap: 2 }}>
-                            {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => (
-                              <small className="text-center text-muted" key={`${day}-${index}`}>{day}</small>
-                            ))}
-                            {Array.from({ length: firstWeekday }, (_, index) => (
-                              <span aria-hidden="true" key={`blank-${index}`} />
-                            ))}
-                            {Array.from({ length: monthLength }, (_, index) => {
-                              const day = index + 1;
-                              const holiday = holidaysByDay.get(day);
-                              const weekend = isWeeklyOff(weeklyOffDays, new Date(calendarYear, monthIndex, day));
-                              const isToday =
-                                calendarYear === currentYear &&
-                                monthIndex + 1 === currentMonth &&
-                                day === currentDate.getDate();
-                              return (
-                                <span
-                                  className={`text-center rounded ${holiday?.is_company_holiday ? "bg-success text-white" : holiday ? "bg-info-subtle" : weekend ? "text-danger" : ""} ${isToday ? "border border-primary border-2" : ""}`}
-                                  key={day}
-                                  title={holiday?.holiday_name || ""}
-                                >
-                                  {day}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
-            ) : (
-              <p className="text-muted">No published eligible holidays are available for this calendar year.</p>
+          <MyHolidayCalendar
+            companyCalendar={organizationData?.holiday_calendar}
+            weeklyOffDays={weeklyOffDays}
+            todayKey={todayDateKey}
+            canManage={["hr admin", "administrator"].includes(
+              String(user?.role || "").trim().toLowerCase(),
             )}
-          </section>
+            onManage={() => onNavigate?.("holiday-calendar")}
+          />
 
           {/* ======================================================
               USER ID

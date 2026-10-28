@@ -87,17 +87,23 @@ export const REQUEST_STATUS_BADGES = {
 
 export const OUTCOME_LABELS = {
   approved: "Approved as",
-  changed: "Changed to",
-  rejected: "Changed to",
+  changed: "Approved with changes as",
+  rejected: "Rejected",
   not_applied: "Not applied",
 };
 
+/** Check-in/check-out pair as text, without inventing missing values. */
+export const formatTimeRange = (checkIn, checkOut) =>
+  checkIn || checkOut ? `${checkIn || "no check-in"} – ${checkOut || "no check-out"}` : "";
+
+// Date-only values are built in UTC so the weekday never shifts with the browser timezone.
 export const formatRequestDate = (iso) => {
   if (!iso) return "—";
   const [year, month, day] = String(iso).slice(0, 10).split("-").map(Number);
-  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString("en-IN", {
-    day: "2-digit", month: "short", year: "numeric", timeZone: "UTC",
-  });
+  const value = new Date(Date.UTC(year, month - 1, day));
+  const weekday = value.toLocaleDateString("en-IN", { weekday: "short", timeZone: "UTC" });
+  const text = value.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
+  return `${weekday}, ${text}`;
 };
 
 export const formatRequestDateTime = (value) => {

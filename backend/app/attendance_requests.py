@@ -1,9 +1,10 @@
 """Employee attendance correction requests with per-date HR Admin decisions.
 
-Employees request Present/Holiday for their own Not Marked past dates. HR Admin
-decides every date individually (Present, Holiday or Absent); decisions are
-written to the canonical ``attendance`` collection (one record per employee and
-date) and are blocked while payroll for that month is calculated or finalized.
+Employees request a status (and, for Present, check-in/check-out times) for
+their own past dates. HR Admin approves (optionally changing the final status
+or times) or rejects every date individually; approved decisions are written
+to the canonical ``attendance`` collection (one record per employee and date).
+Monthly Weekly Off and Medical Leave limits are enforced on every step.
 """
 
 from __future__ import annotations
@@ -47,15 +48,33 @@ payroll_collection = db["monthly_payroll_records"]
 leave_notifications_collection = db["leave_notifications"]
 notification_sequences_collection = db["notification_sequences"]
 
-REQUESTABLE_STATUSES = ("Present", "Holiday")
-DECISION_STATUSES = ("Present", "Holiday", "Absent")
+RequestStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"]
+# HR Admin may also finalize a requested date as Not Applicable (counted as LOP).
+FinalStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Not Applicable"]
+NOT_APPLICABLE = "Not Applicable"
+BEFORE_JOINING = "Before Joining"
+# Permitted corrections by the date's current attendance status. Leave dates
+# are owned by the Leave module and future/pre-joining dates are not eligible.
+STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "Not Marked": ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"),
+    NOT_APPLICABLE: ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"),
+    "Absent": ("Present", "Holiday", "Weekly Off", "Medical Leave"),
+    "Weekly Off": ("Present", "Medical Leave", "Absent"),
+    "Present": ("Present", "Absent", "Medical Leave", "Weekly Off"),
+    "Holiday": ("Present",),
+}
+MEDICAL_LEAVE_MONTHLY_LIMIT = leave.MEDICAL_LEAVE_DAYS_PER_MONTH
+MEDICAL_LEAVE_CODE = leave.MEDICAL_LEAVE_CODE
+DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT = 4  # Used only if the company policy has no value.
 REQUEST_STATUSES = ("pending", "processing", "approved", "partially_approved", "rejected", "cancelled")
+ACTIVE_REQUEST_STATUSES = ("pending", "processing")
 # Payroll statuses from app.payroll: Calculated is a draft that HR can
 # disapprove; Approved/Processed/Paid are finalized.
 PAYROLL_FINALIZED_STATUSES = {"Approved", "Processed", "Paid"}
 PAYROLL_DRAFT_STATUSES = {"Calculated"}
 PROCESSING_TIMEOUT = timedelta(minutes=5)
 MAX_DATES_PER_REQUEST = 31
+TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 def ensure_attendance_request_indexes() -> None:
@@ -67,6 +86,7 @@ def ensure_attendance_request_indexes() -> None:
     attendance_requests_collection.create_index([("user_id", 1), ("submitted_at", -1)])
     attendance_requests_collection.create_index([("status", 1), ("submitted_at", -1)])
     attendance_requests_collection.create_index([("employee_id", 1), ("status", 1), ("periods", 1)])
+    attendance_requests_collection.create_index([("user_id", 1), ("status", 1), ("periods", 1)])
 
 
 @router.on_event("startup")
@@ -78,36 +98,51 @@ def startup_attendance_requests() -> None:
 # Schemas
 # ---------------------------------------------------------------------------
 
+def _clean_time(value: str | None) -> str | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    if not TIME_PATTERN.match(value):
+        raise ValueError("Time must use 24-hour HH:MM format.")
+    return value
+
+
+def _clean_text(value: str | None) -> str | None:
+    value = (value or "").strip()
+    return value or None
+
+
 class AttendanceRequestDateIn(BaseModel):
     attendance_date: date
-    requested_status: Literal["Present", "Holiday"]
+    requested_status: RequestStatus
+    requested_check_in_time: str | None = None
+    requested_check_out_time: str | None = None
+
+    _times = field_validator("requested_check_in_time", "requested_check_out_time")(classmethod(lambda cls, value: _clean_time(value)))
 
 
 class AttendanceRequestCreate(BaseModel):
     dates: list[AttendanceRequestDateIn] = Field(min_length=1, max_length=MAX_DATES_PER_REQUEST)
     remarks: str | None = Field(default=None, max_length=1000)
 
-    @field_validator("remarks")
-    @classmethod
-    def strip_remarks(cls, value: str | None) -> str | None:
-        value = (value or "").strip()
-        return value or None
+    _remarks = field_validator("remarks")(classmethod(lambda cls, value: _clean_text(value)))
 
 
 class AttendanceDecisionIn(BaseModel):
     attendance_date: date
-    final_status: Literal["Present", "Holiday", "Absent"]
+    action: Literal["approve", "reject"] = "approve"
+    final_status: FinalStatus | None = None
+    final_check_in_time: str | None = None
+    final_check_out_time: str | None = None
+
+    _times = field_validator("final_check_in_time", "final_check_out_time")(classmethod(lambda cls, value: _clean_time(value)))
 
 
 class AttendanceRequestResponsePayload(BaseModel):
     decisions: list[AttendanceDecisionIn] = Field(min_length=1, max_length=MAX_DATES_PER_REQUEST)
     review_comments: str | None = Field(default=None, max_length=1000)
 
-    @field_validator("review_comments")
-    @classmethod
-    def strip_comments(cls, value: str | None) -> str | None:
-        value = (value or "").strip()
-        return value or None
+    _comments = field_validator("review_comments")(classmethod(lambda cls, value: _clean_text(value)))
 
 
 # ---------------------------------------------------------------------------
@@ -164,29 +199,182 @@ def _validate_month(year: int, month: int) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, monthrange(year, month)[1])
 
 
-def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
-    """Authoritative per-date status and request eligibility for one month."""
-    start, end = _validate_month(year, month)
+def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
+    """Attendance data shared by the calendar, request creation and HR review."""
+    start = date(year, month, 1)
+    end = date(year, month, monthrange(year, month)[1])
     user_id = str(user["_id"])
-    employee_id = str(user.get("employee_id") or "")
-    today = company_today()
-    period = f"{year:04d}-{month:02d}"
-
     # Same lazy approved-leave sync as GET /api/attendance/my (idempotent).
     _sync_leave_for_user_range(user_id, start.isoformat(), end.isoformat())
-    records = {
-        str(record.get("attendance_date"))[:10]: record
-        for record in attendance_collection.find(
-            {"user_id": user_id, "attendance_date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
-        )
+    return {
+        "start": start,
+        "end": end,
+        "records": {
+            str(record.get("attendance_date"))[:10]: record
+            for record in attendance_collection.find(
+                {"user_id": user_id, "attendance_date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
+            )
+        },
+        "holidays": leave._holiday_names(user, start, end),
+        "weekly_offs": company_weekly_off_weekdays(),
+        "joining": leave._joining_date(user),
+        "today": company_today(),
     }
-    holidays = leave._holiday_dates(user, start, end)
-    weekly_offs = company_weekly_off_weekdays()
-    joining = leave._joining_date(user)
+
+
+def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any]) -> str:
+    if record:
+        return str(record.get("status") or "Not Marked")
+    if current > ctx["today"]:
+        return "Upcoming"
+    if current in ctx["holidays"]:
+        return "Holiday"
+    if current.weekday() in ctx["weekly_offs"]:
+        return "Weekly Off"
+    if ctx["joining"] and current < ctx["joining"]:
+        return BEFORE_JOINING
+    return "Not Marked"
+
+
+def _weekly_off_limit() -> int:
+    """Weekly Offs per Month from the HR-managed company policy."""
+    try:
+        return int(leave._company_policy().get("weekly_offs_per_month") or DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT)
+    except (TypeError, ValueError):
+        return DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT
+
+
+def _pending_items(user_id: str, period: str, exclude_request_id: str | None = None) -> list[dict[str, Any]]:
+    """Requested dates of other active requests; reserved against monthly limits."""
+    items = []
+    for request in attendance_requests_collection.find(
+        {"user_id": user_id, "status": {"$in": list(ACTIVE_REQUEST_STATUSES)}, "periods": period},
+        {"dates": 1},
+    ):
+        if str(request["_id"]) == exclude_request_id:
+            continue
+        items.extend(item for item in request.get("dates", []) if str(item.get("attendance_date", "")).startswith(period))
+    return items
+
+
+def _medical_leave_types() -> dict[str, str]:
+    """Leave-module Medical Leave types as {leave_type_id: code}."""
+    return {
+        str(item["_id"]): str(item.get("code") or "").upper()
+        for item in db["leave_types"].find({}, {"code": 1, "name": 1})
+        if leave._is_medical_leave_type(item)
+    }
+
+
+def _month_usage(user: dict[str, Any], ctx: dict[str, Any], exclude_request_id: str | None = None) -> dict[str, float]:
+    """Weekly Off and Medical Leave days already used or reserved in a month.
+
+    Weekly Off counts every day of the month whose effective status is Weekly
+    Off (a recorded Weekly Off, or an unrecorded configured weekly-off day) plus
+    pending requests for Weekly Off. Medical Leave is shared with the Leave
+    module: approved Medical Leave in attendance, pending Medical Leave
+    applications and pending Medical Leave attendance requests. Rejected and
+    cancelled requests never count.
+    """
+    weekly_off = 0
+    medical = 0.0
+    medical_types = _medical_leave_types()
+    medical_codes = set(medical_types.values())
+    whole_month = {**ctx, "today": date.max}
+    current = ctx["start"]
+    while current <= ctx["end"]:
+        record = ctx["records"].get(current.isoformat())
+        if _day_status(current, record, whole_month) == "Weekly Off":
+            weekly_off += 1
+        if record and (record.get("medical_leave") or (
+            str(record.get("status") or "").casefold() == "leave"
+            and str(record.get("leave_type_code") or "").upper() in medical_codes
+        )):
+            medical += 0.5 if "half" in str(record.get("leave_day_part") or "") else 1
+        current += timedelta(days=1)
+    period = ctx["start"].isoformat()[:7]
+    for item in _pending_items(str(user["_id"]), period, exclude_request_id):
+        weekly_off += item.get("requested_status") == "Weekly Off"
+        medical += item.get("requested_status") == "Medical Leave"
+    if medical_types:
+        for application in db["leave_requests"].find({
+            "user_id": str(user["_id"]), "leave_type_id": {"$in": list(medical_types)},
+            "status": {"$regex": "^pending", "$options": "i"},
+        }, {"leave_dates": 1, "from_date": 1, "day_part": 1}):
+            per_day = 0.5 if "half" in str(application.get("day_part") or "") else 1
+            dates = application.get("leave_dates") or [application.get("from_date")]
+            medical += per_day * sum(1 for value in dates if str(value or "").startswith(period))
+    return {"weekly_off_used": weekly_off, "medical_leave_used": medical}
+
+
+def leave_module_medical_problem(user: dict[str, Any], leave_dates: list[date], day_part: str) -> str | None:
+    """Monthly Medical Leave rule for Leave module applications (None if allowed)."""
+    weekly_limit = _weekly_off_limit()
+    per_day = 0.5 if day_part != "full_day" else 1
+    by_month: dict[tuple[int, int], int] = {}
+    for value in leave_dates:
+        by_month[(value.year, value.month)] = by_month.get((value.year, value.month), 0) + 1
+    for (year, month), count in sorted(by_month.items()):
+        label = date(year, month, 1).strftime("%B %Y")
+        usage = _month_usage(user, _month_context(user, year, month))
+        if usage["weekly_off_used"] < weekly_limit:
+            return (
+                f"Medical Leave for {label} is available only after all {weekly_limit} Weekly Off days of the month "
+                f"are used ({usage['weekly_off_used']} of {weekly_limit} used)."
+            )
+        if usage["medical_leave_used"] + per_day * count > MEDICAL_LEAVE_MONTHLY_LIMIT:
+            return (
+                f"Medical Leave is limited to {MEDICAL_LEAVE_MONTHLY_LIMIT} day per month per employee; "
+                f"{usage['medical_leave_used']:g} day(s) of {label} are already used or pending."
+            )
+    return None
+
+
+def _medical_leave_availability(usage: dict[str, int], weekly_limit: int, extra_weekly_offs: int = 0) -> tuple[bool, str | None]:
+    """Medical Leave is a paid monthly entitlement of one day per employee.
+
+    It unlocks only once the month's Weekly Off allowance is fully used
+    (recorded or requested) and does not depend on leave balances.
+    """
+    if usage["medical_leave_used"] + 1 > MEDICAL_LEAVE_MONTHLY_LIMIT:
+        return False, f"the monthly limit of {MEDICAL_LEAVE_MONTHLY_LIMIT} medical leave has been reached."
+    weekly_used = usage["weekly_off_used"] + extra_weekly_offs
+    if weekly_used < weekly_limit:
+        return False, f"it unlocks after all {weekly_limit} Weekly Off days of the month are used ({weekly_used} of {weekly_limit} used)."
+    return True, None
+
+
+def _status_options(base_status: str, usage: dict[str, int], weekly_limit: int) -> tuple[list[str], list[str]]:
+    """Permitted statuses for a date plus explanations for limit-blocked ones."""
+    options: list[str] = []
+    notes: list[str] = []
+    medical = _medical_leave_availability(usage, weekly_limit)
+    for option in STATUS_TRANSITIONS.get(base_status, ()):
+        if option == "Weekly Off" and usage["weekly_off_used"] >= weekly_limit:
+            notes.append(
+                f"Weekly Off is unavailable: the monthly limit of {weekly_limit} weekly off day(s) has been reached "
+                f"({usage['weekly_off_used']} recorded or requested)."
+            )
+            continue
+        if option == "Medical Leave" and not medical[0]:
+            notes.append(f"Medical Leave is unavailable: {medical[1]}")
+            continue
+        options.append(option)
+    return options, notes
+
+
+def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
+    """Authoritative per-date status, request eligibility and options for one month."""
+    _validate_month(year, month)
+    ctx = _month_context(user, year, month)
+    user_id = str(user["_id"])
+    employee_id = str(user.get("employee_id") or "")
+    today = ctx["today"]
+    period = f"{year:04d}-{month:02d}"
     claims = {
         claim["attendance_date"]: claim["request_id"]
         for claim in attendance_request_date_claims_collection.find(
-            {"user_id": user_id, "attendance_date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
+            {"user_id": user_id, "attendance_date": {"$gte": ctx["start"].isoformat(), "$lte": ctx["end"].isoformat()}}
         )
     }
     requests_by_id = {
@@ -198,26 +386,16 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
     } if claims else {}
     payroll_status = _payroll_status(employee_id, period)
     payroll_lock = payroll_status in PAYROLL_FINALIZED_STATUSES
+    usage = _month_usage(user, ctx)
+    weekly_limit = _weekly_off_limit()
+    medical = _medical_leave_availability(usage, weekly_limit)
 
     days: list[dict[str, Any]] = []
-    current = start
-    while current <= end:
+    current = ctx["start"]
+    while current <= ctx["end"]:
         iso = current.isoformat()
-        record = records.get(iso)
-        is_holiday = current in holidays
-        is_weekly_off = current.weekday() in weekly_offs
-        if record:
-            day_status = str(record.get("status") or "Not Marked")
-        elif current > today:
-            day_status = "Upcoming"
-        elif is_holiday:
-            day_status = "Holiday"
-        elif is_weekly_off:
-            day_status = "Weekly Off"
-        elif joining and current < joining:
-            day_status = "Not Applicable"
-        else:
-            day_status = "Not Marked"
+        record = ctx["records"].get(iso)
+        day_status = _day_status(current, record, ctx)
 
         claim_request = requests_by_id.get(claims.get(iso, ""))
         request_info = None
@@ -230,31 +408,42 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
                 "requested_status": requested.get("requested_status"),
             }
 
+        options, option_notes = _status_options(day_status, usage, weekly_limit)
         reason = None
-        if day_status != "Not Marked":
-            reason = "Only Not Marked dates can be requested."
-        elif current >= today:
-            reason = "Today's attendance can still be marked; requests are for past dates."
+        if current >= today:
+            reason = "Requests are for past dates only; today's attendance can still be marked."
+        elif day_status == "Leave":
+            reason = "Leave dates are managed in the Leave module."
+        elif day_status == BEFORE_JOINING:
+            reason = "This date is before your joining date."
+        elif day_status not in STATUS_TRANSITIONS:
+            reason = f"{day_status} dates cannot be corrected through an attendance request."
         elif request_info:
             reason = f"Request {request_info['request_number']} is already {request_info['status']} for this date."
         elif payroll_lock:
             reason = _payroll_lock_reason(period, payroll_status)
+        elif not options:
+            reason = "No attendance status can be requested for this date. " + " ".join(option_notes)
 
         days.append({
             "attendance_date": iso,
             "status": day_status,
+            "status_label": "Medical Leave" if record and record.get("medical_leave") else day_status,
             "attendance_category": _attendance_category(record),
             "attendance_source": record.get("attendance_source") if record else None,
             "check_in_time": record.get("check_in_time") if record else None,
             "check_out_time": record.get("check_out_time") if record else None,
             "leave_type_code": record.get("leave_type_code") if record else None,
-            "is_holiday": is_holiday,
-            "is_weekly_off": is_weekly_off,
+            "is_holiday": current in ctx["holidays"],
+            "holiday_name": ctx["holidays"].get(current) if day_status == "Holiday" else None,
+            "is_weekly_off": current.weekday() in ctx["weekly_offs"],
             "is_future": current > today,
             "has_record": record is not None,
             "request": request_info,
             "eligible_for_request": reason is None,
             "ineligible_reason": reason,
+            "request_options": options if reason is None else [],
+            "option_notes": option_notes if reason is None else [],
         })
         current += timedelta(days=1)
 
@@ -264,8 +453,16 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         "period": period,
         "payroll_status": payroll_status,
         "payroll_locked": payroll_lock,
-        "weekly_off_weekdays": [WEEKDAY_NAMES[index] for index in sorted(weekly_offs)],
-        "weekly_off_configured": bool(weekly_offs),
+        "weekly_off_weekdays": [WEEKDAY_NAMES[index] for index in sorted(ctx["weekly_offs"])],
+        "weekly_off_configured": bool(ctx["weekly_offs"]),
+        "limits": {
+            "weekly_off_limit": weekly_limit,
+            "weekly_off_used": usage["weekly_off_used"],
+            "medical_leave_limit": MEDICAL_LEAVE_MONTHLY_LIMIT,
+            "medical_leave_used": usage["medical_leave_used"],
+            "medical_leave_available": medical[0],
+            "medical_leave_note": f"Medical Leave is unavailable: {medical[1]}" if medical[1] else None,
+        },
         "days": days,
     }
 
@@ -356,7 +553,7 @@ def _local_text(value: datetime) -> str:
 
 
 def _date_label(iso: str) -> str:
-    return date.fromisoformat(iso).strftime("%d %b %Y")
+    return date.fromisoformat(iso).strftime("%a, %d %b %Y")
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +584,31 @@ def my_eligible_dates(
     }
 
 
+def _times_text(check_in: str | None, check_out: str | None) -> str:
+    if not check_in and not check_out:
+        return ""
+    return f" ({check_in or 'no check-in'} – {check_out or 'no check-out'})"
+
+
+def _time_problem(
+    status_value: str | None,
+    check_in: str | None,
+    check_out: str | None,
+    original: dict[str, Any] | None = None,
+) -> str | None:
+    if status_value != "Present":
+        return "Check-in/check-out times apply only to Present." if check_in or check_out else None
+    if check_in and check_out and check_out <= check_in:
+        return "Check-out time must be later than check-in time."
+    # A correction may change recorded times but never erase them.
+    if original and original.get("status") == "Present":
+        if original.get("check_in_time") and not check_in:
+            return "Enter a check-in time; an existing check-in cannot be removed."
+        if original.get("check_out_time") and not check_out:
+            return "Enter a check-out time; an existing check-out cannot be removed."
+    return None
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_attendance_request(
     payload: AttendanceRequestCreate,
@@ -400,35 +622,88 @@ def create_attendance_request(
     if len(set(isos)) != len(isos):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Each date can be included only once in a request.")
 
-    calendars: dict[tuple[int, int], dict[str, dict[str, Any]]] = {}
-    problems = []
+    calendars: dict[tuple[int, int], dict[str, Any]] = {}
+    added: dict[tuple[int, int], dict[str, int]] = {}
+    problems: list[str] = []
+    items: list[dict[str, Any]] = []
     for item in requested:
+        iso = item.attendance_date.isoformat()
         key = (item.attendance_date.year, item.attendance_date.month)
         if key not in calendars:
             try:
-                calendars[key] = {day["attendance_date"]: day for day in _build_calendar(user, *key)["days"]}
+                calendar = _build_calendar(user, *key)
+                calendars[key] = {"limits": calendar["limits"], "days": {day["attendance_date"]: day for day in calendar["days"]}}
             except HTTPException as exc:
-                problems.append(f"{item.attendance_date.isoformat()}: {exc.detail}")
-                calendars[key] = {}
-                continue
-        day = calendars[key].get(item.attendance_date.isoformat())
+                calendars[key] = {"limits": None, "days": {}, "error": exc.detail}
+            added[key] = {"Weekly Off": 0, "Medical Leave": 0}
+        calendar = calendars[key]
+        day = calendar["days"].get(iso)
         if not day:
+            problems.append(f"{iso}: {calendar.get('error', 'Invalid date.')}")
             continue
         if not day["eligible_for_request"]:
-            problems.append(f"{item.attendance_date.isoformat()}: {day['ineligible_reason']}")
-        elif any(leave_item.get("day_part", "full_day") == "full_day" for leave_item in _approved_leaves_for_date(item.attendance_date.isoformat(), user_id)):
-            problems.append(f"{item.attendance_date.isoformat()}: An approved full-day leave covers this date.")
+            problems.append(f"{iso}: {day['ineligible_reason']}")
+            continue
+        if item.requested_status not in day["request_options"]:
+            notes = " ".join(day["option_notes"])
+            problems.append(f"{iso}: {item.requested_status} cannot be requested for a {day['status']} date. {notes}".strip())
+            continue
+        time_problem = _time_problem(
+            item.requested_status, item.requested_check_in_time, item.requested_check_out_time,
+            {"status": day["status"], "check_in_time": day["check_in_time"], "check_out_time": day["check_out_time"]},
+        )
+        if time_problem:
+            problems.append(f"{iso}: {time_problem}")
+            continue
+        if (
+            item.requested_status == "Present" and day["status"] == "Present"
+            and (item.requested_check_in_time, item.requested_check_out_time) == (day["check_in_time"], day["check_out_time"])
+        ):
+            problems.append(f"{iso}: Change the check-in or check-out time to request a Present correction.")
+            continue
+        if any(leave_item.get("day_part", "full_day") == "full_day" for leave_item in _approved_leaves_for_date(iso, user_id)):
+            problems.append(f"{iso}: An approved full-day leave covers this date.")
+            continue
+        # Several Weekly Off / Medical Leave dates in one request count together.
+        limits = calendar["limits"]
+        if item.requested_status == "Weekly Off":
+            if limits["weekly_off_used"] + added[key]["Weekly Off"] >= limits["weekly_off_limit"]:
+                problems.append(f"{iso}: Weekly Off would exceed the monthly limit of {limits['weekly_off_limit']}.")
+                continue
+            added[key]["Weekly Off"] += 1
+        if item.requested_status == "Medical Leave":
+            if limits["medical_leave_used"] + added[key]["Medical Leave"] + 1 > limits["medical_leave_limit"]:
+                problems.append(f"{iso}: Medical Leave would exceed the monthly limit of {limits['medical_leave_limit']}.")
+                continue
+            added[key]["Medical Leave"] += 1
+        items.append({
+            "attendance_date": iso,
+            # Original attendance is kept separately; the record is unchanged until approval.
+            "original_status": day["status"],
+            "original_check_in_time": day["check_in_time"],
+            "original_check_out_time": day["check_out_time"],
+            "original_attendance_category": day["attendance_category"],
+            "original_has_record": day["has_record"],
+            "requested_status": item.requested_status,
+            "requested_check_in_time": item.requested_check_in_time if item.requested_status == "Present" else None,
+            "requested_check_out_time": item.requested_check_out_time if item.requested_status == "Present" else None,
+            "decision": None,
+            "final_status": None,
+            "final_check_in_time": None,
+            "final_check_out_time": None,
+            "outcome": None,
+            "applied": False,
+            "message": None,
+        })
     if problems:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "These dates are not eligible for an attendance request: " + "; ".join(problems))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "These dates cannot be requested: " + "; ".join(problems))
 
     request_id = ObjectId()
-    claimed: list[str] = []
     try:
         for iso in isos:
             attendance_request_date_claims_collection.insert_one(
                 {"user_id": user_id, "attendance_date": iso, "request_id": str(request_id), "created_at": datetime.now(timezone.utc)}
             )
-            claimed.append(iso)
     except DuplicateKeyError as exc:
         attendance_request_date_claims_collection.delete_many({"request_id": str(request_id)})
         raise HTTPException(status.HTTP_409_CONFLICT, "Another attendance request already covers one of these dates. Refresh and try again.") from exc
@@ -440,17 +715,7 @@ def create_attendance_request(
         "employee_id": user.get("employee_id", ""),
         "employee_name": user.get("name", ""),
         "department": _department(user),
-        "dates": [
-            {
-                "attendance_date": item.attendance_date.isoformat(),
-                "requested_status": item.requested_status,
-                "final_status": None,
-                "outcome": None,
-                "applied": False,
-                "message": None,
-            }
-            for item in requested
-        ],
+        "dates": items,
         "attendance_dates": isos,
         "periods": sorted({iso[:7] for iso in isos}),
         "employee_remarks": payload.remarks,
@@ -471,8 +736,23 @@ def create_attendance_request(
         logger.exception("Unable to save attendance request for user %s", user_id)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Your attendance request could not be saved. Please try again.") from exc
 
+    # Concurrent requests for different dates could both pass the limit check;
+    # recheck with this request's reservations included and roll back if over.
+    weekly_limit = _weekly_off_limit()
+    for year, month in {(item.attendance_date.year, item.attendance_date.month) for item in requested
+                        if item.requested_status in {"Weekly Off", "Medical Leave"}}:
+        usage = _month_usage(user, _month_context(user, year, month))
+        if usage["weekly_off_used"] > weekly_limit or usage["medical_leave_used"] > MEDICAL_LEAVE_MONTHLY_LIMIT:
+            attendance_requests_collection.delete_one({"_id": request_id, "status": "pending"})
+            _release_claims(str(request_id))
+            raise HTTPException(status.HTTP_409_CONFLICT, "Another request used the remaining Weekly Off / Medical Leave allowance for this month. Refresh and try again.")
+
     _audit(user, "ATTENDANCE_REQUEST_SUBMITTED", record, {"dates": isos})
-    summary = ", ".join(f"{_date_label(item['attendance_date'])} ({item['requested_status']})" for item in record["dates"])
+    summary = ", ".join(
+        f"{_date_label(item['attendance_date'])} ({item['original_status']} → {item['requested_status']}"
+        f"{_times_text(item['requested_check_in_time'], item['requested_check_out_time'])})"
+        for item in items
+    )
     try:
         for admin in users_collection.find({"is_active": True, "role": {"$regex": r"^\s*(hr admin|administrator)\s*$", "$options": "i"}}, {"_id": 1}):
             _notify(
@@ -549,6 +829,25 @@ def list_attendance_requests(
     return [_serialize(item) for item in records]
 
 
+def _employee_for_request(request: dict[str, Any]) -> dict[str, Any]:
+    user_id = request.get("user_id", "")
+    employee = users_collection.find_one({"_id": ObjectId(user_id)}) if ObjectId.is_valid(user_id) else None
+    if not employee:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The employee for this request no longer exists.")
+    return employee
+
+
+def _record_matches_original(item: dict[str, Any], record: dict[str, Any] | None, current_status: str) -> bool:
+    """True when the date still has the attendance the employee saw at submission."""
+    if current_status != item.get("original_status", "Not Marked"):
+        return False
+    if not record:
+        return True
+    return (record.get("check_in_time"), record.get("check_out_time")) == (
+        item.get("original_check_in_time"), item.get("original_check_out_time"),
+    )
+
+
 @router.get("/{request_id}")
 def get_attendance_request(request_id: str, authorization: str | None = Header(default=None)):
     user = _current_user(authorization)
@@ -557,72 +856,147 @@ def get_attendance_request(request_id: str, authorization: str | None = Header(d
     if not is_admin and request.get("user_id") != str(user["_id"]):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not authorized to view this attendance request.")
     result = _serialize(request)
+    can_respond = is_admin and request.get("status") in ACTIVE_REQUEST_STATUSES
+    employee = _employee_for_request(request) if can_respond else None
     payroll_cache: dict[str, str | None] = {}
+    month_cache: dict[tuple[int, int], tuple[dict[str, Any], dict[str, int]]] = {}
+    weekly_limit = _weekly_off_limit()
     for item in result["dates"]:
+        item.setdefault("original_status", "Not Marked")
         record = attendance_collection.find_one({"user_id": request["user_id"], "attendance_date": item["attendance_date"]})
         payroll_status = _payroll_status(request.get("employee_id", ""), item["attendance_date"][:7], payroll_cache)
         lock_reason = _payroll_lock_reason(item["attendance_date"][:7], payroll_status)
-        item["current_status"] = str(record.get("status")) if record else "Not Marked"
+        item["current_status"] = str(record.get("status")) if record else None
         item["current_check_in_time"] = record.get("check_in_time") if record else None
         item["current_check_out_time"] = record.get("check_out_time") if record else None
         item["current_attendance_category"] = _attendance_category(record)
         item["payroll_status"] = payroll_status
         item["payroll_locked"] = lock_reason is not None
         item["payroll_note"] = _payroll_draft_note(item["attendance_date"][:7], payroll_status)
-        item["eligibility_message"] = lock_reason or (
-            None if not record or record.get("attendance_request_id") == result["id"]
-            else f"Attendance is already recorded as {record.get('status')}; the existing record will be preserved."
-        )
-    result["can_respond"] = is_admin and request.get("status") in {"pending", "processing"}
+        item["eligibility_message"] = lock_reason
+        if not can_respond:
+            continue
+        day = date.fromisoformat(item["attendance_date"])
+        key = (day.year, day.month)
+        if key not in month_cache:
+            ctx = _month_context(employee, *key)
+            month_cache[key] = (ctx, _month_usage(employee, ctx, exclude_request_id=result["id"]))
+        ctx, usage = month_cache[key]
+        current_status = _day_status(day, record, ctx)
+        item["current_status"] = current_status
+        if not lock_reason and not _record_matches_original(item, record, current_status):
+            item["eligibility_message"] = (
+                f"Attendance for this date changed after the request was submitted (now {current_status}); "
+                "approving will not overwrite it."
+            )
+        options, notes = _status_options(item["original_status"], usage, weekly_limit)
+        if item["original_status"] != NOT_APPLICABLE:
+            options.append(NOT_APPLICABLE)
+        item["allowed_final_statuses"] = options
+        item["option_notes"] = notes
+    result["can_respond"] = can_respond
+    result["limits"] = {"weekly_off_limit": weekly_limit, "medical_leave_limit": MEDICAL_LEAVE_MONTHLY_LIMIT}
     return result
+
+
+ESSL_FIELDS = ("first_punch", "last_punch", "last_essl_sync_at", "last_essl_sync_id")
+LEAVE_FIELDS = ("leave_request_id", "leave_day_part", "leave_type_code", "medical_leave")
 
 
 def _apply_date_decision(
     request: dict[str, Any],
-    attendance_date: str,
-    final_status: str,
+    item: dict[str, Any],
+    decision: AttendanceDecisionIn,
     admin: dict[str, Any],
+    employee: dict[str, Any],
     payroll_cache: dict[str, str | None],
 ) -> tuple[bool, str, str]:
-    """Apply one decision. Returns (applied, final_status, message)."""
+    """Apply one approved decision. Returns (applied, final_status, message)."""
     request_id = str(request["_id"])
     user_id = request["user_id"]
+    attendance_date = item["attendance_date"]
+    final_status = decision.final_status or ""
+    check_in = decision.final_check_in_time if final_status == "Present" else None
+    check_out = decision.final_check_out_time if final_status == "Present" else None
     period = attendance_date[:7]
     lock_reason = _payroll_lock_reason(period, _payroll_status(request.get("employee_id", ""), period, payroll_cache))
     if lock_reason:
         return False, final_status, lock_reason
     key = {"user_id": user_id, "attendance_date": attendance_date}
     existing = attendance_collection.find_one(key)
-    if existing:
-        if existing.get("attendance_request_id") == request_id:
-            # Applied by an earlier, interrupted attempt of this same response.
-            return True, str(existing.get("status")), f"Recorded as {existing.get('status')}."
-        return False, final_status, f"Attendance is already recorded as {existing.get('status')}; the existing record was preserved."
-    if any(item.get("day_part", "full_day") == "full_day" for item in _approved_leaves_for_date(attendance_date, user_id)):
+    if existing and existing.get("attendance_request_id") == request_id:
+        # Applied by an earlier, interrupted attempt of this same response.
+        return True, final_status, "Recorded."
+    day = date.fromisoformat(attendance_date)
+    ctx = _month_context(employee, day.year, day.month)
+    current_status = _day_status(day, existing, ctx)
+    if not _record_matches_original(item, existing, current_status):
+        return False, final_status, f"Attendance for this date changed after the request was submitted (now {current_status}); the existing record was preserved."
+    if any(leave_item.get("day_part", "full_day") == "full_day" for leave_item in _approved_leaves_for_date(attendance_date, user_id)):
         return False, final_status, "An approved full-day leave covers this date; attendance was not changed."
+
+    # Revalidate monthly limits immediately before writing.
+    if final_status in {"Weekly Off", "Medical Leave"}:
+        usage = _month_usage(employee, ctx, exclude_request_id=request_id)
+        if final_status == "Weekly Off" and usage["weekly_off_used"] >= _weekly_off_limit():
+            return False, final_status, f"Weekly Off would exceed the monthly limit of {_weekly_off_limit()}."
+        if final_status == "Medical Leave":
+            available, reason = _medical_leave_availability(usage, _weekly_off_limit())
+            if not available:
+                return False, final_status, f"Medical Leave is unavailable: {reason}"
+
     now = datetime.now(timezone.utc)
-    record = {
-        "user_id": user_id,
-        "employee_id": request.get("employee_id", ""),
-        "attendance_date": attendance_date,
-        "status": final_status,
-        # Never fabricate punches: request-based attendance has no times.
-        "check_in_time": None,
-        "check_out_time": None,
-        "punch_details_missing": final_status == "Present",
+    values: dict[str, Any] = {
+        "status": "Leave" if final_status == "Medical Leave" else final_status,
+        # Times come only from the employee request / HR decision; never invented.
+        "check_in_time": check_in,
+        "check_out_time": check_out,
+        "punch_details_missing": final_status == "Present" and not check_in,
         "attendance_source": "ATTENDANCE_REQUEST",
-        "attendance_type": None,
+        "attendance_type": (existing or {}).get("attendance_type") if final_status == "Present" else None,
         "attendance_request_id": request_id,
         "attendance_request_number": request.get("request_number"),
         "marked_by": str(admin["_id"]),
-        "created_at": now,
         "updated_at": now,
     }
-    try:
-        attendance_collection.insert_one(record)
-    except DuplicateKeyError:
-        current = attendance_collection.find_one(key) or {}
-        return False, final_status, f"Attendance was recorded as {current.get('status', 'another status')} while this response was being processed; the existing record was preserved."
+    unset = {field: "" for field in ESSL_FIELDS}
+    if final_status == "Medical Leave":
+        values.update({
+            "leave_type_code": MEDICAL_LEAVE_CODE,
+            "leave_day_part": "full_day",
+            "leave_request_id": None,
+            "medical_leave": True,
+        })
+    else:
+        unset.update({field: "" for field in LEAVE_FIELDS})
+    if existing:
+        values["correction_previous"] = {
+            "status": existing.get("status"),
+            "check_in_time": existing.get("check_in_time"),
+            "check_out_time": existing.get("check_out_time"),
+            "attendance_source": existing.get("attendance_source"),
+        }
+        written = attendance_collection.update_one(
+            {
+                "_id": existing["_id"],
+                "status": existing.get("status"),
+                "check_in_time": existing.get("check_in_time"),
+                "check_out_time": existing.get("check_out_time"),
+            },
+            {"$set": values, "$unset": unset},
+        )
+        if written.matched_count != 1:
+            return False, final_status, "Attendance was changed while this response was being processed; the existing record was preserved."
+    else:
+        try:
+            attendance_collection.insert_one({
+                **values, "user_id": user_id, "employee_id": request.get("employee_id", ""),
+                "attendance_date": attendance_date, "created_at": now,
+            })
+        except DuplicateKeyError:
+            current = attendance_collection.find_one(key) or {}
+            return False, final_status, f"Attendance was recorded as {current.get('status', 'another status')} while this response was being processed; the existing record was preserved."
+
     # A calculated (draft) payroll no longer matches attendance: flag it so it
     # cannot be approved until HR disapproves and recalculates. If payroll was
     # finalized in the meantime, undo this write instead.
@@ -643,20 +1017,101 @@ def _apply_date_decision(
     else:
         current_payroll = _payroll_status(request.get("employee_id", ""), period)
         if current_payroll in PAYROLL_FINALIZED_STATUSES:
-            attendance_collection.delete_one({**key, "attendance_request_id": request_id})
+            if existing:
+                attendance_collection.replace_one({"_id": existing["_id"], "attendance_request_id": request_id}, existing)
+            else:
+                attendance_collection.delete_one({**key, "attendance_request_id": request_id})
             payroll_cache[period] = current_payroll
             return False, final_status, _payroll_lock_reason(period, current_payroll) or "Payroll is locked."
+
     try:
         audit_logs_collection.insert_one({
             "user_id": str(admin["_id"]),
             "action": "attendance.request_decision",
-            "old_value": {"user_id": user_id, "attendance_date": attendance_date, "status": "Not Marked"},
-            "new_value": {"attendance_date": attendance_date, "status": final_status, "attendance_source": "ATTENDANCE_REQUEST", "attendance_request_id": request_id},
+            "old_value": {
+                "user_id": user_id, "attendance_date": attendance_date, "status": current_status,
+                "check_in_time": (existing or {}).get("check_in_time"), "check_out_time": (existing or {}).get("check_out_time"),
+            },
+            "new_value": {
+                "attendance_date": attendance_date, "status": values["status"], "final_status": final_status,
+                "check_in_time": check_in, "check_out_time": check_out,
+                "attendance_source": "ATTENDANCE_REQUEST", "attendance_request_id": request_id,
+            },
             "timestamp": now,
         })
     except Exception:
         logger.exception("Unable to write audit log for attendance request %s on %s", request.get("request_number"), attendance_date)
-    return True, final_status, f"Recorded as {final_status}.{payroll_note}"
+    return True, final_status, f"Recorded as {final_status}{_times_text(check_in, check_out)}.{payroll_note}"
+
+
+def _validate_decisions(request: dict[str, Any], payload: AttendanceRequestResponsePayload, employee: dict[str, Any]) -> dict[str, AttendanceDecisionIn]:
+    requested_dates = [item["attendance_date"] for item in request.get("dates", [])]
+    decisions: dict[str, AttendanceDecisionIn] = {}
+    for decision in payload.decisions:
+        iso = decision.attendance_date.isoformat()
+        if iso in decisions:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"{iso} has more than one decision.")
+        decisions[iso] = decision
+    unknown = sorted(set(decisions) - set(requested_dates))
+    missing = [iso for iso in requested_dates if iso not in decisions]
+    if unknown:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"These dates are not part of the request: {', '.join(unknown)}.")
+    if missing:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Approve or reject every requested date. Missing: {', '.join(missing)}.")
+    if any(decision.action == "reject" for decision in decisions.values()) and not payload.review_comments:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Enter response remarks when rejecting a date.")
+
+    problems: list[str] = []
+    added: dict[str, dict[str, int]] = {}
+    weekly_limit = _weekly_off_limit()
+    # Weekly Off days approved in this response also unlock Medical Leave.
+    approved_weekly_offs: dict[str, int] = {}
+    for iso, decision in decisions.items():
+        if decision.action == "approve" and decision.final_status == "Weekly Off":
+            approved_weekly_offs[iso[:7]] = approved_weekly_offs.get(iso[:7], 0) + 1
+    usage_cache: dict[str, dict[str, int]] = {}
+    for item in request.get("dates", []):
+        iso = item["attendance_date"]
+        decision = decisions[iso]
+        if decision.action == "reject":
+            continue
+        original = item.get("original_status", "Not Marked")
+        if not decision.final_status:
+            problems.append(f"{iso}: select the final attendance status to approve.")
+            continue
+        hr_only = decision.final_status == NOT_APPLICABLE and original != NOT_APPLICABLE
+        if not hr_only and decision.final_status not in STATUS_TRANSITIONS.get(original, ()):
+            problems.append(f"{iso}: {decision.final_status} is not a permitted correction for a {original} date.")
+            continue
+        time_problem = _time_problem(
+            decision.final_status, decision.final_check_in_time, decision.final_check_out_time,
+            {"status": original, "check_in_time": item.get("original_check_in_time"), "check_out_time": item.get("original_check_out_time")},
+        )
+        if time_problem:
+            problems.append(f"{iso}: {time_problem}")
+            continue
+        if decision.final_status in {"Weekly Off", "Medical Leave"}:
+            period = iso[:7]
+            if period not in usage_cache:
+                day = date.fromisoformat(iso)
+                usage_cache[period] = _month_usage(employee, _month_context(employee, day.year, day.month), exclude_request_id=str(request["_id"]))
+                added[period] = {"Weekly Off": 0, "Medical Leave": 0}
+            used = usage_cache[period]
+            if decision.final_status == "Weekly Off" and used["weekly_off_used"] + added[period]["Weekly Off"] >= weekly_limit:
+                problems.append(f"{iso}: Weekly Off would exceed the monthly limit of {weekly_limit}.")
+                continue
+            if decision.final_status == "Medical Leave":
+                if used["medical_leave_used"] + added[period]["Medical Leave"] + 1 > MEDICAL_LEAVE_MONTHLY_LIMIT:
+                    problems.append(f"{iso}: Medical Leave would exceed the monthly limit of {MEDICAL_LEAVE_MONTHLY_LIMIT}.")
+                    continue
+                available, reason = _medical_leave_availability(used, weekly_limit, approved_weekly_offs.get(period, 0))
+                if not available:
+                    problems.append(f"{iso}: Medical Leave is unavailable: {reason}")
+                    continue
+            added[period][decision.final_status] += 1
+    if problems:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Correct these decisions: " + "; ".join(problems))
+    return decisions
 
 
 @router.post("/{request_id}/respond")
@@ -669,22 +1124,10 @@ def respond_to_attendance_request(
     request = _load_request(request_id)
     if request.get("user_id") == str(admin["_id"]):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You cannot respond to your own attendance request. Another HR Admin must review it.")
-    if request.get("status") not in {"pending", "processing"}:
+    if request.get("status") not in ACTIVE_REQUEST_STATUSES:
         raise HTTPException(status.HTTP_409_CONFLICT, f"This attendance request has already been {request.get('status', 'processed').replace('_', ' ')}.")
-
-    requested_dates = [item["attendance_date"] for item in request.get("dates", [])]
-    decisions: dict[str, str] = {}
-    for item in payload.decisions:
-        iso = item.attendance_date.isoformat()
-        if iso in decisions:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"{iso} has more than one decision.")
-        decisions[iso] = item.final_status
-    unknown = sorted(set(decisions) - set(requested_dates))
-    missing = [iso for iso in requested_dates if iso not in decisions]
-    if unknown:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"These dates are not part of the request: {', '.join(unknown)}.")
-    if missing:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Select a final status for every requested date. Missing: {', '.join(missing)}.")
+    employee = _employee_for_request(request)
+    decisions = _validate_decisions(request, payload, employee)
 
     # Claim the request so only one reviewer can apply it; a stale claim from
     # an interrupted attempt can be retried after the timeout.
@@ -704,42 +1147,63 @@ def respond_to_attendance_request(
     if not claimed:
         raise HTTPException(status.HTTP_409_CONFLICT, "This attendance request is already being processed or has been processed. Refresh the list.")
 
+    def release_to_pending() -> None:
+        attendance_requests_collection.update_one(
+            {"_id": claimed["_id"], "processing_token": token},
+            {"$set": {"status": "pending", "updated_at": datetime.now(timezone.utc)}, "$unset": {"processing_token": "", "processing_by": "", "processing_started_at": ""}},
+        )
+
+    # Serialize responses per employee and month so concurrent approvals cannot
+    # exceed the monthly Weekly Off / Medical Leave limits.
+    if attendance_requests_collection.find_one({
+        "_id": {"$ne": claimed["_id"]}, "user_id": claimed["user_id"],
+        "status": "processing", "periods": {"$in": claimed.get("periods", [])},
+    }):
+        release_to_pending()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Another response for this employee and month is being saved. Retry in a moment.")
+
     payroll_cache: dict[str, str | None] = {}
     results = []
     try:
-        for item in claimed["dates"]:
-            iso = item["attendance_date"]
-            applied, final_status, message = _apply_date_decision(claimed, iso, decisions[iso], admin, payroll_cache)
+        # Apply Medical Leave last so Weekly Off days approved here unlock it.
+        ordered = sorted(claimed["dates"], key=lambda entry: decisions[entry["attendance_date"]].final_status == "Medical Leave")
+        for item in ordered:
+            item = {"original_status": "Not Marked", **item}
+            decision = decisions[item["attendance_date"]]
+            if decision.action == "reject":
+                results.append({**item, "decision": "reject", "final_status": None, "final_check_in_time": None, "final_check_out_time": None,
+                                "outcome": "rejected", "applied": False, "message": "Rejected by HR Admin; attendance unchanged."})
+                continue
+            applied, final_status, message = _apply_date_decision(claimed, item, decision, admin, employee, payroll_cache)
+            final_in = decision.final_check_in_time if final_status == "Present" else None
+            final_out = decision.final_check_out_time if final_status == "Present" else None
             if not applied:
                 outcome = "not_applied"
-            elif final_status == item["requested_status"]:
+            elif final_status == item["requested_status"] and (final_in, final_out) == (item.get("requested_check_in_time"), item.get("requested_check_out_time")):
                 outcome = "approved"
-            elif final_status == "Absent":
-                outcome = "rejected"
             else:
                 outcome = "changed"
-            results.append({**item, "final_status": final_status, "outcome": outcome, "applied": applied, "message": message})
+            results.append({**item, "decision": "approve", "final_status": final_status, "final_check_in_time": final_in,
+                            "final_check_out_time": final_out, "outcome": outcome, "applied": applied, "message": message})
     except Exception as exc:
         # Leave the claim to expire so a retry resumes idempotently; dates
         # already written are recognised by attendance_request_id.
         logger.exception("Attendance request %s failed while applying decisions", claimed.get("request_number"))
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "The response could not be fully saved. No notification was sent; please retry in a few minutes.") from exc
 
+    results.sort(key=lambda entry: entry["attendance_date"])
     applied_count = sum(1 for item in results if item["applied"])
-    if applied_count == 0:
-        # Nothing could be saved (all dates locked/ineligible): keep the
-        # request pending, report every date, and do not notify the employee.
-        attendance_requests_collection.update_one(
-            {"_id": claimed["_id"], "processing_token": token},
-            {"$set": {"status": "pending", "updated_at": datetime.now(timezone.utc)}, "$unset": {"processing_token": "", "processing_by": "", "processing_started_at": ""}},
-        )
+    rejected_count = sum(1 for item in results if item["outcome"] == "rejected")
+    if applied_count == 0 and rejected_count == 0:
+        # Nothing could be saved (all dates locked/changed): keep the request
+        # pending, report every date, and do not notify the employee.
+        release_to_pending()
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"message": "No date could be updated, so the request is still pending.", "dates": [{"attendance_date": item["attendance_date"], "message": item["message"]} for item in results]},
         )
 
-    approved_count = sum(1 for item in results if item["outcome"] == "approved")
-    overall = "approved" if approved_count == len(results) else ("rejected" if approved_count == 0 else "partially_approved")
+    overall = "approved" if applied_count == len(results) else ("rejected" if applied_count == 0 else "partially_approved")
     reviewed_at = datetime.now(timezone.utc)
     finished = attendance_requests_collection.find_one_and_update(
         {"_id": claimed["_id"], "status": "processing", "processing_token": token},
@@ -756,23 +1220,28 @@ def respond_to_attendance_request(
     if not finished:
         raise HTTPException(status.HTTP_409_CONFLICT, "This request was taken over by another reviewer after a timeout. Refresh to see its current state.")
     _release_claims(str(claimed["_id"]))
-    _audit(admin, "ATTENDANCE_REQUEST_RESPONDED", finished, {"status": overall, "dates": [{k: item[k] for k in ("attendance_date", "requested_status", "final_status", "outcome", "applied")} for item in results]})
+    _audit(admin, "ATTENDANCE_REQUEST_RESPONDED", finished, {
+        "status": overall,
+        "dates": [{k: item.get(k) for k in ("attendance_date", "original_status", "requested_status", "requested_check_in_time",
+                                             "requested_check_out_time", "decision", "final_status", "final_check_in_time",
+                                             "final_check_out_time", "outcome", "applied")} for item in results],
+    })
 
-    outcome_text = {
-        "approved": "Approved as {final}",
-        "changed": "Changed to {final}",
-        "rejected": "Changed to {final}",
-        "not_applied": "Not applied ({message})",
-    }
-    lines = [
-        f"{_date_label(item['attendance_date'])} — Requested {item['requested_status']} — "
-        + outcome_text[item["outcome"]].format(final=item["final_status"], message=item["message"])
-        for item in results
-    ]
+    def outcome_line(item: dict[str, Any]) -> str:
+        requested = f"Requested {item['requested_status']}{_times_text(item.get('requested_check_in_time'), item.get('requested_check_out_time'))}"
+        final = f"{item['final_status']}{_times_text(item.get('final_check_in_time'), item.get('final_check_out_time'))}"
+        text = {
+            "approved": f"Approved as {final}",
+            "changed": f"Approved with changes as {final}",
+            "rejected": "Rejected",
+            "not_applied": f"Not applied ({item['message']})",
+        }[item["outcome"]]
+        return f"{_date_label(item['attendance_date'])} — {requested} — {text}"
+
     message = (
         f"Attendance request {finished['request_number']} submitted on {_local_text(finished['submitted_at'])} "
-        f"was {overall.replace('_', ' ')} on {_local_text(reviewed_at)}. " + " | ".join(lines)
-        + (f" | Comments: {payload.review_comments}" if payload.review_comments else "")
+        f"was {overall.replace('_', ' ')} on {_local_text(reviewed_at)}. " + " | ".join(outcome_line(item) for item in results)
+        + (f" | Remarks: {payload.review_comments}" if payload.review_comments else "")
     )
     try:
         _notify(finished["user_id"], f"Attendance Request {overall.replace('_', ' ').title()}", message, finished, "response")
@@ -785,7 +1254,8 @@ def respond_to_attendance_request(
         **_serialize(finished),
         "summary": {
             "applied": applied_count,
-            "not_applied": len(results) - applied_count,
+            "rejected": rejected_count,
+            "not_applied": len(results) - applied_count - rejected_count,
             "notification_sent": notification_sent,
             "outdated_payroll_periods": sorted(
                 row["period"]

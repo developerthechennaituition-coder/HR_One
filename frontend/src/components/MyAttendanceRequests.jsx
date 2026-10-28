@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   OUTCOME_LABELS,
   REQUEST_STATUS_BADGES,
@@ -7,28 +7,56 @@ import {
   createAttendanceRequest,
   formatRequestDate,
   formatRequestDateTime,
+  formatTimeRange,
   getMyAttendanceRequests,
 } from "../services/attendanceRequestApi";
 
 const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const STATUS_FILTERS = ["Not Marked", "Absent", "Present", "Weekly Off", "Holiday", "Not Applicable", "all"];
+const ACTIVE_STATUSES = new Set(["pending", "processing"]);
+
+const timeSuffix = (checkIn, checkOut) => {
+  const text = formatTimeRange(checkIn, checkOut);
+  return text ? ` (${text})` : "";
+};
 
 export function DateDecisionList({ dates }) {
   return (
-    <ul className="list-unstyled mb-0 small">
+    <ul className="list-unstyled mb-0 small d-grid gap-1">
       {(dates || []).map((item) => (
         <li key={item.attendance_date}>
-          <strong>{formatRequestDate(item.attendance_date)}</strong> — Requested {item.requested_status}
-          {item.outcome
-            ? <> — {OUTCOME_LABELS[item.outcome]}{item.outcome !== "not_applied" && <> <strong>{item.final_status}</strong></>}
-              {item.outcome === "not_applied" && item.message && <span className="text-muted"> ({item.message})</span>}</>
-            : <span className="text-muted"> — Awaiting decision</span>}
+          <strong>{formatRequestDate(item.attendance_date)}</strong>
+          {item.original_status && <span className="text-muted"> · was {item.original_status}{timeSuffix(item.original_check_in_time, item.original_check_out_time)}</span>}
+          <div>Requested {item.requested_status}{timeSuffix(item.requested_check_in_time, item.requested_check_out_time)}</div>
+          {item.outcome ? (
+            <div className={item.outcome === "rejected" || item.outcome === "not_applied" ? "text-danger" : "text-success"}>
+              {OUTCOME_LABELS[item.outcome]}
+              {(item.outcome === "approved" || item.outcome === "changed") && <> <strong>{item.final_status}</strong>{timeSuffix(item.final_check_in_time, item.final_check_out_time)}</>}
+              {item.outcome === "not_applied" && item.message && <span> — {item.message}</span>}
+            </div>
+          ) : <div className="text-muted">Awaiting HR Admin decision</div>}
         </li>
       ))}
     </ul>
   );
 }
 
-function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onChanged, refreshKey = 0 }) {
+function rowProblem(entry) {
+  const { day, requested_status: status, check_in: checkIn, check_out: checkOut } = entry;
+  if (!status) return "Select the status you are requesting.";
+  if (status !== "Present") return "";
+  if (checkIn && checkOut && checkOut <= checkIn) return "Check-out must be later than check-in.";
+  if (day.status === "Present") {
+    if (day.check_in_time && !checkIn) return "An existing check-in cannot be removed.";
+    if (day.check_out_time && !checkOut) return "An existing check-out cannot be removed.";
+    if ((checkIn || null) === (day.check_in_time || null) && (checkOut || null) === (day.check_out_time || null)) {
+      return "Change the check-in or check-out time to request a correction.";
+    }
+  }
+  return "";
+}
+
+function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, onOpenChange, onMonthChange, onChanged, onDecided, refreshKey = 0 }) {
   const [requests, setRequests] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -37,38 +65,54 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
   const [remarks, setRemarks] = useState("");
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [statusFilter, setStatusFilter] = useState("Not Marked");
+  const [dateFilter, setDateFilter] = useState("");
   const [cancellingId, setCancellingId] = useState("");
   const [confirmCancelId, setConfirmCancelId] = useState("");
+  const activeIdsRef = useRef(null);
 
   const loadRequests = useCallback(async () => {
     try {
-      setRequests(await getMyAttendanceRequests());
+      const data = await getMyAttendanceRequests();
+      setRequests(data);
       setError("");
+      // A request decided by HR Admin since the last load changes attendance:
+      // let the page refresh the calendar and detailed attendance.
+      const active = new Set(data.filter((item) => ACTIVE_STATUSES.has(item.status)).map((item) => item.id));
+      if (activeIdsRef.current && [...activeIdsRef.current].some((id) => !active.has(id))) onDecided?.();
+      activeIdsRef.current = active;
     } catch (loadError) {
       setError(loadError.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onDecided]);
 
   useEffect(() => { loadRequests(); }, [loadRequests, refreshKey]);
 
-  // Requestable dates come from the same authoritative calendar data.
-  const notMarkedDays = useMemo(
-    () => (calendar?.days || []).filter((day) => day.status === "Not Marked" && !day.is_future),
-    [calendar],
-  );
-  // Only dates that are eligible in the current calendar data can be submitted.
-  const eligibleDates = useMemo(
-    () => new Set(notMarkedDays.filter((day) => day.eligible_for_request).map((day) => day.attendance_date)),
-    [notMarkedDays],
-  );
-  const selectedDates = Object.keys(selected).filter((iso) => eligibleDates.has(iso)).sort();
+  const hasActive = requests.some((item) => ACTIVE_STATUSES.has(item.status));
+  useEffect(() => {
+    if (!hasActive) return undefined;
+    const timer = window.setInterval(loadRequests, 30000);
+    return () => window.clearInterval(timer);
+  }, [hasActive, loadRequests]);
+
+  // Past dates of the displayed month that can be corrected or explain why not.
+  const visibleDays = useMemo(() => (calendar?.days || []).filter((day) => {
+    if (day.is_future) return false;
+    if (dateFilter) return day.attendance_date === dateFilter;
+    return statusFilter === "all" ? day.eligible_for_request || day.request : day.status === statusFilter;
+  }), [calendar, dateFilter, statusFilter]);
+
+  const selectedDates = Object.keys(selected).sort();
+  const limits = calendar?.limits;
 
   const resetForm = () => {
     setSelected({});
     setRemarks("");
     setFormError("");
+    setDateFilter("");
+    setStatusFilter("Not Marked");
   };
 
   const openForm = () => {
@@ -82,16 +126,38 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
     onOpenChange(false);
   };
 
-  const toggleDate = (iso, checked) => {
+  const toggleDate = (day, checked) => {
     setSelected((current) => {
       const next = { ...current };
-      if (checked) next[iso] = next[iso] || "Present";
-      else delete next[iso];
+      if (checked) {
+        next[day.attendance_date] = {
+          day,
+          requested_status: day.request_options.length === 1 ? day.request_options[0] : "",
+          // Existing times prefill the Present correction fields; nothing is invented.
+          check_in: day.check_in_time || "",
+          check_out: day.check_out_time || "",
+        };
+      } else {
+        delete next[day.attendance_date];
+      }
       return next;
     });
   };
 
-  const applyToAll = (status) => setSelected((current) => Object.fromEntries(Object.keys(current).map((iso) => [iso, status])));
+  const updateEntry = (iso, changes) => setSelected((current) => ({ ...current, [iso]: { ...current[iso], ...changes } }));
+
+  const jumpToDate = (iso) => {
+    setDateFilter(iso);
+    if (!iso) return;
+    const [jumpYear, jumpMonth] = iso.split("-").map(Number);
+    if (jumpYear !== year || jumpMonth !== month) onMonthChange?.(jumpYear, jumpMonth);
+  };
+
+  const shiftMonth = (delta) => {
+    const index = year * 12 + (month - 1) + delta;
+    setDateFilter("");
+    onMonthChange?.(Math.floor(index / 12), (index % 12) + 1);
+  };
 
   const submit = async (event) => {
     event.preventDefault();
@@ -99,14 +165,28 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
       setFormError("Select at least one eligible date.");
       return;
     }
+    const firstProblem = selectedDates.map((iso) => [iso, rowProblem(selected[iso])]).find(([, problem]) => problem);
+    if (firstProblem) {
+      setFormError(`${formatRequestDate(firstProblem[0])}: ${firstProblem[1]}`);
+      return;
+    }
     setSubmitting(true);
     setFormError("");
     try {
       const created = await createAttendanceRequest(
-        selectedDates.map((iso) => ({ attendance_date: iso, requested_status: selected[iso] })),
+        selectedDates.map((iso) => {
+          const entry = selected[iso];
+          const isPresent = entry.requested_status === "Present";
+          return {
+            attendance_date: iso,
+            requested_status: entry.requested_status,
+            requested_check_in_time: isPresent ? entry.check_in || null : null,
+            requested_check_out_time: isPresent ? entry.check_out || null : null,
+          };
+        }),
         remarks.trim(),
       );
-      setSuccess(`Attendance request ${created.request_number} submitted for ${created.dates.length} date(s). HR Admin will review each date.`);
+      setSuccess(`Attendance request ${created.request_number} submitted for ${created.dates.length} date(s). Status: Pending HR Admin review. Your attendance will change only after approval.`);
       closeForm();
       window.dispatchEvent(new Event("hrms-notifications-updated"));
       await Promise.all([loadRequests(), onChanged?.()]);
@@ -138,6 +218,8 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
     }
   };
 
+  const atLatestMonth = year > maxYear || (year === maxYear && month >= maxMonth);
+
   return (
     <>
       <section className="card border-0 shadow-sm mb-4" aria-label="My attendance requests">
@@ -145,7 +227,7 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
           <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
             <div>
               <h4 className="mb-1">My Attendance Requests</h4>
-              <small className="text-muted">Request Present or Holiday for past dates that are Not Marked. HR Admin decides each date.</small>
+              <small className="text-muted">Request a correction for a past date. HR Admin approves or rejects each date; attendance changes only after approval.</small>
             </div>
             <button type="button" className="btn btn-primary" onClick={openForm} disabled={!calendar}>
               <i className="bi bi-calendar-plus me-2" aria-hidden="true" />Attendance Request
@@ -167,11 +249,11 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
                   <tr key={request.id}>
                     <td className="fw-semibold">{request.request_number}</td>
                     <td className="small">{formatRequestDateTime(request.submitted_at)}</td>
-                    <td><DateDecisionList dates={request.dates} /></td>
+                    <td style={{ minWidth: 220 }}><DateDecisionList dates={request.dates} /></td>
                     <td><span className={`badge ${REQUEST_STATUS_BADGES[request.status] || "text-bg-secondary"}`}>{REQUEST_STATUS_LABELS[request.status] || request.status}</span></td>
                     <td className="small">
                       {request.reviewed_at ? <>{formatRequestDateTime(request.reviewed_at)}<div className="text-muted">by {request.reviewed_by_name || "HR Admin"}</div></> : "—"}
-                      {request.review_comments && <div className="mt-1">“{request.review_comments}”</div>}
+                      {request.review_comments && <div className="mt-1">Remarks: {request.review_comments}</div>}
                     </td>
                     <td className="text-end">
                       {request.status === "pending" && (
@@ -195,42 +277,97 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
 
       {open && (
         <div className="modal d-block" tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="attendance-request-title" style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}>
-          <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
-            <form className="modal-content" onSubmit={submit}>
+          <div className="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable modal-fullscreen-md-down">
+            <form className="modal-content" onSubmit={submit} noValidate>
               <div className="modal-header">
-                <h5 className="modal-title" id="attendance-request-title">Attendance Request · {MONTH_NAMES[month - 1]} {year}</h5>
+                <h5 className="modal-title" id="attendance-request-title">Attendance Request</h5>
                 <button type="button" className="btn-close" aria-label="Close" onClick={closeForm} disabled={submitting} />
               </div>
               <div className="modal-body">
-                <p className="small text-muted">
-                  Select one or more Not Marked dates and choose the status you are requesting for each date. Use the calendar's month controls to request dates in another month.
-                </p>
-                {notMarkedDays.length === 0 ? (
-                  <div className="alert alert-light border">There are no Not Marked past dates in this month.</div>
+                <div className="row g-2 align-items-end mb-3">
+                  <div className="col-12 col-md-5">
+                    <span className="form-label small d-block mb-1">Month</span>
+                    <div className="d-flex align-items-center gap-2">
+                      <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => shiftMonth(-1)} disabled={submitting} aria-label="Previous month"><i className="bi bi-chevron-left" aria-hidden="true" /></button>
+                      <strong className="flex-grow-1 text-center">{MONTH_NAMES[month - 1]} {year}</strong>
+                      <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => shiftMonth(1)} disabled={submitting || atLatestMonth} aria-label="Next month"><i className="bi bi-chevron-right" aria-hidden="true" /></button>
+                    </div>
+                  </div>
+                  <div className="col-6 col-md-3">
+                    <label className="form-label small mb-1" htmlFor="ar-status-filter">Attendance status</label>
+                    <select id="ar-status-filter" className="form-select form-select-sm" value={statusFilter} disabled={Boolean(dateFilter)} onChange={(e) => setStatusFilter(e.target.value)}>
+                      {STATUS_FILTERS.map((value) => <option key={value} value={value}>{value === "all" ? "All eligible dates" : value}</option>)}
+                    </select>
+                  </div>
+                  <div className="col-6 col-md-4">
+                    <label className="form-label small mb-1" htmlFor="ar-date-filter">Find a date</label>
+                    <div className="d-flex gap-1">
+                      <input id="ar-date-filter" type="date" className="form-control form-control-sm" value={dateFilter} onChange={(e) => jumpToDate(e.target.value)} />
+                      {dateFilter && <button type="button" className="btn btn-sm btn-light border" onClick={() => setDateFilter("")}>Clear</button>}
+                    </div>
+                  </div>
+                </div>
+
+                {limits && (
+                  <div className="small text-muted mb-2">
+                    This month: Weekly Off {limits.weekly_off_used} of {limits.weekly_off_limit} used · Medical Leave {limits.medical_leave_used} of {limits.medical_leave_limit} used
+                    {limits.medical_leave_note && <> · {limits.medical_leave_note}</>}
+                  </div>
+                )}
+
+                {[...new Set(visibleDays.filter((day) => day.eligible_for_request).flatMap((day) => day.option_notes))].map((note) => (
+                  <div key={note} className="alert alert-warning py-2 small mb-2">{note}</div>
+                ))}
+
+                {visibleDays.length === 0 ? (
+                  <div className="alert alert-light border mb-0">No past dates match this filter in {MONTH_NAMES[month - 1]} {year}.</div>
                 ) : (
                   <div className="table-responsive border rounded">
                     <table className="table table-sm align-middle mb-0">
-                      <thead className="table-light"><tr><th style={{ width: 40 }} /><th>Date</th><th>Current status</th><th>Requested status</th></tr></thead>
+                      <thead className="table-light">
+                        <tr><th style={{ width: 40 }}><span className="visually-hidden">Select</span></th><th>Date</th><th>Current attendance</th><th>Requested status</th><th>Requested times</th></tr>
+                      </thead>
                       <tbody>
-                        {notMarkedDays.map((day) => {
+                        {visibleDays.map((day) => {
                           const iso = day.attendance_date;
-                          const checked = Boolean(selected[iso]);
+                          const entry = selected[iso];
+                          const problem = entry ? rowProblem(entry) : "";
                           return (
                             <tr key={iso} className={day.eligible_for_request ? "" : "text-muted"}>
                               <td>
-                                <input type="checkbox" className="form-check-input" id={`request-${iso}`} checked={checked}
-                                  disabled={!day.eligible_for_request || submitting} onChange={(event) => toggleDate(iso, event.target.checked)} />
+                                <input type="checkbox" className="form-check-input" id={`request-${iso}`} checked={Boolean(entry)}
+                                  disabled={!day.eligible_for_request || submitting} onChange={(e) => toggleDate(day, e.target.checked)} />
                               </td>
-                              <td><label htmlFor={`request-${iso}`} className="mb-0">{formatRequestDate(iso)}</label></td>
-                              <td>{day.eligible_for_request ? "Not Marked" : <span className="small">{day.ineligible_reason}</span>}</td>
+                              <td className="text-nowrap"><label htmlFor={`request-${iso}`} className="mb-0">{formatRequestDate(iso)}</label></td>
                               <td>
-                                {checked && (
-                                  <select className="form-select form-select-sm" aria-label={`Requested status for ${iso}`} value={selected[iso]}
-                                    onChange={(event) => setSelected((current) => ({ ...current, [iso]: event.target.value }))} disabled={submitting}>
-                                    <option value="Present">Present</option>
-                                    <option value="Holiday">Holiday</option>
+                                <div>{day.status_label || day.status}</div>
+                                {(day.check_in_time || day.check_out_time) && <div className="small text-muted">{formatTimeRange(day.check_in_time, day.check_out_time)}</div>}
+                                {!day.eligible_for_request && <div className="small">{day.ineligible_reason}</div>}
+                              </td>
+                              <td style={{ minWidth: 160 }}>
+                                {entry ? (
+                                  <select className={`form-select form-select-sm ${entry.requested_status ? "" : "border-warning"}`} aria-label={`Requested status for ${iso}`}
+                                    value={entry.requested_status} disabled={submitting}
+                                    onChange={(e) => updateEntry(iso, { requested_status: e.target.value })}>
+                                    <option value="">Select status...</option>
+                                    {day.request_options.map((option) => <option key={option} value={option}>{option}</option>)}
                                   </select>
-                                )}
+                                ) : null}
+                              </td>
+                              <td style={{ minWidth: 200 }}>
+                                {entry?.requested_status === "Present" ? (
+                                  <div className="d-flex flex-wrap gap-2">
+                                    <label className="small mb-0">Check-in
+                                      <input type="time" className="form-control form-control-sm" value={entry.check_in} disabled={submitting}
+                                        onChange={(e) => updateEntry(iso, { check_in: e.target.value })} />
+                                    </label>
+                                    <label className="small mb-0">Check-out
+                                      <input type="time" className="form-control form-control-sm" value={entry.check_out} disabled={submitting}
+                                        onChange={(e) => updateEntry(iso, { check_out: e.target.value })} />
+                                    </label>
+                                  </div>
+                                ) : <span className="small text-muted">—</span>}
+                                {problem && entry?.requested_status && <div className="small text-danger mt-1">{problem}</div>}
                               </td>
                             </tr>
                           );
@@ -240,30 +377,22 @@ function MyAttendanceRequests({ calendar, year, month, open, onOpenChange, onCha
                   </div>
                 )}
 
-                <div className="d-flex flex-wrap align-items-center gap-2 mt-3">
-                  <strong>{selectedDates.length} date(s) selected</strong>
-                  {selectedDates.length > 1 && (
-                    <>
-                      <span className="text-muted small">Set all selected to:</span>
-                      <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => applyToAll("Present")} disabled={submitting}>Present</button>
-                      <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => applyToAll("Holiday")} disabled={submitting}>Holiday</button>
-                    </>
-                  )}
-                </div>
+                <div className="mt-3"><strong>{selectedDates.length} date(s) selected</strong></div>
                 {selectedDates.length > 0 && (
                   <div className="d-flex flex-wrap gap-2 mt-2">
                     {selectedDates.map((iso) => (
-                      <span key={iso} className="badge text-bg-light border d-inline-flex align-items-center gap-1">
-                        {formatRequestDate(iso)} · {selected[iso]}
-                        <button type="button" className="btn-close" style={{ fontSize: 8 }} aria-label={`Remove ${iso}`} onClick={() => toggleDate(iso, false)} disabled={submitting} />
+                      <span key={iso} className="badge text-bg-light border d-inline-flex align-items-center gap-1 text-wrap text-start">
+                        {formatRequestDate(iso)} · {selected[iso].requested_status || "status not selected"}
+                        {selected[iso].requested_status === "Present" && timeSuffix(selected[iso].check_in, selected[iso].check_out)}
+                        <button type="button" className="btn-close" style={{ fontSize: 8 }} aria-label={`Remove ${iso}`} onClick={() => toggleDate(selected[iso].day, false)} disabled={submitting} />
                       </span>
                     ))}
                   </div>
                 )}
 
-                <label htmlFor="attendance-request-remarks" className="form-label mt-3">Reason / remarks (optional)</label>
+                <label htmlFor="attendance-request-remarks" className="form-label mt-3">Reason / remarks</label>
                 <textarea id="attendance-request-remarks" className="form-control" rows={2} maxLength={1000} value={remarks}
-                  onChange={(event) => setRemarks(event.target.value)} disabled={submitting} />
+                  placeholder="Explain why this attendance needs correction" onChange={(e) => setRemarks(e.target.value)} disabled={submitting} />
                 {formError && <div className="alert alert-danger py-2 mt-3 mb-0" role="alert">{formError}</div>}
               </div>
               <div className="modal-footer">

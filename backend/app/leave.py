@@ -47,6 +47,10 @@ audit_logs_collection = db["audit_logs"]
 logger = logging.getLogger(__name__)
 
 APPROVER_ROLES = {"hr admin", "administrator", "hr manager"}
+# Medical Leave (code ML): one day per month per employee, usable only after
+# the month's Weekly Off allowance is used (see attendance_requests).
+MEDICAL_LEAVE_CODE = "ML"
+MEDICAL_LEAVE_DAYS_PER_MONTH = 1
 HR_ADMIN_ROLE = "hr admin"
 
 
@@ -233,12 +237,13 @@ def ensure_leave_indexes() -> None:
 
     defaults = [
         {"code": "CL", "name": "Casual Leave", "description": "Casual leave", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
-        {"code": "SL", "name": "Sick Leave", "description": "Sick leave", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
+        {"code": MEDICAL_LEAVE_CODE, "name": "Medical Leave", "description": "Medical leave - 1 day per month", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
         {"code": "EL", "name": "Earned Leave", "description": "Earned / annual leave", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
         {"code": "LOP", "name": "Loss of Pay", "description": "Leave without pay", "is_paid": False, "allow_half_day": True, "requires_attachment": False, "is_active": True},
     ]
-    default_entitlements = {"CL": 12, "SL": 12, "EL": 15, "LOP": 0}
+    default_entitlements = {"CL": 12, MEDICAL_LEAVE_CODE: 12, "EL": 15, "LOP": 0}
     now = datetime.now(timezone.utc)
+    _migrate_sl_to_medical_leave(now)
     for item in defaults:
         leave_types_collection.update_one(
             {"code": item["code"]},
@@ -255,6 +260,34 @@ def ensure_leave_indexes() -> None:
             {"$setOnInsert": {"leave_type_id": leave_type_id, "annual_entitlement": entitlement, "carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False, "accrual_frequency": "annual", "is_active": True, "created_at": now, "updated_at": now}},
             upsert=True,
         )
+
+
+def _migrate_sl_to_medical_leave(now: datetime) -> None:
+    """Replace the retired SL leave type with ML (Medical Leave). Idempotent."""
+    medical = leave_types_collection.find_one({"code": MEDICAL_LEAVE_CODE})
+    for retired in list(leave_types_collection.find({"code": "SL"})):
+        if not medical:
+            # Keep the same _id so balances, policies and requests stay linked.
+            leave_types_collection.update_one(
+                {"_id": retired["_id"]},
+                {"$set": {"code": MEDICAL_LEAVE_CODE, "name": "Medical Leave", "description": "Medical leave - 1 day per month", "updated_at": now}},
+            )
+            medical = leave_types_collection.find_one({"_id": retired["_id"]})
+            continue
+        retired_id, medical_id = str(retired["_id"]), str(medical["_id"])
+        leave_requests_collection.update_many({"leave_type_id": retired_id}, {"$set": {"leave_type_id": medical_id}})
+        for balance in leave_balances_collection.find({"leave_type_id": retired_id}):
+            used, pending = float(balance.get("used", 0)), float(balance.get("pending", 0))
+            if used or pending:
+                _ensure_balance(balance["user_id"], medical_id, int(balance["year"]))
+                leave_balances_collection.update_one(
+                    {"user_id": balance["user_id"], "leave_type_id": medical_id, "year": balance["year"]},
+                    {"$inc": {"used": used, "pending": pending}, "$set": {"updated_at": now}},
+                )
+            leave_balances_collection.delete_one({"_id": balance["_id"]})
+        leave_policies_collection.delete_many({"leave_type_id": retired_id})
+        leave_types_collection.delete_one({"_id": retired["_id"]})
+    db["attendance"].update_many({"leave_type_code": "SL"}, {"$set": {"leave_type_code": MEDICAL_LEAVE_CODE}})
 
 
 def _serialize(record: dict[str, Any]) -> dict[str, Any]:
@@ -477,26 +510,43 @@ def _add_months(value: date, months: int) -> date:
     return date(year, month, day)
 
 
-def _is_sick_leave_type(leave_type: dict[str, Any]) -> bool:
-    return str(leave_type.get("code", "")).strip().lower() == "sl" or "sick" in str(
-        leave_type.get("name", "")
-    ).lower() or "medical" in str(leave_type.get("name", "")).lower()
+def _is_medical_leave_type(leave_type: dict[str, Any]) -> bool:
+    return str(leave_type.get("code", "")).strip().upper() == MEDICAL_LEAVE_CODE
 
 
-def _sick_entitlement(user: dict[str, Any], entitlement: float) -> float:
+def _medical_entitlement(user: dict[str, Any], entitlement: float) -> float:
+    """Medical Leave allowance for the year: one day for every month."""
+    yearly = float(MEDICAL_LEAVE_DAYS_PER_MONTH * 12)
     policy = _company_policy()
     if policy.get("sick_leave_before_probation_allowed"):
-        return min(entitlement, float(policy["sick_leave_after_probation"]))
+        return yearly
     joining = _joining_date(user)
     if not joining:
         return 0.0
     eligible_from = _add_months(joining, int(policy["probation_period_months"]))
     if company_now().date() < eligible_from:
         return 0.0
-    return min(entitlement, float(policy["sick_leave_after_probation"]))
+    return yearly
 
 
 def _holiday_dates(user: dict[str, Any], start: date, end: date) -> set[date]:
+    return set(_holiday_names(user, start, end))
+
+
+def _holiday_names(user: dict[str, Any], start: date, end: date) -> dict[date, str]:
+    """Holiday dates with names: published religion calendar plus assigned calendar."""
+    from app.religion_holidays import published_religion_holidays
+
+    result = {
+        day: str(holiday.get("holiday_name") or "Holiday")
+        for day, holiday in published_religion_holidays(user, start, end).items()
+    }
+    for day in _assigned_holiday_dates(user, start, end):
+        result.setdefault(day, "Holiday")
+    return result
+
+
+def _assigned_holiday_dates(user: dict[str, Any], start: date, end: date) -> set[date]:
     employee_id = _employee_id_for_user(user)
     if not employee_id:
         return set()
@@ -590,8 +640,8 @@ def _effective_entitled(balance: dict[str, Any], policy: dict[str, Any] | None, 
 def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
     policy = _get_policy(str(balance["leave_type_id"]))
     entitled = _effective_entitled(balance, policy, int(balance["year"]))
-    if _is_sick_leave_type(leave_type):
-        entitled = _sick_entitlement(user, entitled)
+    if _is_medical_leave_type(leave_type):
+        entitled = _medical_entitlement(user, entitled)
     used = float(balance.get("used", 0))
     pending = float(balance.get("pending", 0))
     return {"id": str(balance["_id"]), "leave_type_id": str(balance["leave_type_id"]), "code": leave_type.get("code"), "name": leave_type.get("name"), "is_paid": leave_type.get("is_paid", True), "entitled": round(entitled, 2), "annual_entitlement": float(balance.get("annual_entitlement", entitled)), "carry_forward": float(balance.get("carry_forward", 0)), "used": round(used, 2), "pending": round(pending, 2), "available": round(max(entitled - used - pending, 0), 2), "year": balance["year"], "accrual_enabled": bool(policy and policy.get("accrual_enabled"))}
@@ -877,29 +927,29 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
         if payload.from_date != payload.to_date:
             raise HTTPException(status_code=400, detail="Half-day leave can be applied for a single date only")
     company_policy = _company_policy()
-    if _is_sick_leave_type(leave_type) and not company_policy.get("sick_leave_before_probation_allowed"):
+    if _is_medical_leave_type(leave_type) and not company_policy.get("sick_leave_before_probation_allowed"):
         joining = _joining_date(user)
         if joining is None:
             raise HTTPException(
                 status_code=400,
-                detail="Your date of joining is missing. Please ask HR Admin to update your employee profile before applying for Sick Leave.",
+                detail="Your date of joining is missing. Please ask HR Admin to update your employee profile before applying for Medical Leave.",
             )
         eligible_from = _add_months(joining, int(company_policy["probation_period_months"]))
         if company_now().date() < eligible_from:
             raise HTTPException(
                 status_code=400,
-                detail=f"Sick Leave is available after your {company_policy['probation_period_months']}-month probation period. Eligibility begins on {eligible_from.isoformat()}.",
+                detail=f"Medical Leave is available after your {company_policy['probation_period_months']}-month probation period. Eligibility begins on {eligible_from.isoformat()}.",
             )
     requires_medical_certificate = (
         company_policy.get("medical_certificate_required")
-        and _is_sick_leave_type(leave_type)
+        and _is_medical_leave_type(leave_type)
     )
     attachment_bytes = None
     if requires_medical_certificate:
         if not payload.attachment_content_base64 or not payload.attachment_content_type:
             raise HTTPException(
                 status_code=400,
-                detail="A medical certificate file is required for Sick/Medical Leave. Upload a PDF, PNG or JPEG certificate before submitting.",
+                detail="A medical certificate file is required for Medical Leave. Upload a PDF, PNG or JPEG certificate before submitting.",
             )
         if payload.attachment_content_type not in {"application/pdf", "image/png", "image/jpeg"}:
             raise HTTPException(
@@ -931,6 +981,12 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     working_dates = _working_dates(user, payload.from_date, payload.to_date)
     if not working_dates:
         raise HTTPException(status_code=400, detail="Selected dates contain no working days")
+    if _is_medical_leave_type(leave_type):
+        from app.attendance_requests import leave_module_medical_problem
+
+        medical_problem = leave_module_medical_problem(user, working_dates, payload.day_part)
+        if medical_problem:
+            raise HTTPException(status_code=400, detail=medical_problem)
     days = float(len(working_dates)) if payload.day_part == "full_day" else 0.5
     user_id = str(user["_id"])
     if _overlap_exists(user_id, payload.from_date, payload.to_date):
@@ -938,8 +994,8 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     balance = _ensure_balance(user_id, payload.leave_type_id, payload.from_date.year)
     policy = _get_policy(payload.leave_type_id)
     entitled = _effective_entitled(balance, policy, payload.from_date.year)
-    if _is_sick_leave_type(leave_type):
-        entitled = _sick_entitlement(user, entitled)
+    if _is_medical_leave_type(leave_type):
+        entitled = _medical_entitlement(user, entitled)
     available = entitled - float(balance.get("used", 0)) - float(balance.get("pending", 0))
     if leave_type.get("is_paid", True) and days > available:
         raise HTTPException(status_code=400, detail=f"Insufficient {leave_type.get('name', 'leave')} balance. Available: {available:g} day(s).")

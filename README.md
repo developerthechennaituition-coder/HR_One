@@ -2,7 +2,7 @@
 
 A full-stack HRMS application with a React/Vite frontend, a Python FastAPI backend, and MongoDB persistence. The repository contains employee and user administration, organization setup, attendance, WFH attendance controls, ESSL attendance integration workflows, leave and permission management, notifications, payroll, and payslips.
 
-> **Repository layout:** this documentation assumes the backend files are in `backend/` and the frontend files are in `frontend/`. The supplied backend ZIP contains the backend source at its archive root, so if you extract both ZIPs into one repository, place the backend ZIP contents inside `backend/` and the frontend ZIP contents inside `frontend/`.
+> **Repository layout:** the backend lives in `backend/` and the frontend in `frontend/`. Each has its own dependencies; see [Repository layout](#repository-layout).
 
 ## Contents
 
@@ -20,8 +20,10 @@ A full-stack HRMS application with a React/Vite frontend, a Python FastAPI backe
 - [Attendance and ESSL device integration](#attendance-and-essl-device-integration)
 - [WFH attendance and biometrics](#wfh-attendance-and-biometrics)
 - [Payroll workflow](#payroll-workflow)
+- [Key business rules](#key-business-rules)
 - [Security and deployment](#security-and-deployment)
 - [Troubleshooting](#troubleshooting)
+- [Automated tests](#automated-tests)
 - [Validation checklist](#validation-checklist)
 
 ## Features
@@ -34,21 +36,26 @@ A full-stack HRMS application with a React/Vite frontend, a Python FastAPI backe
 
 ### Organization and employee administration
 - Company and organization structure, including business units, departments, teams, and designations.
-- Holiday calendars, holiday entries, employee calendar assignments, publish/audit workflows.
+- Religion-based holiday calendars: HR Admin creates one calendar per religion per year (current or next year only), adds/edits/deletes holidays, and publishes. Published holidays apply automatically to employees of that religion, with targeted notifications and an audit trail. Legacy company-wide calendars and employee assignments still work.
 - Employee master and employee details.
 - User management, status updates, and account activation.
 - Reporting-manager assignments and team-member views.
 
 ### Attendance
 - Attendance views, employee/day and monthly attendance details, remarks, and spreadsheet export.
+- Monthly attendance calendars (My Attendance, Profile, Team Member Details) with colour-coded Present, Absent, Holiday (with name), Leave (type code such as CL/ML), Weekly Off and Not Applicable days. Clicking a date shows that day's working time and breaks.
+- Attendance requests: employees request a status change for past dates (Present with corrected times, Absent, Holiday, Weekly Off, Medical Leave). HR Admin approves or rejects each date and can adjust the final status/times or mark the date Not Applicable. Attendance changes only after approval.
 - Work-from-home check-in/check-out, breaks, location registration/verification, and configurable WFH controls.
+- WFH late check-in: a late attempt notifies the reporting manager, who can approve a 2-hour extension or reject it.
 - ESSL attendance configuration, file import, connection test, synchronization, sync history, and issue review routes.
 
 ### Leave, permissions, notifications, and payroll
 - Leave types, policies, balances, requests, approvals/rejections/cancellations, reports, and CSV export.
+- Company weekly-off days configured by HR Admin (no default) and Weekly Offs per Month.
+- Medical Leave (code `ML`): 1 day per month per employee, available only after the month's 4 Weekly Offs are used; shared between Leave and Attendance Request.
 - Permission requests and approval workflows.
 - In-app notifications and notification management.
-- Employee salary profiles, attendance summaries, payroll calculation and review actions, payroll records, and payslip PDF endpoints.
+- Employee salary profiles, attendance summaries, payroll calculation and review actions, payroll records, and payslip PDF endpoints. Payable days include weekly offs, Medical Leave and published holidays; Not Applicable days are Loss of Pay.
 - Employee self-service payslip views and PDF downloads.
 
 The exact options available to a user depend on the role and backend authorization rules. Availability of a screen does not imply that a particular third-party device or external service is already connected.
@@ -121,6 +128,9 @@ HRMS-Project/
 │   │   ├── core_routes.py
 │   │   ├── db/mongodb.py
 │   │   ├── attendance.py
+│   │   ├── attendance_requests.py   # attendance request workflow + monthly calendar
+│   │   ├── religion_holidays.py     # religion holiday lookups for attendance/leave/payroll
+│   │   ├── wfh_biometrics.py
 │   │   ├── essl.py
 │   │   ├── leave.py
 │   │   ├── payroll.py
@@ -133,6 +143,7 @@ HRMS-Project/
 │   │   ├── session.py
 │   │   └── payslip_pdf.py
 │   ├── scripts/check_wfh_mongodb.py
+│   ├── tests/                       # unittest suites (see Automated tests)
 │   └── assets/
 └── frontend/
     ├── README.md
@@ -233,7 +244,7 @@ Open two PowerShell terminals from the repository root.
 
 ### Terminal 1 — backend
 
-# Used Python 3.12 in project
+The project is developed with Python 3.12.
 
 ```powershell
 cd backend
@@ -329,8 +340,9 @@ The frontend contains pages and shared components for:
 - Home: dashboard, profile, header, sidebar, and role-aware layout.
 - Organization: company setup, organization setup, holiday calendar setup.
 - People: employee master, employee details, user management, reporting-manager team members, and member details.
-- Attendance: attendance views, employee attendance, user attendance, WFH attendance, WFH admin settings, ESSL setup, and ESSL admin settings.
-- Leave: leave and permission workflows.
+- Attendance: attendance views, monthly attendance calendar, attendance requests and the HR response inbox, employee attendance, user attendance, WFH attendance, WFH admin settings, ESSL setup, and ESSL admin settings.
+- Leave: leave and permission workflows, weekly-off and Medical Leave rules.
+- Holidays: HR holiday calendar management and the employee's own holiday calendar (Profile).
 - Payroll: employee salary setup, payroll workspace, employee payslips.
 - Notifications: notification bell/panel and notification management.
 - WFH email verification and access-denied handling.
@@ -350,6 +362,8 @@ Important route groups visible in the source include:
 | Organization | `/api/organization/*`, `/api/companies*`, `/api/business-units*`, `/api/departments*`, `/api/teams*`, `/api/designations*` |
 | Employees | `/api/employees*`, `/api/employee-details/*` |
 | Attendance | `/api/attendance/*` |
+| Attendance requests | `/api/attendance-requests*` (calendar, eligible dates, submit, cancel, HR inbox, respond) |
+| Holiday calendars | `/api/holiday-calendars*`, `/api/holidays/*`, `/api/employee-holiday-calendars*`, `/api/my-holidays` |
 | ESSL attendance | `/api/attendance/essl/*` |
 | Reporting manager | `/api/reporting-manager/*` |
 | Notifications | `/api/notifications/*` |
@@ -395,7 +409,21 @@ Recommended operational flow:
 5. Review/approve records through the available payroll actions.
 6. Verify generated payslips and access permissions before distributing them.
 
+Payable days = Present + approved paid leave + eligible holidays (assigned and published religion calendars) + Weekly Offs + Medical Leave. Absent, unpaid leave and Not Applicable days count as Loss of Pay. If attendance, an attendance request or a published holiday changes after payroll is **Calculated**, the record is flagged as outdated and must be disapproved and recalculated before approval; Approved/Processed/Paid payroll is never changed.
+
 Payroll rules are organization-specific. Validate statutory deductions, rounding, overtime, unpaid leave, and tax treatment with the organization's payroll owner before using results for actual salary payments.
+
+## Key business rules
+
+| Area | Rule |
+|---|---|
+| Attendance requests | Past dates only. Options depend on the date's current status. Nothing changes until HR approves; HR decides per date and may set Not Applicable. Dates in finalized payroll are locked. |
+| Weekly Off | Weekdays configured by HR Admin; Weekly Offs per Month (default 4) limits requests. |
+| Medical Leave (`ML`) | 1 day per month per employee, only after the month's 4 Weekly Offs are used; counted across Leave and Attendance Request. |
+| Not Applicable | Set only by HR when responding to a request; shown in calendars and counted as Loss of Pay. |
+| Religion holiday calendars | One per religion per year; only the current and next year can be created. Religion comes from the employee's Employee Master record. Drafts are hidden; employees cannot view other religions' calendars. Past holidays cannot be changed. |
+| Precedence | A recorded attendance status (Present/Absent/Leave) always wins over a holiday or weekly off. |
+| WFH late check-in | Late attempts notify the reporting manager; approval grants 2 extra hours from the normal deadline. |
 
 ## Security and deployment
 
@@ -427,6 +455,18 @@ Payroll rules are organization-specific. Validate statutory deductions, rounding
 | Payslip or spreadsheet generation fails | Check required Python packages, input records, file permissions, and backend traceback. |
 | Frontend build fails | Run `npm ci`, then `npm run lint` and `npm run build`; fix the first relevant error before retrying. |
 
+## Automated tests
+
+Backend tests use Python `unittest` under `backend/tests/`. Integration suites run against a real MongoDB but only on a throwaway database whose name ends in `_test` (they drop it afterwards):
+
+```powershell
+cd backend
+$env:MONGODB_DATABASE = "hrms_test"
+python -m unittest tests.test_attendance_requests tests.test_religion_holidays tests.test_wfh_late_check_in tests.test_essl_attendance tests.test_leave_approval_routing tests.test_employee_details_api tests.test_notification_scope
+```
+
+Known pre-existing issues: `test_holiday_api`, `test_holiday_models`, `test_holiday_workflow`, `test_organization_workflow`, `test_companies_api`, `test_users_api` and `test_step15_checklist` import names from `app.main` that now live in `app.core_routes`, so they fail to load; `test_wfh_attendance` has failures unrelated to recent work.
+
 ## Validation checklist
 
 Before merging or releasing:
@@ -442,7 +482,7 @@ npm run lint
 npm run build
 ```
 
-The MongoDB smoke check requires a configured, reachable database. `compileall` checks Python syntax but does not replace tests or integration testing. The supplied project does not include a comprehensive automated test suite in the provided ZIPs, so validate important workflows manually in a non-production environment.
+The MongoDB smoke check requires a configured, reachable database. `compileall` checks Python syntax only; run the [automated tests](#automated-tests) and validate important workflows manually in a non-production environment.
 
 Suggested end-to-end checks:
 - [ ] Backend health endpoint responds.
@@ -452,6 +492,8 @@ Suggested end-to-end checks:
 - [ ] Attendance data imports/synchronizes correctly and duplicate/error cases are reviewed.
 - [ ] WFH check-in/out and fallback flows are tested with approved devices and permissions.
 - [ ] Leave request, approval, rejection, and balance updates are verified.
+- [ ] Attendance requests are approved/rejected per date and reflected in calendars and payroll.
+- [ ] A published religion holiday calendar appears only for employees of that religion.
 - [ ] Notifications appear for the intended recipients.
 - [ ] Payroll calculation is reconciled against a known test case.
 - [ ] Payslip PDF and attendance export access is restricted appropriately.

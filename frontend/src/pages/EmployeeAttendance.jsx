@@ -131,6 +131,19 @@ function EmployeeAttendance({ session, onNavigate }) {
     setRequestFormOpen(false);
   };
 
+  // Keeps the request dialog open while it browses another month.
+  const browseRequestMonth = (nextYear, nextMonth) => {
+    setCalendarYear(nextYear);
+    setCalendarMonth(nextMonth);
+  };
+
+  // HR Admin decided a request: refresh every attendance view on this page.
+  const handleRequestDecided = useCallback(() => {
+    setRefreshKey((value) => value + 1);
+    loadAttendance();
+    loadCalendar();
+  }, [loadAttendance, loadCalendar]);
+
   const refreshAll = async () => {
     setRefreshKey((value) => value + 1);
     await Promise.all([loadAttendance(), loadCalendar()]);
@@ -349,9 +362,13 @@ function EmployeeAttendance({ session, onNavigate }) {
         calendar={calendar}
         year={calendarYear}
         month={calendarMonth}
+        maxYear={year}
+        maxMonth={month}
         open={requestFormOpen}
         onOpenChange={setRequestFormOpen}
+        onMonthChange={browseRequestMonth}
         onChanged={loadCalendar}
+        onDecided={handleRequestDecided}
         refreshKey={refreshKey}
       />
     </div>

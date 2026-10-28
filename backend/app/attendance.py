@@ -3457,6 +3457,10 @@ def _calculate_daily_attendance(
     source = (record or {}).get("attendance_source")
     attendance_type = (record or {}).get("attendance_type")
     is_essl = source == "ESSL" or attendance_type == "OFFICE"
+    # An HR-approved attendance-request correction replaces the day's raw
+    # punches; show the approved check-in/check-out instead.
+    if source == "ATTENDANCE_REQUEST":
+        punch_times = []
 
     # ESSL raw punches are the source of truth for office intervals.
     # For legacy/manual and WFH records, preserve their existing check-in/out.

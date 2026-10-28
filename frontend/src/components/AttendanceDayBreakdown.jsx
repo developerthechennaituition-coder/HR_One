@@ -100,7 +100,7 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
           <>
             {showStatus && (
               <div className="d-flex flex-wrap gap-4 mb-3 small">
-                <div><span className="text-muted">Status</span><div className="fw-semibold fs-6">{(calendarDay?.attendance_date === selectedDate && calendarDay.status) || data.status || "Not Marked"}</div></div>
+                <div><span className="text-muted">Status</span><div className="fw-semibold fs-6">{(calendarDay?.attendance_date === selectedDate && (calendarDay.status_label || calendarDay.status)) || data.status || "Not Marked"}{calendarDay?.attendance_date === selectedDate && calendarDay.holiday_name ? ` · ${calendarDay.holiday_name}` : ""}</div></div>
                 <div><span className="text-muted">Check-in / Check-out</span><div className="fw-semibold fs-6">{calendarDay?.attendance_date === selectedDate && calendarDay.has_record ? `${calendarDay.check_in_time || "Not recorded"} / ${calendarDay.check_out_time || "Not recorded"}` : "—"}</div></div>
                 <div><span className="text-muted">Attendance category</span><div className="fw-semibold fs-6">{data.attendance_type === "WFH" || data.attendance_source === "WFH_FACE_GPS" ? "Work From Home" : data.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(data.attendance_source) ? "Office" : "—"}</div></div>
                 <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" ? "Attendance request (no punch recorded)" : data.attendance_source || "—"}</div></div>

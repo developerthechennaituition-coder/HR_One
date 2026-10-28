@@ -5,6 +5,7 @@ import {
   useState,
 } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
+import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
 
 const API_URL =
   HRONE_API_BASE + "/api/reporting-manager";
@@ -187,6 +188,8 @@ function TeamMemberDetails({
 
   const currentMonth = todayInIndia.month;
 
+  const weeklyOffDays = useCompanyWeeklyOffs();
+
   /* ==========================================================
      STATE
   ========================================================== */
@@ -198,6 +201,10 @@ function TeamMemberDetails({
     useState([]);
 
   const [approvedLeaves, setApprovedLeaves] =
+    useState([]);
+
+  // Published holidays that apply to this member (from the backend).
+  const [memberHolidays, setMemberHolidays] =
     useState([]);
 
   const [selectedYear, setSelectedYear] =
@@ -267,6 +274,16 @@ function TeamMemberDetails({
     holiday: {
       background: "#ADD8E6",
       text: "#0b3d4a",
+    },
+
+    weeklyoff: {
+      background: "#6c757d",
+      text: "#ffffff",
+    },
+
+    notapplicable: {
+      background: "#fd7e14",
+      text: "#ffffff",
     },
 
     notmarked: {
@@ -478,6 +495,11 @@ function TeamMemberDetails({
               ? data.approved_leaves
               : []
           );
+          setMemberHolidays(
+            Array.isArray(data?.holidays)
+              ? data.holidays
+              : []
+          );
         }
       } catch (err) {
         console.error(
@@ -488,6 +510,7 @@ function TeamMemberDetails({
         if (!cancelled) {
           setAttendance([]);
           setApprovedLeaves([]);
+          setMemberHolidays([]);
           setAttendanceError(
             err?.message ||
               "Unable to load attendance."
@@ -641,7 +664,16 @@ function TeamMemberDetails({
     if (attendanceRecord) return attendanceRecord;
 
     const leave = approvedLeaveByDate[dateString];
-    if (!leave) return null;
+    const holiday = memberHolidays.find((item) => item.holiday_date === dateString);
+    if (!leave && holiday) {
+      return { attendance_date: dateString, status: "Holiday", holiday_name: holiday.holiday_name, is_calendar_holiday: true };
+    }
+    if (!leave) {
+      // HR-configured weekly-off weekday without an attendance record.
+      return isWeeklyOff(weeklyOffDays, new Date(`${dateString}T00:00:00`))
+        ? { attendance_date: dateString, status: "Weekly Off", is_weekly_off: true }
+        : null;
+    }
 
     return {
       attendance_date: dateString,
@@ -689,7 +721,30 @@ function TeamMemberDetails({
       return "holiday";
     }
 
+    if (status === "weeklyoff") {
+      return "weeklyoff";
+    }
+
+    if (status === "notapplicable") {
+      return "notapplicable";
+    }
+
     return "notmarked";
+  };
+
+  // Card label: leave type code (CL, ML) for leave, otherwise the status.
+  const getCalendarLabel = (record) => {
+    const statusKey = getStatusKey(record);
+    if (statusKey === "notmarked") return "";
+    if (statusKey === "leave") return record.leave_type_code || "Leave";
+    if (statusKey === "holiday" && record.holiday_name) return record.holiday_name;
+    return {
+      present: "Present",
+      absent: "Absent",
+      holiday: "Holiday",
+      weeklyoff: "Weekly Off",
+      notapplicable: "Not Applicable",
+    }[statusKey];
   };
 
   /* ==========================================================
@@ -900,11 +955,9 @@ function TeamMemberDetails({
           />
         )}
 
-        {record && (
+        {getCalendarLabel(record) && (
           <span className="team-calendar-status">
-            {record.leave_type_code || record.status ||
-              record.attendance_status ||
-              "Marked"}
+            {getCalendarLabel(record)}
           </span>
         )}
       </button>
@@ -1901,6 +1954,14 @@ function TeamMemberDetails({
               label: "Holiday",
             },
             {
+              key: "weeklyoff",
+              label: "Weekly Off",
+            },
+            {
+              key: "notapplicable",
+              label: "Not Applicable",
+            },
+            {
               key: "notmarked",
               label: "Not Marked",
             },
@@ -2177,7 +2238,12 @@ function TeamMemberDetails({
 
       </div>
 
-          <AttendanceDayBreakdown userId={memberId} title="Team member · working time and breaks" />
+          <AttendanceDayBreakdown
+            userId={memberId}
+            title="Team member · working time and breaks"
+            date={selectedDate || undefined}
+            onDateChange={setSelectedDate}
+          />
 
           {/* Attendance error */}
 

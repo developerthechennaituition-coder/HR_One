@@ -68,6 +68,14 @@ body {
   -webkit-overflow-scrolling: touch;
 }
 
+/* A table inside a horizontal scroll wrapper keeps its natural column widths
+   and scrolls; capping it at 100% squeezed columns until text broke per letter. */
+.main-content .table-responsive > table,
+.main-content [class*="table-wrapper"] > table,
+.main-content [class*="table-wrap"] > table {
+  max-width: none;
+}
+
 .header-title-group {
   display: flex;
   align-items: center;
@@ -186,23 +194,25 @@ body {
     --bs-gutter-x: 1rem;
   }
 
+  /* break-word wraps long words without shrinking min-content widths;
+     "anywhere" collapsed table columns and buttons to a single letter. */
   .main-content .btn {
     max-width: 100%;
     white-space: normal;
-    overflow-wrap: anywhere;
+    overflow-wrap: break-word;
   }
 
   .main-content .d-flex {
     flex-wrap: wrap;
   }
 
-  .main-content .modal-dialog {
+  .main-content .modal-dialog:not([class*="modal-fullscreen"]) {
     margin: 0.5rem;
     max-width: calc(100% - 1rem);
   }
 
   .main-content .modal-body {
-    overflow-wrap: anywhere;
+    overflow-wrap: break-word;
   }
 }
 

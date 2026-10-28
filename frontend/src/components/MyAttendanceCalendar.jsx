@@ -9,7 +9,8 @@ const CALENDAR_LEGEND = [
   { key: "leave", label: "Leave", background: "#ffe5d0", text: "#984c0c" },
   { key: "weeklyoff", label: "Weekly Off", background: "#e9ecef", text: "#495057" },
   { key: "notmarked", label: "Not Marked", background: "#fff3cd", text: "#664d03" },
-  { key: "other", label: "Upcoming / Not Applicable", background: "#f8f9fa", text: "#6c757d" },
+  { key: "notapplicable", label: "Not Applicable (LOP)", background: "#dee2e6", text: "#842029" },
+  { key: "other", label: "Upcoming / Before Joining", background: "#f8f9fa", text: "#6c757d" },
 ];
 const LEGEND_BY_KEY = Object.fromEntries(CALENDAR_LEGEND.map((item) => [item.key, item]));
 
@@ -21,6 +22,7 @@ const dayStyleKey = (day) => {
   if (value === "leave") return "leave";
   if (value === "weekly off") return "weeklyoff";
   if (value === "not marked") return "notmarked";
+  if (value === "not applicable") return "notapplicable";
   return "other";
 };
 
@@ -74,9 +76,6 @@ function MyAttendanceCalendar({ year, month, maxYear, maxMonth, calendar, loadin
           </div>
         </div>
 
-        {calendar && !calendar.weekly_off_configured && (
-          <div className="alert alert-light border py-2 small">Weekly off days have not been configured by HR Admin, so no day is shown as Weekly Off.</div>
-        )}
         {calendar?.payroll_locked && (
           <div className="alert alert-secondary py-2 small">Payroll for this month is {calendar.payroll_status}; attendance requests are closed for this month.</div>
         )}
@@ -94,7 +93,7 @@ function MyAttendanceCalendar({ year, month, maxYear, maxMonth, calendar, loadin
                 {days.map((day) => {
                   const colors = LEGEND_BY_KEY[dayStyleKey(day)];
                   const selected = day.attendance_date === selectedDate;
-                  const label = colors.key === "other" ? day.status : colors.label;
+                  const label = day.holiday_name || (day.status_label && day.status_label !== day.status ? day.status_label : colors.key === "other" ? day.status : colors.label);
                   return (
                     <button
                       key={day.attendance_date}

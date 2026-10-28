@@ -187,7 +187,7 @@ class LeaveApprovalRoutingTests(unittest.TestCase):
             patch.object(leave, "_current_user", return_value=employee),
             patch.object(leave, "_get_leave_type", return_value={"_id": ObjectId(), "name": "Annual Leave", "is_paid": True}),
             patch.object(leave, "_company_policy", return_value=leave.LeaveCompanyPolicy().model_dump()),
-            patch.object(leave, "_is_sick_leave_type", return_value=False),
+            patch.object(leave, "_is_medical_leave_type", return_value=False),
             patch.object(
                 leave,
                 "_working_dates",

@@ -4,6 +4,7 @@ import {
   REQUEST_STATUS_LABELS,
   formatRequestDate,
   formatRequestDateTime,
+  formatTimeRange,
   getAttendanceRequest,
   listAttendanceRequests,
   respondToAttendanceRequest,
@@ -14,6 +15,29 @@ const EMPTY_FILTERS = { status: "pending", employee: "", department: "", period:
 
 function StatusBadge({ value }) {
   return <span className={`badge ${REQUEST_STATUS_BADGES[value] || "text-bg-secondary"}`}>{REQUEST_STATUS_LABELS[value] || value}</span>;
+}
+
+const timesOrDash = (checkIn, checkOut) => formatTimeRange(checkIn, checkOut) || "—";
+
+// No date is pre-approved: HR must choose Approve or Reject for each one.
+const initialDecisions = (request) => Object.fromEntries((request.dates || []).map((item) => [item.attendance_date, {
+  action: "",
+  final_status: (item.allowed_final_statuses || []).includes(item.requested_status) ? item.requested_status : "",
+  check_in: item.requested_check_in_time || item.original_check_in_time || "",
+  check_out: item.requested_check_out_time || item.original_check_out_time || "",
+}]));
+
+function decisionProblem(item, decision) {
+  if (!decision?.action) return "Choose Approve or Reject.";
+  if (decision.action === "reject") return "";
+  if (!decision.final_status) return "Select the final status.";
+  if (decision.final_status !== "Present") return "";
+  if (decision.check_in && decision.check_out && decision.check_out <= decision.check_in) return "Check-out must be later than check-in.";
+  if (item.original_status === "Present") {
+    if (item.original_check_in_time && !decision.check_in) return "An existing check-in cannot be removed.";
+    if (item.original_check_out_time && !decision.check_out) return "An existing check-out cannot be removed.";
+  }
+  return "";
 }
 
 function AttendanceRequestInbox() {
@@ -56,15 +80,19 @@ function AttendanceRequestInbox() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const showReview = (request) => {
+    setReview(request);
+    setDecisions(initialDecisions(request));
+  };
+
   const openReview = async (requestId) => {
     setReviewLoading(true);
     setReviewError("");
     setSuccess("");
-    setDecisions({});
     setComments("");
     setConfirming(false);
     try {
-      setReview(await getAttendanceRequest(requestId));
+      showReview(await getAttendanceRequest(requestId));
     } catch (loadError) {
       setError(loadError.message);
     } finally {
@@ -82,11 +110,21 @@ function AttendanceRequestInbox() {
     setConfirming(false);
   };
 
-  const undecided = review ? review.dates.filter((item) => !decisions[item.attendance_date]) : [];
+  const updateDecision = (iso, changes) => {
+    setConfirming(false);
+    setDecisions((current) => ({ ...current, [iso]: { ...current[iso], ...changes } }));
+  };
+
+  const problems = review ? review.dates.map((item) => [item, decisionProblem(item, decisions[item.attendance_date])]).filter(([, problem]) => problem) : [];
+  const hasReject = review ? review.dates.some((item) => decisions[item.attendance_date]?.action === "reject") : false;
 
   const submitResponse = async () => {
-    if (undecided.length) {
-      setReviewError(`Select a final status for every date. Missing: ${undecided.map((item) => formatRequestDate(item.attendance_date)).join(", ")}.`);
+    if (problems.length) {
+      setReviewError(problems.map(([item, problem]) => `${formatRequestDate(item.attendance_date)}: ${problem}`).join(" "));
+      return;
+    }
+    if (hasReject && !comments.trim()) {
+      setReviewError("Enter response remarks when rejecting a date.");
       return;
     }
     if (!confirming) {
@@ -99,13 +137,25 @@ function AttendanceRequestInbox() {
     try {
       const result = await respondToAttendanceRequest(
         review.id,
-        review.dates.map((item) => ({ attendance_date: item.attendance_date, final_status: decisions[item.attendance_date] })),
+        review.dates.map((item) => {
+          const decision = decisions[item.attendance_date];
+          const isPresent = decision.action === "approve" && decision.final_status === "Present";
+          return decision.action === "reject"
+            ? { attendance_date: item.attendance_date, action: "reject" }
+            : {
+              attendance_date: item.attendance_date,
+              action: "approve",
+              final_status: decision.final_status,
+              final_check_in_time: isPresent ? decision.check_in || null : null,
+              final_check_out_time: isPresent ? decision.check_out || null : null,
+            };
+        }),
         comments.trim(),
       );
-      const { applied, not_applied: notApplied, notification_sent: notified, outdated_payroll_periods: outdated = [] } = result.summary;
+      const { applied, rejected = 0, not_applied: notApplied, notification_sent: notified, outdated_payroll_periods: outdated = [] } = result.summary;
       setSuccess(
-        `${result.request_number} saved as ${REQUEST_STATUS_LABELS[result.status]}: ${applied} date(s) updated` +
-        (notApplied ? `, ${notApplied} date(s) not applied (see details)` : "") +
+        `${result.request_number} saved as ${REQUEST_STATUS_LABELS[result.status]}: ${applied} date(s) approved and applied, ${rejected} rejected` +
+        (notApplied ? `, ${notApplied} not applied (see details)` : "") +
         (notified ? ". The employee has been notified." : ". The employee notification could not be created.") +
         (outdated.length ? ` Calculated payroll for ${outdated.join(", ")} is now marked outdated — disapprove and recalculate it in Payroll.` : ""),
       );
@@ -115,8 +165,8 @@ function AttendanceRequestInbox() {
     } catch (submitError) {
       setConfirming(false);
       setReviewError(submitError.message);
-      // Refresh in case the request was processed elsewhere.
-      getAttendanceRequest(review.id).then(setReview).catch(() => {});
+      // Refresh in case the request or attendance changed elsewhere.
+      getAttendanceRequest(review.id).then((fresh) => setReview(fresh)).catch(() => {});
     } finally {
       setSubmitting(false);
     }
@@ -127,13 +177,21 @@ function AttendanceRequestInbox() {
     setAppliedFilters(filters);
   };
 
+  const finalSummary = (item) => {
+    const decision = decisions[item.attendance_date];
+    if (decision?.action === "reject") return "Reject (attendance unchanged)";
+    if (decision?.action !== "approve" || !decision.final_status) return "No decision";
+    const times = decision.final_status === "Present" ? formatTimeRange(decision.check_in, decision.check_out) : "";
+    return `Approve as ${decision.final_status}${times ? ` (${times})` : ""}`;
+  };
+
   return (
     <section ref={sectionRef} className="card border-0 shadow-sm mt-4" aria-label="Attendance requests inbox">
       <div className="card-body">
         <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
           <div>
             <h4 className="mb-1">Attendance Requests</h4>
-            <small className="text-muted">Review employee requests and decide every date individually.</small>
+            <small className="text-muted">Review employee requests and approve or reject every date individually.</small>
           </div>
           <button type="button" className="btn btn-outline-secondary btn-sm" onClick={loadRequests} disabled={loading}>{loading ? "Loading..." : "Refresh"}</button>
         </div>
@@ -162,7 +220,7 @@ function AttendanceRequestInbox() {
             <label className="form-label small mb-1" htmlFor="ar-date">Attendance date</label>
             <input id="ar-date" type="date" className="form-control form-control-sm" value={filters.attendance_date} onChange={(e) => setFilters({ ...filters, attendance_date: e.target.value })} />
           </div>
-          <div className="col-6 col-md-1 d-flex gap-1">
+          <div className="col-12 col-md-auto d-flex gap-1">
             <button type="submit" className="btn btn-primary btn-sm">Apply</button>
             <button type="button" className="btn btn-light border btn-sm" onClick={() => { setFilters(EMPTY_FILTERS); setAppliedFilters(EMPTY_FILTERS); }}>Reset</button>
           </div>
@@ -187,7 +245,7 @@ function AttendanceRequestInbox() {
                   <td>{request.employee_name}<div className="small text-muted">{request.employee_id}</div></td>
                   <td>{request.department || "—"}</td>
                   <td className="small">{formatRequestDateTime(request.submitted_at)}</td>
-                  <td><DateDecisionList dates={request.dates} /></td>
+                  <td style={{ minWidth: 220 }}><DateDecisionList dates={request.dates} /></td>
                   <td><StatusBadge value={request.status} /></td>
                   <td>
                     <button type="button" className="btn btn-sm btn-outline-primary" disabled={reviewLoading} onClick={() => openReview(request.id)}>
@@ -203,7 +261,7 @@ function AttendanceRequestInbox() {
 
       {review && (
         <div className="modal d-block" tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ar-review-title" style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}>
-          <div className="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+          <div className="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable modal-fullscreen-md-down">
             <div className="modal-content">
               <div className="modal-header">
                 <h5 className="modal-title" id="ar-review-title">
@@ -213,65 +271,106 @@ function AttendanceRequestInbox() {
               </div>
               <div className="modal-body">
                 <div className="row g-2 small mb-3">
-                  <div className="col-md-3"><span className="text-muted">Department</span><div>{review.department || "—"}</div></div>
-                  <div className="col-md-3"><span className="text-muted">Submitted</span><div>{formatRequestDateTime(review.submitted_at)}</div></div>
-                  <div className="col-md-6"><span className="text-muted">Employee remarks</span><div>{review.employee_remarks || "—"}</div></div>
+                  <div className="col-6 col-md-3"><span className="text-muted">Department</span><div>{review.department || "—"}</div></div>
+                  <div className="col-6 col-md-3"><span className="text-muted">Submitted</span><div>{formatRequestDateTime(review.submitted_at)}</div></div>
+                  <div className="col-12 col-md-6"><span className="text-muted">Employee remarks</span><div>{review.employee_remarks || "—"}</div></div>
                 </div>
-                <div className="table-responsive border rounded">
-                  <table className="table table-sm align-middle mb-0">
-                    <thead className="table-light">
-                      <tr><th>Date</th><th>Current status</th><th>Check-in / out</th><th>Category</th><th>Requested</th><th>Payroll / eligibility</th><th>Final decision</th></tr>
-                    </thead>
-                    <tbody>
-                      {review.dates.map((item) => {
-                        const decided = Boolean(decisions[item.attendance_date]);
-                        return (
-                          <tr key={item.attendance_date} className={review.can_respond && !decided ? "table-warning" : ""}>
-                            <td className="fw-semibold">{formatRequestDate(item.attendance_date)}</td>
-                            <td>{item.current_status}</td>
-                            <td>{item.current_check_in_time || "—"} / {item.current_check_out_time || "—"}</td>
-                            <td>{item.current_attendance_category || "—"}</td>
-                            <td>{item.requested_status}</td>
-                            <td className="small">
-                              {item.payroll_status ? `Payroll ${item.payroll_status}` : "No payroll yet"}
-                              {item.eligibility_message && <div className="text-danger">{item.eligibility_message}</div>}
-                              {item.payroll_note && <div className="text-warning-emphasis">{item.payroll_note}</div>}
-                            </td>
-                            <td style={{ minWidth: 150 }}>
-                              {review.can_respond ? (
-                                <select className={`form-select form-select-sm ${decided ? "" : "border-warning"}`} aria-label={`Final status for ${item.attendance_date}`}
-                                  value={decisions[item.attendance_date] || ""} disabled={submitting}
-                                  onChange={(e) => { setConfirming(false); setDecisions({ ...decisions, [item.attendance_date]: e.target.value }); }}>
-                                  <option value="">Select...</option>
-                                  <option value="Present">Present</option>
-                                  <option value="Holiday">Holiday</option>
-                                  <option value="Absent">Absent</option>
-                                </select>
-                              ) : (
-                                <span>{item.final_status || "—"}{item.message && <div className="small text-muted">{item.message}</div>}</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+
                 {review.can_respond ? (
-                  <>
-                    <div className="small mt-2">{undecided.length ? <span className="text-warning-emphasis">{undecided.length} date(s) still need a decision.</span> : <span className="text-success">Every date has a decision.</span>}</div>
-                    <label htmlFor="ar-comments" className="form-label mt-3">Review comments (optional)</label>
-                    <textarea id="ar-comments" className="form-control" rows={2} maxLength={1000} value={comments} onChange={(e) => setComments(e.target.value)} disabled={submitting} />
-                  </>
-                ) : (
-                  <div className="small mt-3">
-                    Reviewed {formatRequestDateTime(review.reviewed_at)} by {review.reviewed_by_name || "HR Admin"}
-                    {review.review_comments && <div>Comments: {review.review_comments}</div>}
+                  <div className="table-responsive border rounded">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead className="table-light">
+                        <tr><th>Date</th><th>Original attendance</th><th>Employee requested</th><th>Payroll / eligibility</th><th>HR Admin decision</th></tr>
+                      </thead>
+                      <tbody>
+                        {review.dates.map((item) => {
+                          const iso = item.attendance_date;
+                          const decision = decisions[iso] || {};
+                          const problem = decisionProblem(item, decision);
+                          return (
+                            <tr key={iso} className={decision.action ? "" : "table-warning"}>
+                              <td className="fw-semibold text-nowrap">{formatRequestDate(iso)}</td>
+                              <td>
+                                <div>{item.original_status}</div>
+                                <div className="small text-muted">{timesOrDash(item.original_check_in_time, item.original_check_out_time)}</div>
+                                {item.original_attendance_category && <div className="small text-muted">{item.original_attendance_category}</div>}
+                              </td>
+                              <td>
+                                <div className="fw-semibold">{item.requested_status}</div>
+                                {item.requested_status === "Present" && <div className="small">Requested: {timesOrDash(item.requested_check_in_time, item.requested_check_out_time)}</div>}
+                              </td>
+                              <td className="small" style={{ minWidth: 150 }}>
+                                {item.payroll_status ? `Payroll ${item.payroll_status}` : "No payroll yet"}
+                                {item.eligibility_message && <div className="text-danger">{item.eligibility_message}</div>}
+                                {item.payroll_note && <div className="text-warning-emphasis">{item.payroll_note}</div>}
+                              </td>
+                              <td style={{ minWidth: 240 }}>
+                                <div className="btn-group btn-group-sm mb-2" role="group" aria-label={`Decision for ${iso}`}>
+                                  <button type="button" className={`btn ${decision.action === "approve" ? "btn-success" : "btn-outline-success"}`} aria-pressed={decision.action === "approve"}
+                                    disabled={submitting} onClick={() => updateDecision(iso, { action: "approve" })}>
+                                    <i className="bi bi-check-lg me-1" aria-hidden="true" />Approve
+                                  </button>
+                                  <button type="button" className={`btn ${decision.action === "reject" ? "btn-danger" : "btn-outline-danger"}`} aria-pressed={decision.action === "reject"}
+                                    disabled={submitting} onClick={() => updateDecision(iso, { action: "reject" })}>
+                                    <i className="bi bi-x-lg me-1" aria-hidden="true" />Reject
+                                  </button>
+                                </div>
+                                {decision.action === "approve" && (
+                                  <>
+                                    <select className={`form-select form-select-sm ${decision.final_status ? "" : "border-warning"}`} aria-label={`Final status for ${iso}`}
+                                      value={decision.final_status} disabled={submitting} onChange={(e) => updateDecision(iso, { final_status: e.target.value })}>
+                                      <option value="">Final status...</option>
+                                      {(item.allowed_final_statuses || []).map((option) => <option key={option} value={option}>{option}</option>)}
+                                    </select>
+                                    {decision.final_status === "Present" && (
+                                      <div className="d-flex flex-wrap gap-2 mt-2">
+                                        <label className="small mb-0">Final check-in
+                                          <input type="time" className="form-control form-control-sm" value={decision.check_in} disabled={submitting}
+                                            onChange={(e) => updateDecision(iso, { check_in: e.target.value })} />
+                                        </label>
+                                        <label className="small mb-0">Final check-out
+                                          <input type="time" className="form-control form-control-sm" value={decision.check_out} disabled={submitting}
+                                            onChange={(e) => updateDecision(iso, { check_out: e.target.value })} />
+                                        </label>
+                                      </div>
+                                    )}
+                                    {(item.option_notes || []).map((note) => <div key={note} className="small text-warning-emphasis mt-1">{note}</div>)}
+                                  </>
+                                )}
+                                {decision.action && problem && <div className="small text-danger mt-1">{problem}</div>}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
                   </div>
+                ) : (
+                  <>
+                    <DateDecisionList dates={review.dates} />
+                    <div className="small mt-3">
+                      Reviewed {formatRequestDateTime(review.reviewed_at)} by {review.reviewed_by_name || "HR Admin"}
+                      {review.review_comments && <div>Response remarks: {review.review_comments}</div>}
+                    </div>
+                  </>
+                )}
+
+                {review.can_respond && (
+                  <>
+                    <div className="small mt-2">
+                      {problems.length ? <span className="text-warning-emphasis">{problems.length} date(s) still need a complete decision.</span> : <span className="text-success">Every date has a decision.</span>}
+                    </div>
+                    <label htmlFor="ar-comments" className="form-label mt-3">Response remarks {hasReject ? <span className="text-danger">(required when rejecting)</span> : "(optional)"}</label>
+                    <textarea id="ar-comments" className="form-control" rows={2} maxLength={1000} value={comments} onChange={(e) => { setConfirming(false); setComments(e.target.value); }} disabled={submitting} />
+                  </>
                 )}
                 {confirming && !reviewError && (
                   <div className="alert alert-warning py-2 mt-3 mb-0" role="alert">
-                    Confirm: attendance will be saved for every eligible date in {review.request_number} and the employee will be notified. Click <strong>Confirm Submit</strong> to continue, or Cancel to discard.
+                    <div className="fw-semibold mb-1">Confirm the final values for {review.request_number}:</div>
+                    <ul className="mb-1 ps-3">
+                      {review.dates.map((item) => <li key={item.attendance_date}>{formatRequestDate(item.attendance_date)} — {finalSummary(item)}</li>)}
+                    </ul>
+                    Approved dates update the employee&apos;s attendance and the employee will be notified. Click <strong>Confirm Submit</strong> to continue, or Cancel to discard.
                   </div>
                 )}
                 {reviewError && <div className="alert alert-danger py-2 mt-3 mb-0" role="alert">{reviewError}</div>}

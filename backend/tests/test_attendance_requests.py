@@ -17,7 +17,7 @@ from fastapi import HTTPException  # noqa: E402
 from pymongo.errors import PyMongoError  # noqa: E402
 
 from app import attendance_requests as ar  # noqa: E402
-from app import leave, payroll  # noqa: E402
+from app import attendance as attendance_module, leave, payroll  # noqa: E402
 from app.db.mongodb import client, db, ensure_audit_logs_collection  # noqa: E402
 from app.session import active_sessions  # noqa: E402
 
@@ -25,15 +25,28 @@ TODAY = date(2026, 10, 15)
 
 
 def payload(*dates, remarks=None):
+    """Each date is (iso, status) or (iso, "Present", check_in, check_out)."""
     return ar.AttendanceRequestCreate(
-        dates=[{"attendance_date": iso, "requested_status": status} for iso, status in dates],
+        dates=[
+            {"attendance_date": item[0], "requested_status": item[1],
+             "requested_check_in_time": item[2] if len(item) > 2 else None,
+             "requested_check_out_time": item[3] if len(item) > 3 else None}
+            for item in dates
+        ],
         remarks=remarks,
     )
 
 
 def decisions(*items, comments=None):
+    """Each item is (iso, final_status[, check_in, check_out]) or (iso, "reject")."""
     return ar.AttendanceRequestResponsePayload(
-        decisions=[{"attendance_date": iso, "final_status": status} for iso, status in items],
+        decisions=[
+            {"attendance_date": item[0], "action": "reject"} if item[1] == "reject" else
+            {"attendance_date": item[0], "action": "approve", "final_status": item[1],
+             "final_check_in_time": item[2] if len(item) > 2 else None,
+             "final_check_out_time": item[3] if len(item) > 3 else None}
+            for item in items
+        ],
         review_comments=comments,
     )
 
@@ -59,7 +72,8 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
 
     def setUp(self):
         for name in ["users", "attendance", "attendance_requests", "attendance_request_date_claims",
-                     "monthly_payroll_records", "leave_notifications", "employee_holiday_calendars", "holidays", "leave_policies"]:
+                     "monthly_payroll_records", "leave_notifications", "employee_holiday_calendars", "holidays", "leave_policies",
+                     "leave_types", "leave_balances", "leave_requests", "essl_raw_punches", "audit_logs"]:
             db[name].delete_many({})
         self.today = patch.object(ar, "company_today", return_value=TODAY)
         self.today.start()
@@ -112,15 +126,18 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         days = {day["attendance_date"]: day for day in result["days"]}
 
         self.assertEqual(len(days), 30)
-        self.assertEqual(days["2026-09-01"]["status"], "Not Applicable")
+        # Pre-joining dates are no longer shown as "Not Applicable" by default.
+        self.assertEqual(days["2026-09-01"]["status"], "Before Joining")
+        self.assertEqual(days["2026-09-01"]["ineligible_reason"], "This date is before your joining date.")
         self.assertEqual((days["2026-09-03"]["status"], days["2026-09-03"]["attendance_category"], days["2026-09-03"]["check_in_time"]), ("Present", "Office", "09:05"))
         self.assertEqual(days["2026-09-04"]["attendance_category"], "Work From Home")
         self.assertEqual(days["2026-09-06"]["status"], "Weekly Off")
         self.assertEqual(days["2026-09-10"]["status"], "Holiday")
         self.assertEqual(days["2026-09-07"]["status"], "Not Marked")
         self.assertTrue(days["2026-09-07"]["eligible_for_request"])
-        for iso in ["2026-09-01", "2026-09-03", "2026-09-06", "2026-09-10"]:
-            self.assertFalse(days[iso]["eligible_for_request"])
+        self.assertFalse(days["2026-09-01"]["eligible_for_request"])
+        for iso in ["2026-09-03", "2026-09-06", "2026-09-10"]:
+            self.assertTrue(days[iso]["eligible_for_request"], iso)
         october = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 10, self.employee["auth"])["days"]}
         self.assertFalse(october["2026-10-15"]["eligible_for_request"])  # today
         self.assertEqual(october["2026-10-20"]["status"], "Upcoming")
@@ -129,12 +146,19 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
 
     # -- Employee requests --------------------------------------------------
 
-    def test_only_eligible_not_marked_dates_can_be_requested(self):
-        for iso in ["2026-09-03", "2026-09-06", "2026-09-10", "2026-09-01", "2026-10-15", "2026-10-20"]:
+    def test_ineligible_dates_and_invalid_transitions_are_rejected(self):
+        for iso in ["2026-09-01", "2026-10-15", "2026-10-20"]:  # before joining, today, future
             self.assert_http(422, ar.create_attendance_request, payload((iso, "Present")), self.employee["auth"])
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-10", "Absent")), self.employee["auth"])  # Holiday -> Present only
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-06", "Weekly Off")), self.employee["auth"])  # already Weekly Off
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-03", "Present", "09:05", "18:10")), self.employee["auth"])  # times unchanged
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-03", "Present")), self.employee["auth"])  # cannot erase times
+        db["attendance"].insert_one({"user_id": str(self.employee["_id"]), "employee_id": "E-201", "attendance_date": "2026-09-11", "status": "Leave", "leave_type_code": "CL"})
+        detail = self.assert_http(422, ar.create_attendance_request, payload(("2026-09-11", "Present")), self.employee["auth"])
+        self.assertIn("Leave module", detail)
         self.assertEqual(db["attendance_requests"].count_documents({}), 0)
         with self.assertRaises(Exception):
-            payload(("2026-09-07", "Absent"))  # Employees cannot request Absent.
+            payload(("2026-09-07", "Late"))  # Unknown statuses are refused by the schema.
 
     def test_multi_date_request_and_duplicate_prevention(self):
         created = ar.create_attendance_request(
@@ -206,9 +230,9 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
             self.hr["auth"],
         )
 
-        self.assertEqual(result["status"], "partially_approved")
-        self.assertEqual(result["summary"], {"applied": 3, "not_applied": 0, "notification_sent": True, "outdated_payroll_periods": []})
-        self.assertEqual([(d["final_status"], d["outcome"]) for d in result["dates"]], [("Present", "approved"), ("Absent", "rejected"), ("Present", "changed")])
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(result["summary"], {"applied": 3, "rejected": 0, "not_applied": 0, "notification_sent": True, "outdated_payroll_periods": []})
+        self.assertEqual([(d["final_status"], d["outcome"]) for d in result["dates"]], [("Present", "approved"), ("Absent", "changed"), ("Present", "changed")])
         self.assertEqual(result["reviewed_by"], str(self.hr["_id"]))
         actions = {item["action"] for item in db["audit_logs"].find({"$or": [{"entity_id": created["id"]}, {"new_value.attendance_request_id": created["id"]}]})}
         self.assertTrue({"ATTENDANCE_REQUEST_SUBMITTED", "ATTENDANCE_REQUEST_RESPONDED", "attendance.request_decision"} <= actions, actions)
@@ -218,7 +242,7 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
             self.assertIsNone(record["check_in_time"])  # No fabricated punches.
             self.assertEqual(record["employee_id"], "E-201")
         self.assertEqual(self.calendar_day(self.employee, "2026-09-07")["status"], "Present")
-        self.assertFalse(self.calendar_day(self.employee, "2026-09-07")["eligible_for_request"])
+        self.assertIsNone(self.calendar_day(self.employee, "2026-09-07")["request"])  # claim released
         self.assertEqual(db["attendance_request_date_claims"].count_documents({}), 0)
 
         after = payroll._attendance_summary_for_employee("E-201", 9, 2026)
@@ -227,8 +251,8 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
 
         notes = list(db["leave_notifications"].find({"recipient_user_id": str(self.employee["_id"])}))
         self.assertEqual(len(notes), 1)
-        for text in ["07 Sep 2026 — Requested Present — Approved as Present", "08 Sep 2026 — Requested Present — Changed to Absent",
-                     "09 Sep 2026 — Requested Holiday — Changed to Present", "Verified with team lead", created["request_number"]]:
+        for text in ["07 Sep 2026 — Requested Present — Approved as Present", "08 Sep 2026 — Requested Present — Approved with changes as Absent",
+                     "09 Sep 2026 — Requested Holiday — Approved with changes as Present", "Verified with team lead", created["request_number"]]:
             self.assertIn(text, notes[0]["message"])
 
         # Retried submission: no reapplication, no duplicate records or notifications.
@@ -236,7 +260,7 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         self.assertEqual(db["attendance"].count_documents({"attendance_request_id": created["id"]}), 3)
         self.assertEqual(db["leave_notifications"].count_documents({"recipient_user_id": str(self.employee["_id"])}), 1)
         history = ar.my_attendance_requests(self.employee["auth"])
-        self.assertEqual(history[0]["status"], "partially_approved")
+        self.assertEqual(history[0]["status"], "approved")
 
     def test_existing_records_created_after_submission_are_preserved(self):
         created = ar.create_attendance_request(payload(("2026-09-07", "Present"), ("2026-09-08", "Present")), self.employee["auth"])
@@ -249,7 +273,7 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         self.assertIn("existing record was preserved", result["dates"][1]["message"])
         manual = db["attendance"].find_one({"user_id": str(self.employee["_id"]), "attendance_date": "2026-09-08"})
         self.assertEqual((manual["status"], manual["check_in_time"], manual["attendance_source"]), ("Present", "09:00", "MANUAL"))
-        self.assertEqual(result["status"], "rejected")  # Nothing approved as requested.
+        self.assertEqual(result["status"], "partially_approved")
 
     def test_calculated_draft_payroll_is_flagged_and_cannot_be_approved(self):
         created = ar.create_attendance_request(payload(("2026-09-07", "Present")), self.other["auth"])
@@ -304,7 +328,7 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         days = {day["attendance_date"]: day for day in result["days"]}
         self.assertEqual(result["weekly_off_weekdays"], ["saturday", "sunday"])
         self.assertEqual((days["2026-09-05"]["status"], days["2026-09-06"]["status"]), ("Weekly Off", "Weekly Off"))
-        self.assertFalse(days["2026-09-05"]["eligible_for_request"])
+        self.assertNotIn("Weekly Off", days["2026-09-05"]["request_options"])
         # Leave day counting uses the same HR configuration.
         working = leave._working_dates(self.other, date(2026, 9, 4), date(2026, 9, 8))
         self.assertEqual([d.isoformat() for d in working], ["2026-09-04", "2026-09-07", "2026-09-08"])
@@ -324,6 +348,240 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
             policy = db["leave_policies"].find_one({"leave_type_id": "__company_policy__"})
             self.assertEqual(policy["weekly_off_weekdays"], expected)
             self.assertNotIn("weekly_off_weekday", policy)
+
+    # -- Status options, time corrections and rejection --------------------
+
+    def test_request_options_follow_the_current_status(self):
+        self.set_weekly_offs([])
+        days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
+        # Medical Leave stays locked until the month's Weekly Off allowance is used.
+        self.assertEqual(days["2026-09-07"]["request_options"], ["Present", "Absent", "Holiday", "Weekly Off"])
+        self.assertTrue(any("unlocks after all 4 Weekly Off days" in note for note in days["2026-09-07"]["option_notes"]))
+        db["attendance"].insert_many([
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-08", "status": "Absent"},
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-09", "status": "Weekly Off"},
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-10", "status": "Present", "check_in_time": "09:00", "check_out_time": "18:00"},
+        ])
+        days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
+        self.assertEqual(days["2026-09-08"]["request_options"], ["Present", "Holiday", "Weekly Off"])
+        self.assertEqual(days["2026-09-09"]["request_options"], ["Present", "Absent"])
+        self.assertEqual(days["2026-09-10"]["request_options"], ["Present", "Absent", "Weekly Off"])
+        # Four configured Sundays use the allowance: Medical Leave replaces Weekly Off.
+        self.set_weekly_offs(["sunday"])
+        days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
+        self.assertEqual(days["2026-09-08"]["request_options"], ["Present", "Holiday", "Medical Leave"])
+        self.assertEqual(days["2026-09-10"]["request_options"], ["Present", "Absent", "Medical Leave"])
+
+    def test_present_time_correction_is_applied_only_after_hr_approval(self):
+        employee_id = str(self.employee["_id"])
+        db["essl_raw_punches"].insert_many([
+            {"user_id": employee_id, "punch_at": datetime(2026, 9, 3, 3, 35, tzinfo=timezone.utc)},   # 09:05 IST
+            {"user_id": employee_id, "punch_at": datetime(2026, 9, 3, 12, 40, tzinfo=timezone.utc)},  # 18:10 IST
+        ])
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-03", "Present", "18:00", "09:00")), self.employee["auth"])
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-03", "Absent", "09:00", None)), self.employee["auth"])
+        created = ar.create_attendance_request(payload(("2026-09-03", "Present", "08:55", "18:10"), remarks="Forgot to punch in on time"), self.employee["auth"])
+        item = created["dates"][0]
+        self.assertEqual((item["original_status"], item["original_check_in_time"], item["original_check_out_time"]), ("Present", "09:05", "18:10"))
+        self.assertEqual((item["requested_check_in_time"], item["requested_check_out_time"]), ("08:55", "18:10"))
+        record = db["attendance"].find_one({"user_id": employee_id, "attendance_date": "2026-09-03"})
+        self.assertEqual((record["check_in_time"], record["attendance_source"]), ("09:05", "ESSL"))  # unchanged before approval
+
+        detail = ar.get_attendance_request(created["id"], self.hr["auth"])
+        self.assertEqual(detail["dates"][0]["allowed_final_statuses"][0], "Present")
+        self.assert_http(422, ar.respond_to_attendance_request, created["id"], decisions(("2026-09-03", "Present", "19:00", "18:10")), self.hr["auth"])
+        result = ar.respond_to_attendance_request(created["id"], decisions(("2026-09-03", "Present", "09:00", "18:10")), self.hr["auth"])
+        self.assertEqual((result["status"], result["dates"][0]["outcome"]), ("approved", "changed"))
+        record = db["attendance"].find_one({"user_id": employee_id, "attendance_date": "2026-09-03"})
+        self.assertEqual((record["status"], record["check_in_time"], record["check_out_time"]), ("Present", "09:00", "18:10"))
+        self.assertEqual((record["attendance_source"], record["attendance_type"]), ("ATTENDANCE_REQUEST", "OFFICE"))
+        self.assertEqual(record["correction_previous"]["check_in_time"], "09:05")
+        self.assertNotIn("last_punch", record)
+        daily = attendance_module._calculate_daily_attendance(employee_id, date(2026, 9, 3), self.employee)
+        self.assertTrue(daily["first_check_in"].startswith("2026-09-03T09:00"))  # approved time replaces raw punches
+        note = db["leave_notifications"].find_one({"recipient_user_id": employee_id})
+        self.assertIn("Requested Present (08:55 – 18:10) — Approved with changes as Present (09:00 – 18:10)", note["message"])
+
+    def test_rejection_requires_remarks_and_leaves_attendance_unchanged(self):
+        created = ar.create_attendance_request(payload(("2026-09-07", "Present"), ("2026-09-08", "Holiday")), self.employee["auth"])
+        self.assert_http(422, ar.respond_to_attendance_request, created["id"], decisions(("2026-09-07", "reject"), ("2026-09-08", "reject")), self.hr["auth"])
+        result = ar.respond_to_attendance_request(created["id"], decisions(("2026-09-07", "reject"), ("2026-09-08", "Holiday"), comments="No proof for 7 Sep"), self.hr["auth"])
+        self.assertEqual(result["status"], "partially_approved")
+        self.assertEqual([d["outcome"] for d in result["dates"]], ["rejected", "approved"])
+        self.assertIsNone(db["attendance"].find_one({"user_id": str(self.employee["_id"]), "attendance_date": "2026-09-07"}))
+        note = db["leave_notifications"].find_one({"recipient_user_id": str(self.employee["_id"])})
+        self.assertIn("07 Sep 2026 — Requested Present — Rejected", note["message"])
+        self.assertIn("Remarks: No proof for 7 Sep", note["message"])
+
+        only_reject = ar.create_attendance_request(payload(("2026-09-09", "Present")), self.employee["auth"])
+        result = ar.respond_to_attendance_request(only_reject["id"], decisions(("2026-09-09", "reject"), comments="Not verified"), self.hr["auth"])
+        self.assertEqual((result["status"], result["summary"]["rejected"]), ("rejected", 1))
+
+    # -- Monthly limits -----------------------------------------------------
+
+    def test_weekly_off_limit_of_four_per_month(self):
+        self.set_weekly_offs([])
+        auth = self.other["auth"]
+        self.assertEqual(ar.my_attendance_calendar(2026, 9, auth)["limits"]["weekly_off_limit"], 4)
+        five = [(f"2026-09-0{day}", "Weekly Off") for day in range(1, 6)]
+        self.assertIn("monthly limit of 4", self.assert_http(422, ar.create_attendance_request, payload(*five), auth))
+        first = ar.create_attendance_request(payload(*five[:3]), auth)
+        # Pending requests reserve the allowance, so a concurrent fifth cannot slip through.
+        second = ar.create_attendance_request(payload(("2026-09-07", "Weekly Off")), auth)
+        day = self.calendar_day(self.other, "2026-09-08")
+        self.assertNotIn("Weekly Off", day["request_options"])
+        self.assertIn("Medical Leave", day["request_options"])  # offered instead
+        self.assertTrue(any("Weekly Off is unavailable" in note for note in day["option_notes"]))
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-08", "Weekly Off")), auth)
+
+        ar.respond_to_attendance_request(first["id"], decisions(*[(iso, "Weekly Off") for iso, _ in five[:3]]), self.hr["auth"])
+        ar.respond_to_attendance_request(second["id"], decisions(("2026-09-07", "Weekly Off")), self.hr["auth"])
+        self.assertEqual(db["attendance"].count_documents({"user_id": str(self.other["_id"]), "status": "Weekly Off"}), 4)
+        # HR cannot approve a fifth Weekly Off either, even when changing another request's status.
+        third = ar.create_attendance_request(payload(("2026-09-08", "Present")), auth)
+        detail = ar.get_attendance_request(third["id"], self.hr["auth"])
+        self.assertNotIn("Weekly Off", detail["dates"][0]["allowed_final_statuses"])
+        self.assert_http(422, ar.respond_to_attendance_request, third["id"], decisions(("2026-09-08", "Weekly Off")), self.hr["auth"])
+        # The next calendar month has its own allowance.
+        self.assertIn("Weekly Off", self.calendar_day(self.other, "2026-10-01")["request_options"])
+
+    def test_rejected_weekly_off_requests_do_not_use_the_allowance(self):
+        self.set_weekly_offs([])
+        auth = self.other["auth"]
+        created = ar.create_attendance_request(payload(*[(f"2026-09-0{day}", "Weekly Off") for day in range(1, 5)]), auth)
+        self.assertNotIn("Weekly Off", self.calendar_day(self.other, "2026-09-08")["request_options"])
+        ar.respond_to_attendance_request(created["id"], decisions(*[(f"2026-09-0{day}", "reject") for day in range(1, 5)], comments="Not eligible"), self.hr["auth"])
+        self.assertIn("Weekly Off", self.calendar_day(self.other, "2026-09-08")["request_options"])
+
+    def test_medical_leave_limit_of_one_per_month(self):
+        # Four configured Sundays use the September Weekly Off allowance.
+        auth = self.other["auth"]
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-07", "Medical Leave"), ("2026-09-08", "Medical Leave")), auth)
+        created = ar.create_attendance_request(payload(("2026-09-07", "Medical Leave")), auth)
+        self.assertNotIn("Medical Leave", self.calendar_day(self.other, "2026-09-08")["request_options"])  # pending reserves it
+        result = ar.respond_to_attendance_request(created["id"], decisions(("2026-09-07", "Medical Leave")), self.hr["auth"])
+        self.assertEqual(result["status"], "approved")
+        record = db["attendance"].find_one({"user_id": str(self.other["_id"]), "attendance_date": "2026-09-07"})
+        self.assertEqual((record["status"], record["leave_type_code"], record["medical_leave"]), ("Leave", "ML", True))
+        self.assertEqual(db["leave_balances"].count_documents({}), 0)  # monthly entitlement, no leave balance used
+        self.assertEqual(self.calendar_day(self.other, "2026-09-07")["status_label"], "Medical Leave")
+        summary = payroll._attendance_summary_for_employee("E-202", 9, 2026)
+        self.assertEqual((summary["medical_leave_days"], summary["paid_leave_days"], summary["weekly_off_days"]), (1, 0, 4))
+        self.assertEqual(summary["paid_days"], 5)
+
+        day = self.calendar_day(self.other, "2026-09-08")
+        self.assertNotIn("Medical Leave", day["request_options"])
+        self.assertTrue(any("monthly limit of 1 medical leave" in note for note in day["option_notes"]))
+        self.assert_http(422, ar.create_attendance_request, payload(("2026-09-08", "Medical Leave")), auth)
+        other = ar.create_attendance_request(payload(("2026-09-08", "Present")), auth)
+        self.assert_http(422, ar.respond_to_attendance_request, other["id"], decisions(("2026-09-08", "Medical Leave")), self.hr["auth"])
+        # A new calendar month has its own allowance.
+        self.assertIn("Medical Leave", self.calendar_day(self.other, "2026-10-01")["request_options"])
+
+    def test_medical_leave_unlocks_after_four_weekly_offs(self):
+        self.set_weekly_offs([])
+        auth = self.other["auth"]
+        self.assertIn("unlocks after", self.assert_http(422, ar.create_attendance_request, payload(("2026-09-08", "Medical Leave")), auth))
+        weekly = ar.create_attendance_request(payload(*[(f"2026-09-0{day}", "Weekly Off") for day in range(1, 5)]), auth)
+        self.assertIn("Medical Leave", self.calendar_day(self.other, "2026-09-08")["request_options"])
+        medical = ar.create_attendance_request(payload(("2026-09-08", "Medical Leave")), auth)
+        # If the Weekly Off days are rejected, Medical Leave cannot be approved.
+        ar.respond_to_attendance_request(weekly["id"], decisions(*[(f"2026-09-0{day}", "reject") for day in range(1, 5)], comments="Worked"), self.hr["auth"])
+        self.assertIn("unlocks after", str(self.assert_http(422, ar.respond_to_attendance_request, medical["id"], decisions(("2026-09-08", "Medical Leave")), self.hr["auth"])))
+
+    def test_payroll_counts_weekly_offs_and_medical_leave_as_payable(self):
+        self.set_weekly_offs([])
+        db["attendance"].insert_many([
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": f"2026-09-0{day}", "status": "Weekly Off"}
+            for day in range(1, 5)
+        ] + [
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-05", "status": "Leave", "leave_type_code": "ML", "medical_leave": True},
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-07", "status": "Present"},
+            {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-08", "status": "Absent"},
+        ])
+        summary = payroll._attendance_summary_for_employee("E-202", 9, 2026)
+        self.assertEqual((summary["weekly_off_days"], summary["medical_leave_days"], summary["present_days"]), (4, 1, 1))
+        self.assertEqual((summary["paid_days"], summary["lop_days"]), (6, 1))
+
+    def test_hr_can_finalize_a_date_as_not_applicable_counted_as_lop(self):
+        auth = self.other["auth"]
+        created = ar.create_attendance_request(payload(("2026-09-07", "Present", "09:00", "18:00"), ("2026-09-08", "Holiday")), auth)
+        # Not Applicable is an HR-only final status; employees cannot request it.
+        self.assertEqual(ar.get_attendance_request(created["id"], self.hr["auth"])["dates"][0]["allowed_final_statuses"][-1], "Not Applicable")
+        with self.assertRaises(Exception):
+            payload(("2026-09-09", "Not Applicable"))
+        result = ar.respond_to_attendance_request(created["id"], decisions(("2026-09-07", "Not Applicable"), ("2026-09-08", "Not Applicable")), self.hr["auth"])
+        self.assertEqual([item["outcome"] for item in result["dates"]], ["changed", "changed"])
+        record = db["attendance"].find_one({"user_id": str(self.other["_id"]), "attendance_date": "2026-09-07"})
+        self.assertEqual((record["status"], record["check_in_time"]), ("Not Applicable", None))
+        day = self.calendar_day(self.other, "2026-09-07")
+        self.assertEqual(day["status"], "Not Applicable")
+        self.assertIn("Present", day["request_options"])  # employee may ask HR to correct it
+        summary = payroll._attendance_summary_for_employee("E-202", 9, 2026)
+        self.assertEqual((summary["not_applicable_days"], summary["lop_days"]), (2, 2))
+        self.assertEqual(summary["paid_days"], 4)  # only the four configured Sundays
+        note = db["leave_notifications"].find_one({"recipient_user_id": str(self.other["_id"])})
+        self.assertIn("Approved with changes as Not Applicable", note["message"])
+
+    def test_leave_module_medical_leave_follows_the_monthly_rule(self):
+        medical_type = db["leave_types"].insert_one({"code": "ML", "name": "Medical Leave", "is_active": True, "is_paid": True}).inserted_id
+        self.assertTrue(leave._is_medical_leave_type({"code": "ML", "name": "Medical Leave"}))
+        self.assertFalse(leave._is_medical_leave_type({"code": "SL", "name": "Sick Leave"}))
+        # September has four configured Sundays, so Medical Leave is unlocked.
+        self.assertIsNone(ar.leave_module_medical_problem(self.other, [date(2026, 9, 8)], "full_day"))
+        self.assertIn("1 day per month", ar.leave_module_medical_problem(self.other, [date(2026, 9, 8), date(2026, 9, 9)], "full_day"))
+        # A pending Medical Leave application uses the month's allowance in both modules.
+        db["leave_requests"].insert_one({"user_id": str(self.other["_id"]), "leave_type_id": str(medical_type), "status": "pending",
+                                         "from_date": "2026-09-08", "to_date": "2026-09-08", "leave_dates": ["2026-09-08"], "day_part": "full_day"})
+        self.assertIn("1 day per month", ar.leave_module_medical_problem(self.other, [date(2026, 9, 9)], "full_day"))
+        self.assertNotIn("Medical Leave", self.calendar_day(self.other, "2026-09-09")["request_options"])
+        # Without four Weekly Offs in the month it stays locked.
+        self.set_weekly_offs([])
+        self.assertIn("only after all 4 Weekly Off days", ar.leave_module_medical_problem(self.other, [date(2026, 10, 8)], "full_day"))
+        # The yearly Medical Leave balance is one day for every month.
+        db["leave_policies"].update_one({"leave_type_id": "__company_policy__"}, {"$set": {"probation_period_months": 3}})
+        self.assertEqual(leave._medical_entitlement(self.other, 3.0), 12.0)
+
+    def test_retired_sl_leave_type_is_merged_into_ml(self):
+        user_id = str(self.other["_id"])
+        ml_id = str(db["leave_types"].insert_one({"code": "ML", "name": "Medical Leave", "is_active": True}).inserted_id)
+        sl_id = str(db["leave_types"].insert_one({"code": "SL", "name": "Medical Leave", "is_active": True}).inserted_id)
+        db["leave_policies"].insert_one({"leave_type_id": sl_id, "annual_entitlement": 12, "is_active": True})
+        db["leave_balances"].insert_many([
+            {"user_id": user_id, "leave_type_id": sl_id, "year": 2026, "used": 1.0, "pending": 0.0},
+            {"user_id": user_id, "leave_type_id": ml_id, "year": 2026, "used": 2.0, "pending": 0.0},
+        ])
+        db["leave_requests"].insert_one({"user_id": user_id, "leave_type_id": sl_id, "status": "approved"})
+        db["attendance"].insert_one({"user_id": user_id, "employee_id": "E-202", "attendance_date": "2026-09-08", "status": "Leave", "leave_type_code": "SL"})
+        leave._migrate_sl_to_medical_leave(datetime.now(timezone.utc))
+        leave._migrate_sl_to_medical_leave(datetime.now(timezone.utc))  # idempotent
+        self.assertEqual(db["leave_types"].count_documents({"code": "SL"}), 0)
+        self.assertEqual(db["leave_policies"].count_documents({"leave_type_id": sl_id}), 0)
+        self.assertEqual(db["leave_balances"].find_one({"user_id": user_id, "leave_type_id": ml_id, "year": 2026})["used"], 3.0)
+        self.assertEqual(db["leave_balances"].count_documents({"leave_type_id": sl_id}), 0)
+        self.assertEqual(db["leave_requests"].find_one({"user_id": user_id})["leave_type_id"], ml_id)
+        self.assertEqual(db["attendance"].find_one({"attendance_date": "2026-09-08"})["leave_type_code"], "ML")
+        # With no ML type yet, SL is simply re-coded in place.
+        db["leave_types"].delete_many({})
+        kept = db["leave_types"].insert_one({"code": "SL", "name": "Sick Leave", "is_active": True}).inserted_id
+        leave._migrate_sl_to_medical_leave(datetime.now(timezone.utc))
+        self.assertEqual(db["leave_types"].find_one({"_id": kept})["code"], "ML")
+
+    def test_weekly_off_and_medical_limits_both_reached(self):
+        # Four configured Sundays already use the September weekly-off allowance.
+        db["attendance"].insert_one({"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-01",
+                                     "status": "Leave", "leave_type_code": "ML", "medical_leave": True})
+        day = self.calendar_day(self.other, "2026-09-07")
+        self.assertEqual(day["request_options"], ["Present", "Absent", "Holiday"])
+        self.assertEqual(len(day["option_notes"]), 2)
+
+    def test_response_is_serialized_per_employee_and_month(self):
+        first = ar.create_attendance_request(payload(("2026-09-07", "Present")), self.employee["auth"])
+        second = ar.create_attendance_request(payload(("2026-09-08", "Present")), self.employee["auth"])
+        db["attendance_requests"].update_one({"_id": ObjectId(second["id"])}, {"$set": {"status": "processing", "processing_started_at": datetime.now(timezone.utc)}})
+        self.assert_http(409, ar.respond_to_attendance_request, first["id"], decisions(("2026-09-07", "Present")), self.hr["auth"])
+        self.assertEqual(db["attendance_requests"].find_one({"_id": ObjectId(first["id"])})["status"], "pending")
+
 
     def test_concurrent_response_is_rejected_while_processing(self):
         created = ar.create_attendance_request(payload(("2026-09-07", "Present")), self.employee["auth"])

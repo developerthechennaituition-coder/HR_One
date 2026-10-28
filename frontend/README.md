@@ -1,6 +1,6 @@
 # HRMS Frontend
 
-The HRMS frontend is a React single-page application for employee, attendance, leave, organization, notification, and payroll workflows. It communicates with the Python FastAPI backend over HTTP(S).
+The HRMS frontend is a React single-page application for employee, attendance, attendance-request, leave, holiday-calendar, organization, notification, and payroll workflows. It communicates with the Python FastAPI backend over HTTP(S).
 
 ## Contents
 
@@ -58,7 +58,11 @@ frontend/
     │   ├── Sidebar.jsx
     │   ├── NotificationBell.jsx
     │   ├── NotificationPanel.jsx
-    │   ├── AttendanceDayBreakdown.jsx
+    │   ├── AttendanceDayBreakdown.jsx   # daily working time and breaks
+    │   ├── MyAttendanceCalendar.jsx     # monthly attendance calendar (My Attendance)
+    │   ├── MyAttendanceRequests.jsx     # employee attendance request dialog + history
+    │   ├── AttendanceRequestInbox.jsx   # HR Admin per-date review/response
+    │   ├── MyHolidayCalendar.jsx        # employee's religion + company holidays
     │   └── EsslAdminSettings.jsx
     ├── pages/
     │   ├── AccessDenied.jsx
@@ -91,9 +95,11 @@ frontend/
     │   ├── WfhAttendance.jsx
     │   └── WfhEmailVerification.jsx
     └── services/
+        ├── attendanceRequestApi.js   # attendance request API + date/time formatters
         ├── authenticatedFetch.js
         ├── notificationApi.js
-        └── payrollApi.js
+        ├── payrollApi.js
+        └── weeklyOff.js              # HR-configured weekly-off days hook
 ```
 
 ## Prerequisites
@@ -201,13 +207,16 @@ npm run build
 ### Company, organization, and employees
 - Company setup.
 - Organization setup.
-- Holiday calendar setup.
+- Holiday calendar setup: religion + year selection (from employee records; current/next year only), draft → publish, add/edit/delete holidays with in-page confirmation and reason dialogs.
+- Employee holiday calendar on Profile: own religion's published holidays plus company holidays, year switch, list and calendar views.
 - Employee master and employee details.
 - User management.
-- Reporting-manager team list and team-member details.
+- Reporting-manager team list and team-member details, including the member's monthly attendance calendar and daily working time.
 
 ### Attendance and WFH
 - Attendance overview.
+- Monthly attendance calendar: colour-coded Present, Absent, Holiday (name), Leave (CL/ML), Weekly Off, Not Applicable; clicking a date loads that day's working time and breaks (My Attendance, Profile, Team Member Details).
+- Attendance requests: employees pick past dates by status, choose an allowed new status (Present with times, Absent, Holiday, Weekly Off, Medical Leave); HR Admin responds per date from the inbox or a notification. Dates show the weekday.
 - Employee attendance and individual user attendance.
 - WFH attendance.
 - WFH admin settings.
@@ -216,11 +225,11 @@ npm run build
 - Attendance-day breakdown component.
 
 ### Leave, notifications, and payroll
-- Leave and permission workflows.
+- Leave and permission workflows, HR weekly-off configuration and Medical Leave (`ML`, 1 day/month after 4 Weekly Offs).
 - Notification bell and panel.
 - Notification management.
 - Employee salary setup.
-- Payroll workspace.
+- Payroll workspace (Weekly Off, Medical Leave and Not Applicable/LOP columns; outdated-payroll badge).
 - Employee payslips.
 
 The frontend is the user interface, not the source of truth for permissions. Backend APIs must validate the current session and the user's role for protected operations.
@@ -231,6 +240,8 @@ The frontend is the user interface, not the source of truth for permissions. Bac
 - `src/services/authenticatedFetch.js` provides the shared authenticated request helper used by API consumers.
 - `src/services/notificationApi.js` contains notification-related API calls.
 - `src/services/payrollApi.js` contains payroll-related API calls.
+- `src/services/attendanceRequestApi.js` contains attendance-request calls and shared date/time formatting.
+- `src/services/weeklyOff.js` reads the HR-configured weekly-off days.
 - `src/auth.js` includes session-reading and user-management role helpers.
 
 The current session helper reads `hrms_session` from `sessionStorage`; corrupted or missing stored session data is treated as a signed-out session. Do not treat client-side session storage or a hidden navigation item as authorization. The backend must independently authenticate and authorize every protected request.
@@ -268,6 +279,7 @@ Before deploying:
 - Keep shared UI in `src/components/`, page-level screens in `src/pages/`, API services in `src/services/`, and common API configuration in `src/config/`.
 - Follow existing component and CSS conventions; this project uses multiple `styles-*.css` files.
 - Preserve accessible labels, keyboard navigation, responsive layouts, and clear loading/empty/error states.
+- Responsive rules live in `src/index.css`: tables inside `.table-responsive` keep natural widths and scroll; dialogs use `modal-fullscreen-md-down` or in-page modals instead of `window.prompt`/`confirm`. Check pages at 320, 375, 430, 768, 1024 and 1440px.
 - Avoid introducing a second API base URL or duplicate authentication implementation.
 - Keep role-based UI aligned with backend permissions, but never rely on frontend checks alone.
 - Do not hardcode server IP addresses, credentials, tokens, or environment-specific values.

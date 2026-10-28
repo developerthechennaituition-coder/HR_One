@@ -411,7 +411,7 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     records = list(attendance_collection.find({
         "employee_id": employee_id,
         "attendance_date": {"$gte": start, "$lte": end},
-    }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1}))
+    }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1, "medical_leave": 1}))
 
     leave_codes = {
         str(row.get("leave_type_code") or "").upper()
@@ -437,6 +437,15 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
             day_status[day] = ("holiday", True, 1.0)
         elif status_value == "absent":
             day_status.setdefault(day, ("absent", False, 1.0))
+        elif status_value == "not applicable":
+            # Set by HR Admin on an attendance request; always Loss of Pay.
+            day_status[day] = ("not_applicable", False, 1.0)
+        elif status_value == "weekly off":
+            if day_status.get(day, ("absent",))[0] == "absent":
+                day_status[day] = ("weekly_off", True, 1.0)
+        elif status_value == "leave" and row.get("medical_leave"):
+            # Monthly Medical Leave granted through an attendance request is paid.
+            day_status[day] = ("medical_leave", True, 1.0)
         elif status_value == "leave":
             code = str(row.get("leave_type_code") or "").upper()
             is_paid = leave_types.get(code, code != "LOP")
@@ -475,6 +484,31 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
                 day_status[holiday_key] = ("holiday", True, 1.0)
             elif holiday_key and day_status.get(holiday_key, (None,))[0] == "absent":
                 day_status[holiday_key] = ("holiday", True, 1.0)
+
+    # Published religion-based holidays for this employee follow the same rule:
+    # they fill unrecorded or Absent dates and never replace Present or leave.
+    from app.religion_holidays import published_religion_holidays
+    religion_user = users_collection.find_one({"employee_id": employee_id})
+    if religion_user:
+        for holiday_day in published_religion_holidays(religion_user, start_date, end_date, include_optional=False):
+            holiday_key = holiday_day.isoformat()
+            if day_status.get(holiday_key, ("absent",))[0] == "absent":
+                day_status[holiday_key] = ("holiday", True, 1.0)
+
+    # Unrecorded HR-configured weekly-off days are payable, from the joining
+    # date up to today; any explicit attendance record for the date wins.
+    from app.attendance import company_today, company_weekly_off_weekdays
+    weekly_off_weekdays = company_weekly_off_weekdays()
+    if weekly_off_weekdays:
+        from app import leave as leave_module
+        employee_user = users_collection.find_one({"employee_id": employee_id})
+        joining = leave_module._joining_date(employee_user) if employee_user else None
+        current = max(start_date, joining) if joining else start_date
+        last = min(end_date, company_today())
+        while current <= last:
+            if current.weekday() in weekly_off_weekdays and current.isoformat() not in day_status:
+                day_status[current.isoformat()] = ("weekly_off", True, 1.0)
+            current += timedelta(days=1)
 
     # Approved leave requests are the source of truth for approved leave. Use
     # them to fill dates not already represented by a higher-priority attendance
@@ -534,18 +568,23 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     unpaid_leave = sum(value[2] for value in day_status.values() if value[0] == "unpaid_leave")
     absent = sum(value[2] for value in day_status.values() if value[0] == "absent")
     holiday = sum(value[2] for value in day_status.values() if value[0] == "holiday")
-    payable_days = min(float(days_in_month), present + paid_leave + holiday)
-    lop = absent + unpaid_leave
+    weekly_off = sum(value[2] for value in day_status.values() if value[0] == "weekly_off")
+    medical_leave = sum(value[2] for value in day_status.values() if value[0] == "medical_leave")
+    payable_days = min(float(days_in_month), present + paid_leave + holiday + weekly_off + medical_leave)
+    not_applicable = sum(value[2] for value in day_status.values() if value[0] == "not_applicable")
+    lop = absent + unpaid_leave + not_applicable
 
     return {
         "employee_id": employee_id, "month": month, "year": year, "calendar_days": days_in_month,
         "present_days": round(present, 2), "absent_days": round(absent, 2),
         "paid_leave_days": round(paid_leave, 2), "unpaid_leave_days": round(unpaid_leave, 2),
         "holiday_days": round(holiday, 2),
-        "working_days": round(present + absent + paid_leave + unpaid_leave, 2),
+        "weekly_off_days": round(weekly_off, 2), "medical_leave_days": round(medical_leave, 2),
+        "not_applicable_days": round(not_applicable, 2),
+        "working_days": round(present + absent + paid_leave + unpaid_leave + medical_leave, 2),
         "lop_days": round(lop, 2), "paid_days": round(payable_days, 2),
         "recorded_attendance_days": len(day_status),
-        "review": "Payable days are present days + approved paid leave + eligible holidays. Unpaid leave and absences are not payable.",
+        "review": "Payable days are present days + approved paid leave + eligible holidays + weekly offs + medical leave. Unpaid leave, absences and Not Applicable days are Loss of Pay.",
     }
 
 
@@ -739,7 +778,9 @@ def calculate_monthly_payroll(payload: PayrollRunRequest,
             "recorded_attendance_days": attendance["recorded_attendance_days"],
             "present_days": attendance["present_days"], "paid_leave_days": attendance["paid_leave_days"],
             "unpaid_leave_days": attendance["unpaid_leave_days"], "absent_days": attendance["absent_days"],
-            "holiday_days": attendance["holiday_days"], "attendance_review": attendance["review"],
+            "holiday_days": attendance["holiday_days"], "weekly_off_days": attendance["weekly_off_days"],
+            "medical_leave_days": attendance["medical_leave_days"], "not_applicable_days": attendance["not_applicable_days"],
+            "attendance_review": attendance["review"],
             "monthly_salary": float(base_monthly), "bank_name": profile.get("bank_name", ""), "bank_account_number": profile.get("bank_account_number", ""), "pan_card_number": profile.get("pan_card_number", ""), "salary_per_calendar_day": float((base_monthly / Decimal(days_in_month)).quantize(Decimal("0.01"))),
             "attendance_proration": float(attendance_proration), "overtime_amount": float(overtime_amount), "earnings": earnings, "deductions": deductions, "gross_earnings": float(gross),
             "total_deductions": float(total_deductions), "net_salary": float(net),
@@ -887,7 +928,7 @@ def get_my_payslip(record_id: str, authorization: str | None = Header(default=No
     allowed_fields = (
         "employee_id", "employee_name", "department", "designation", "period", "month", "year",
         "currency", "paid_days", "lop_days", "working_days", "present_days", "paid_leave_days",
-        "unpaid_leave_days", "absent_days", "holiday_days", "earnings", "deductions",
+        "unpaid_leave_days", "absent_days", "holiday_days", "weekly_off_days", "medical_leave_days", "not_applicable_days", "earnings", "deductions",
         "gross_earnings", "total_deductions", "net_salary", "payment_reference", "updated_at",
     )
     result = {key: row.get(key) for key in allowed_fields}
