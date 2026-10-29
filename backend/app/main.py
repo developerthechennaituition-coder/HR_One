@@ -87,7 +87,7 @@ async def protect_organization_routes(request: Request, call_next):
             and request.url.path.rstrip("/") == "/api/organization/me"
         )
         if role == "hr manager" and not profile_organization_read:
-            raise HTTPException(status_code=403, detail="HR Manager does not have access to Organization Setup.")
+            raise HTTPException(status_code=403, detail="HOD does not have access to Organization Setup.")
         allowed_read_roles = {"hr admin", "administrator", "manager", "employee"}
         if profile_organization_read:
             allowed_read_roles.update({"hr manager", "super admin"})

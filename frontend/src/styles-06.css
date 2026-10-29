@@ -194,6 +194,83 @@
   .payroll-payslip-modal > header { align-items: flex-start; padding: 12px; }
 }
 
+/* ---------- Payslip viewer (HTML payslip + optional PDF preview) ---------- */
+.payroll-payslip-modal { max-height: 100dvh; }
+.payroll-payslip-modal > header { flex-wrap: wrap; flex-shrink: 0; }
+.payslip-modal-title { min-width: 0; flex: 1 1 220px; }
+.payslip-modal-title h2 { overflow-wrap: break-word; }
+.payslip-modal-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.payslip-modal-actions .payroll-button { min-height: 40px; }
+.payslip-view-toggle { display: inline-flex; border: 1px solid #d0d5dd; border-radius: 8px; overflow: hidden; }
+.payslip-view-toggle button { border: 0; background: #fff; color: #344054; padding: 8px 14px; font-weight: 600; min-height: 40px; }
+.payslip-view-toggle button.active { background: #1d4ed8; color: #fff; }
+.payslip-pdf-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.payslip-pdf-canvas-pane { position: relative; flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; background: #f2f4f7; }
+.payslip-pdf-pages { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px; width: max-content; min-width: 100%; }
+.payslip-pdf-pages canvas { display: block; max-width: none; background: #fff; box-shadow: 0 1px 4px rgba(16, 24, 40, 0.18); }
+.payslip-pdf-zoom { position: sticky; bottom: 12px; left: 50%; transform: translateX(-50%); width: max-content; display: flex; align-items: center; gap: 4px; margin: 0 0 12px; padding: 4px; border-radius: 999px; background: rgba(16, 24, 40, 0.82); color: #fff; }
+.payslip-pdf-zoom button { width: 40px; height: 40px; border: 0; border-radius: 50%; background: transparent; color: #fff; font-size: 16px; }
+.payslip-pdf-zoom button:disabled { opacity: .4; }
+.payslip-pdf-zoom span { min-width: 48px; text-align: center; font-size: 13px; font-variant-numeric: tabular-nums; }
+.payslip-print-root { display: none; }
+.payslip-view-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; background: #f2f4f7; padding: 16px; }
+.payslip-screen-hidden { display: none; }
+.payslip-message { padding: 24px; text-align: center; color: #475467; }
+.payslip-message-error { color: #b42318; background: #fef3f2; border: 1px solid #fecdca; border-radius: 8px; margin-bottom: 12px; }
+.payslip-sheet { max-width: 880px; margin: 0 auto; background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 20px; color: #101828; }
+.payslip-sheet h4 { margin: 18px 0 8px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: #475467; }
+.payslip-sheet-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding-bottom: 14px; border-bottom: 2px solid #1d4ed8; }
+.payslip-sheet-head h3 { margin: 0; font-size: 20px; overflow-wrap: break-word; }
+.payslip-sheet-head p { margin: 4px 0 0; color: #475467; font-size: 13px; overflow-wrap: break-word; }
+.payslip-sheet-period { text-align: right; }
+.payslip-sheet-period span { display: block; font-size: 12px; color: #667085; }
+.payslip-sheet-period strong { font-size: 16px; }
+.payslip-net-card { margin-top: 16px; padding: 14px 16px; border-radius: 10px; background: #ecfdf3; border: 1px solid #abefc6; display: grid; gap: 2px; }
+.payslip-net-card span { font-size: 12px; color: #067647; text-transform: uppercase; letter-spacing: .04em; }
+.payslip-net-card strong { font-size: 24px; color: #054f31; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.payslip-net-card small { color: #344054; overflow-wrap: break-word; }
+.payslip-details, .payslip-attendance { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin: 0; }
+.payslip-attendance { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.payslip-details > div, .payslip-attendance > div { min-width: 0; padding: 8px 10px; border: 1px solid #eaecf0; border-radius: 8px; }
+.payslip-details dt, .payslip-attendance dt { font-size: 12px; font-weight: 500; color: #667085; }
+.payslip-details dd, .payslip-attendance dd { margin: 2px 0 0; font-weight: 600; overflow-wrap: anywhere; }
+.payslip-components { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 4px; }
+.payslip-component-card { min-width: 0; border: 1px solid #eaecf0; border-radius: 10px; padding: 0 12px 10px; }
+.payslip-component-card ul { list-style: none; margin: 0; padding: 0; }
+.payslip-component-card li, .payslip-component-total, .payslip-net-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.payslip-component-card li { padding: 7px 0; border-bottom: 1px dashed #eaecf0; }
+.payslip-component-card li > span:first-child { min-width: 0; overflow-wrap: break-word; }
+.payslip-component-total { padding-top: 8px; font-weight: 700; }
+.payslip-amount { white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
+.payslip-net-row { margin-top: 16px; padding: 12px 14px; border-radius: 10px; background: #eff4ff; font-size: 18px; font-weight: 700; flex-wrap: wrap; }
+.payslip-net-row small { display: block; font-size: 12px; font-weight: 400; color: #475467; }
+.payslip-footer { margin: 14px 0 0; text-align: center; font-size: 12px; color: #667085; }
+@media (max-width: 767.98px) {
+  .payslip-components { grid-template-columns: minmax(0, 1fr); }
+  .payslip-attendance { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 575.98px) {
+  .payslip-view-body { padding: 10px; }
+  .payslip-sheet { padding: 14px; border-radius: 10px; }
+  .payslip-details { grid-template-columns: minmax(0, 1fr); }
+  .payslip-sheet-period { text-align: left; }
+  /* Toggle on its own row, then Download / Print / Close side by side. */
+  .payslip-modal-actions { width: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .payslip-view-toggle { grid-column: 1 / -1; }
+  .payslip-view-toggle button { flex: 1 1 0; }
+  .payslip-modal-actions .payroll-button { min-width: 0; padding: 8px 6px; white-space: normal; }
+}
+/* Print the payslip copy rendered outside the app shell so it flows across as many pages as it needs. */
+@media print {
+  html, body { height: auto !important; overflow: visible !important; background: #fff !important; }
+  body > *:not(.payslip-print-root) { display: none !important; }
+  .payslip-print-root { display: block !important; }
+  .payslip-print-root .payslip-sheet { max-width: none; border: 0; border-radius: 0; padding: 0; }
+  .payslip-print-root .payslip-sheet-head, .payslip-print-root .payslip-net-card, .payslip-print-root .payslip-details > div,
+  .payslip-print-root .payslip-attendance > div, .payslip-print-root .payslip-component-card li, .payslip-print-root .payslip-net-row { break-inside: avoid; }
+  .payslip-print-root h4 { break-after: avoid; }
+}
+
 /* =========================================================
    Final responsive refinements
    Keep these overrides at the end so they take precedence

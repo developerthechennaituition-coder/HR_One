@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import PayslipViewer from "../components/PayslipViewer";
 
 import {
 
@@ -17,6 +18,8 @@ import {
   updatePayrollStatus,
 
   downloadPayslip,
+
+  getPayslipDetail,
 
   viewPayslip,
 
@@ -115,8 +118,6 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
   const [message, setMessage] = useState("");
 
-  const [previewUrl, setPreviewUrl] = useState("");
-
   const [previewRow, setPreviewRow] = useState(null);
 
   const [selectedEmployeeIds, setSelectedEmployeeIds] = useState([]);
@@ -125,7 +126,6 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
 
 
-  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl); }, [previewUrl]);
 
 
 
@@ -342,27 +342,16 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
 
 
-  async function handlePreviewPayslip(row) {
-
-    setBusy(true); setError("");
-
-    try {
-
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-
-      const url = await viewPayslip(row.payroll_record_id || row.id);
-
-      setPreviewUrl(url);
-
-      setPreviewRow(row);
-
-    } catch (requestError) {
-
-      setError(requestError.message || "Unable to preview payslip.");
-
-    } finally { setBusy(false); }
-
+  function handlePreviewPayslip(row) {
+    setError("");
+    setPreviewRow(row);
   }
+
+  // Stable callbacks for the payslip viewer (HR Admin-only endpoints).
+  const previewRecordId = previewRow ? previewRow.payroll_record_id || previewRow.id : "";
+  const loadPreviewDetail = useCallback(() => getPayslipDetail(previewRecordId), [previewRecordId]);
+  const loadPreviewPdf = useCallback(() => viewPayslip(previewRecordId), [previewRecordId]);
+  const closePreview = useCallback(() => setPreviewRow(null), []);
 
 
 
@@ -506,17 +495,16 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
 
 
 
-      {previewUrl && previewRow && <div className="payroll-modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) { URL.revokeObjectURL(previewUrl); setPreviewUrl(""); setPreviewRow(null); } }}>
-
-        <section className="payroll-payslip-modal" role="dialog" aria-modal="true" aria-label={`Payslip ${previewRow.period}`}>
-
-          <header><div><h2><Icon name="file-earmark-pdf" /> Payslip — {previewRow.period}</h2><p>{previewRow.employee_name || previewRow.employee_id}</p></div><button type="button" className="payroll-button payroll-button-outline" onClick={() => { URL.revokeObjectURL(previewUrl); setPreviewUrl(""); setPreviewRow(null); }}><Icon name="x-lg" /> Close</button></header>
-
-          <iframe title={`Payslip PDF ${previewRow.period}`} src={previewUrl} />
-
-        </section>
-
-      </div>}
+      {previewRow && (
+        <PayslipViewer
+          period={previewRow.period}
+          subtitle={`${previewRow.employee_name || ""} · ${previewRow.employee_id}`}
+          loadDetail={loadPreviewDetail}
+          loadPdfUrl={loadPreviewPdf}
+          onDownload={() => downloadPayslip(previewRecordId, previewRow.employee_name, previewRow.employee_id, previewRow.period)}
+          onClose={closePreview}
+        />
+      )}
 
       {reviewRow && <div className="payroll-modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setReviewRow(null); }}>
         <section className="payroll-review-modal" role="dialog" aria-modal="true" aria-label={`Review payroll for ${reviewRow.employee_name || reviewRow.employee_id}`}>

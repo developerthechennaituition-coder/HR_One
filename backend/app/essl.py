@@ -28,6 +28,7 @@ from app.attendance import (
     attendance_collection,
     company_now,
     company_today,
+    employee_joining_date,
     users_collection,
 )
 from app.db.mongodb import db
@@ -502,6 +503,21 @@ def _store_issue(
         },
         upsert=True,
     )
+
+
+def _before_joining_reason(
+    user: dict[str, Any],
+    attendance_date: str,
+    cache: dict[str, date | None],
+) -> str | None:
+    """Issue text when a punch predates the mapped employee's own joining date."""
+    user_id = str(user["_id"])
+    if user_id not in cache:
+        cache[user_id] = employee_joining_date(user)
+    joining = cache[user_id]
+    if joining and attendance_date < joining.isoformat():
+        return f"Punch is dated before the employee's joining date ({joining.isoformat()}); attendance was not recorded."
+    return None
 
 
 def _resolve_punch_issue(
@@ -1098,6 +1114,8 @@ async def import_essl_attendance_file(
     users_by_id: dict[str, dict[str, Any]] = {}
     unmatched: set[str] = set()
     duplicate_in_file = 0
+    skipped_before_joining = 0
+    joining_cache: dict[str, date | None] = {}
     seen: set[tuple[str, datetime]] = set()
     for punch in punches:
         normalized = _normalise_employee_id(punch["essl_employee_id"])
@@ -1111,6 +1129,20 @@ async def import_essl_attendance_file(
                 None,
                 None,
                 "No HRMS employee is mapped to this ESSL employee ID.",
+                now,
+                import_id=import_id,
+            )
+            continue
+        joining_reason = _before_joining_reason(user, punch["punch_at"].date().isoformat(), joining_cache)
+        if joining_reason:
+            skipped_before_joining += 1
+            _store_issue(
+                sync_id,
+                punch["essl_employee_id"],
+                punch["punch_at"].isoformat(),
+                None,
+                None,
+                joining_reason,
                 now,
                 import_id=import_id,
             )
@@ -1207,6 +1239,7 @@ async def import_essl_attendance_file(
         "duplicate_punches_in_file": duplicate_in_file,
         "invalid_punch_values": invalid_values,
         "unmatched_employee_ids": sorted(unmatched),
+        "punches_skipped_before_joining": skipped_before_joining,
         "attendance_records_created": created,
         "attendance_records_updated": updated,
         "attendance_records_unchanged": unchanged,
@@ -1568,6 +1601,8 @@ def synchronize_essl_attendance(
     processed_punches = 0
     unmatched_employee_ids: set[str] = set()
     invalid_records = 0
+    skipped_before_joining = 0
+    joining_cache: dict[str, date | None] = {}
     for item in records:
         if not isinstance(item, dict):
             invalid_records += 1
@@ -1636,6 +1671,19 @@ def synchronize_essl_attendance(
                 now,
             )
             continue
+        joining_reason = _before_joining_reason(user, attendance_date, joining_cache)
+        if joining_reason:
+            skipped_before_joining += 1
+            _store_issue(
+                sync_id,
+                raw_employee_id,
+                raw_timestamp,
+                raw_punch_id,
+                raw_device_id,
+                joining_reason,
+                now,
+            )
+            continue
         processed_punches += 1
         _resolve_punch_issue(
             sync_id,
@@ -1693,6 +1741,7 @@ def synchronize_essl_attendance(
         "attendance_records_updated": updated,
         "unmatched_employees": len(unmatched_employee_ids),
         "invalid_records": invalid_records,
+        "punches_skipped_before_joining": skipped_before_joining,
         "attendance_records_protected": protected,
         "from_date": payload.from_date.isoformat(),
         "to_date": payload.to_date.isoformat(),

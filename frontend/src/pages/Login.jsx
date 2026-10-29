@@ -1,5 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useState } from "react";
+import AuthLayout, { AuthAlert } from "../components/AuthLayout";
 
 // FastAPI owns authentication; this component owns form and session UI state.
 
@@ -9,6 +10,13 @@ const API_BASE_URL = (
 
 const API_URL = `${API_BASE_URL}/api/auth/login`;
 
+const greeting = () => {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Good evening";
+};
+
 
 function Login({ onLogin }) {
   const [formValues, setFormValues] = useState({
@@ -16,6 +24,7 @@ function Login({ onLogin }) {
     password: "",
   });
   const [showPassword, setShowPassword] = useState(false);
+  const [capsLockOn, setCapsLockOn] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
 
@@ -46,92 +55,106 @@ function Login({ onLogin }) {
     }
   };
 
+  const trackCapsLock = (event) => {
+    setCapsLockOn(Boolean(event.getModifierState?.("CapsLock")));
+  };
+
   return (
-    <main className="login-page">
-      <section
-        className="login-card card border-0 shadow-sm"
-        aria-labelledby="login-title"
-      >
-        <div className="card-body p-4 p-md-5">
-          <div className="login-brand">HRMS</div>
-          <h1 id="login-title">Welcome back</h1>
-          <p className="text-muted mb-4">
-            Sign in to continue to your workspace.
-          </p>
-          {error && (
-            <div className="alert alert-danger" role="alert">
-              {error}
-            </div>
-          )}
-          <form onSubmit={handleSubmit}>
-            <div className="mb-3">
-              <label htmlFor="login-identifier" className="form-label">
-                Work Email or Employee ID
-              </label>
-              <input
-                id="login-identifier"
-                type="text"
-                className="form-control"
-                autoComplete="username"
-                required
-                value={formValues.identifier}
-                onChange={(event) =>
-                  setFormValues({
-                    ...formValues,
-                    identifier: event.target.value,
-                  })
-                }
-              />
-            </div>
-            <div className="mb-3">
-              <label htmlFor="login-password" className="form-label">
-                Password
-              </label>
-              <div className="input-group">
-                <input
-                  id="login-password"
-                  type={showPassword ? "text" : "password"}
-                  className="form-control"
-                  autoComplete="current-password"
-                  required
-                  value={formValues.password}
-                  onChange={(event) =>
-                    setFormValues({
-                      ...formValues,
-                      password: event.target.value,
-                    })
-                  }
-                />
-                <button
-                  type="button"
-                  className="btn btn-outline-secondary"
-                  onClick={() => setShowPassword(!showPassword)}
-                  aria-label={showPassword ? "Hide password" : "Show password"}
-                >
-                  {showPassword ? "Hide" : "Show"}
-                </button>
-              </div>
-            </div>
-            <div className="d-flex justify-content-end mb-4">
-              <button
-                type="button"
-                className="btn btn-link btn-sm p-0"
-                onClick={() => {window.location.href = "/forgot-password"}}
-              >
-                Forgot Password?
-              </button>
-            </div>
-            <button
-              type="submit"
-              className="btn btn-primary w-100"
-              disabled={isSubmitting}
-            >
-              {isSubmitting ? "Signing in..." : "Sign In"}
-            </button>
-          </form>
+    <AuthLayout
+      icon="bi-hand-thumbs-up"
+      title={`${greeting()}!`}
+      subtitle="Sign in to continue to your HRMS workspace."
+      footer={
+        <>
+          <i className="bi bi-headset" /> Trouble signing in? Contact your HR administrator.
+        </>
+      }
+    >
+      <AuthAlert type="error">{error}</AuthAlert>
+
+      <form className="auth-form" onSubmit={handleSubmit}>
+        <div className="auth-field">
+          <label htmlFor="login-identifier">Work Email or Employee ID</label>
+          <div className="auth-input">
+            <i className="bi bi-person-badge auth-input-icon" />
+            <input
+              id="login-identifier"
+              type="text"
+              placeholder="name@company.com or EMP001"
+              autoComplete="username"
+              required
+              autoFocus
+              value={formValues.identifier}
+              onChange={(event) =>
+                setFormValues({
+                  ...formValues,
+                  identifier: event.target.value,
+                })
+              }
+            />
+          </div>
         </div>
-      </section>
-    </main>
+
+        <div className="auth-field">
+          <div className="auth-label-row">
+            <label htmlFor="login-password">Password</label>
+            <button
+              type="button"
+              className="auth-link"
+              onClick={() => {window.location.href = "/forgot-password"}}
+            >
+              Forgot password?
+            </button>
+          </div>
+          <div className="auth-input">
+            <i className="bi bi-lock auth-input-icon" />
+            <input
+              id="login-password"
+              type={showPassword ? "text" : "password"}
+              placeholder="Enter your password"
+              autoComplete="current-password"
+              required
+              value={formValues.password}
+              onKeyUp={trackCapsLock}
+              onKeyDown={trackCapsLock}
+              onBlur={() => setCapsLockOn(false)}
+              onChange={(event) =>
+                setFormValues({
+                  ...formValues,
+                  password: event.target.value,
+                })
+              }
+            />
+            <button
+              type="button"
+              className="auth-eye"
+              onClick={() => setShowPassword(!showPassword)}
+              aria-label={showPassword ? "Hide password" : "Show password"}
+            >
+              <i className={`bi ${showPassword ? "bi-eye-slash" : "bi-eye"}`} />
+            </button>
+          </div>
+          {capsLockOn && (
+            <small className="auth-hint auth-hint-warn">
+              <i className="bi bi-capslock-fill" /> Caps Lock is on
+            </small>
+          )}
+        </div>
+
+        <button type="submit" className="auth-submit" disabled={isSubmitting}>
+          {isSubmitting ? (
+            <>
+              <span className="spinner-border spinner-border-sm" aria-hidden="true" />
+              Signing in...
+            </>
+          ) : (
+            <>
+              Sign In <i className="bi bi-arrow-right" />
+            </>
+          )}
+        </button>
+      </form>
+    </AuthLayout>
   );
 }
 

@@ -6,6 +6,7 @@ import {
 } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
+import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
 
 const API_URL =
   HRONE_API_BASE + "/api/reporting-manager";
@@ -207,6 +208,10 @@ function TeamMemberDetails({
   const [memberHolidays, setMemberHolidays] =
     useState([]);
 
+  // Pending/approved permissions of this member for the month.
+  const [memberPermissions, setMemberPermissions] =
+    useState([]);
+
   const [selectedYear, setSelectedYear] =
     useState(currentYear);
 
@@ -231,6 +236,44 @@ function TeamMemberDetails({
     attendanceError,
     setAttendanceError,
   ] = useState("");
+
+  /* ==========================================================
+     CALENDAR RANGE
+     The selected team member's own joining date through
+     today + 89 days; future dates are view-only.
+  ========================================================== */
+
+  const calendarRange = useMemo(
+    () =>
+      buildCalendarRange(
+        member?.joining_date || member?.date_of_joining,
+        todayInIndia.key
+      ),
+    [member?.joining_date, member?.date_of_joining, todayInIndia.key]
+  );
+
+  const changeCalendarMonth = (year, month) => {
+    const target = clampMonth(calendarRange, year, month);
+    setSelectedYear(target.year);
+    setSelectedMonth(target.month);
+    setSelectedDate(null);
+  };
+
+  const selectCalendarDate = (dateString) => {
+    if (isSelectableDate(calendarRange, dateString)) {
+      setSelectedDate(dateString);
+    }
+  };
+
+  // Reset to a valid month when the member (and joining date) changes.
+  useEffect(() => {
+    if (!isMonthInRange(calendarRange, selectedYear, selectedMonth)) {
+      const target = clampMonth(calendarRange, selectedYear, selectedMonth);
+      setSelectedYear(target.year);
+      setSelectedMonth(target.month);
+      setSelectedDate(null);
+    }
+  }, [calendarRange, selectedYear, selectedMonth]);
 
   /* ==========================================================
      MONTH NAMES
@@ -500,6 +543,11 @@ function TeamMemberDetails({
               ? data.holidays
               : []
           );
+          setMemberPermissions(
+            Array.isArray(data?.permissions)
+              ? data.permissions
+              : []
+          );
         }
       } catch (err) {
         console.error(
@@ -511,6 +559,7 @@ function TeamMemberDetails({
           setAttendance([]);
           setApprovedLeaves([]);
           setMemberHolidays([]);
+          setMemberPermissions([]);
           setAttendanceError(
             err?.message ||
               "Unable to load attendance."
@@ -591,6 +640,15 @@ function TeamMemberDetails({
 
     return map;
   }, [approvedLeaves]);
+
+  const permissionsByDate = useMemo(() => {
+    const map = {};
+    memberPermissions.forEach((item) => {
+      const key = normalizeDate(item?.permission_date);
+      if (key) (map[key] = map[key] || []).push(item);
+    });
+    return map;
+  }, [memberPermissions]);
 
   /* ==========================================================
      DAYS IN MONTH
@@ -759,13 +817,17 @@ function TeamMemberDetails({
       day <= daysInMonth;
       day++
     ) {
-      result.push(
-        `${selectedYear}-${String(
-          selectedMonth
-        ).padStart(2, "0")}-${String(
-          day
-        ).padStart(2, "0")}`
-      );
+      const dateKey = `${selectedYear}-${String(
+        selectedMonth
+      ).padStart(2, "0")}-${String(
+        day
+      ).padStart(2, "0")}`;
+
+      // Dates before joining or beyond the calendar window are not counted.
+      const state = dateState(calendarRange, dateKey);
+      if (!state.hidden && !state.afterWindow) {
+        result.push(dateKey);
+      }
     }
 
     return result;
@@ -773,6 +835,7 @@ function TeamMemberDetails({
     selectedYear,
     selectedMonth,
     daysInMonth,
+    calendarRange,
   ]);
 
   /* ==========================================================
@@ -871,10 +934,24 @@ function TeamMemberDetails({
     const dateString =
       getDateKey(day);
 
-    const record =
-      getAttendanceForDate(
-        dateString
+    const state = dateState(
+      calendarRange,
+      dateString
+    );
+
+    // Before joining: keep the grid cell empty.
+    if (state.hidden) {
+      return (
+        <div className="team-calendar-empty-cell" />
       );
+    }
+
+    // After the 90th day the date is shown without holiday/leave details.
+    const record = state.afterWindow
+      ? null
+      : getAttendanceForDate(
+          dateString
+        );
 
     const statusKey =
       getStatusKey(record);
@@ -908,10 +985,12 @@ function TeamMemberDetails({
         type="button"
         className="team-attendance-day"
         onClick={() =>
-          setSelectedDate(
+          selectCalendarDate(
             dateString
           )
         }
+        disabled={state.isFuture}
+        title={state.isFuture ? "Upcoming date · view only" : undefined}
         style={{
           position: "relative",
           backgroundColor:
@@ -922,13 +1001,20 @@ function TeamMemberDetails({
 
           border: isSelected
             ? "2px solid #0d6efd"
-            : "1px solid rgba(0,0,0,0.12)",
+            : state.isFuture
+              ? "1px dashed rgba(0,0,0,0.25)"
+              : "1px solid rgba(0,0,0,0.12)",
+
+          opacity: state.isFuture ? 0.8 : 1,
+
+          cursor: state.isFuture ? "not-allowed" : "pointer",
         }}
         aria-label={`${dateString} ${
+          getCalendarLabel(record) ||
           record?.status ||
           record?.attendance_status ||
           "Not Marked"
-        }`}
+        }${state.isFuture ? " (upcoming, not selectable)" : ""}`}
       >
         <span className="team-calendar-weekday">
           {shortDay}
@@ -958,6 +1044,13 @@ function TeamMemberDetails({
         {getCalendarLabel(record) && (
           <span className="team-calendar-status">
             {getCalendarLabel(record)}
+          </span>
+        )}
+
+        {(permissionsByDate[dateString] || []).length > 0 && (
+          <span className="team-calendar-status" style={{ fontWeight: 700 }}>
+            P {permissionsByDate[dateString][0].start_time}–{permissionsByDate[dateString][0].end_time}
+            {permissionsByDate[dateString].length > 1 ? ` +${permissionsByDate[dateString].length - 1}` : ""}
           </span>
         )}
       </button>
@@ -1769,31 +1862,30 @@ function TeamMemberDetails({
           </div>
             <div className="team-attendance-filters">
 
+              {/* Joining month/year through the 90-day window only. */}
               <select
                 className="form-select"
+                aria-label="Month"
                 value={selectedMonth}
                 onChange={(event) => {
-                  setSelectedMonth(
+                  changeCalendarMonth(
+                    selectedYear,
                     Number(
                       event.target.value
                     )
                   );
-
-                  setSelectedDate(
-                    null
-                  );
                 }}
               >
-                {monthNames.map(
-                  (
-                    month,
-                    index
-                  ) => (
+                {monthOptions(
+                  calendarRange,
+                  selectedYear
+                ).map(
+                  (item) => (
                     <option
-                      key={month}
-                      value={index + 1}
+                      key={item.value}
+                      value={item.value}
                     >
-                      {month}
+                      {item.label}
                     </option>
                   )
                 )}
@@ -1801,40 +1893,28 @@ function TeamMemberDetails({
 
               <select
                 className="form-select"
+                aria-label="Year"
                 value={selectedYear}
                 onChange={(event) => {
-                  setSelectedYear(
+                  changeCalendarMonth(
                     Number(
                       event.target.value
-                    )
-                  );
-
-                  setSelectedDate(
-                    null
+                    ),
+                    selectedMonth
                   );
                 }}
               >
-                {[
-                  0,
-                  1,
-                  2,
-                  3,
-                  4,
-                ].map(
-                  (offset) => {
-                    const year =
-                      currentYear -
-                      offset;
-
-                    return (
-                      <option
-                        key={year}
-                        value={year}
-                      >
-                        {year}
-                      </option>
-                    );
-                  }
+                {yearOptions(
+                  calendarRange
+                ).map(
+                  (year) => (
+                    <option
+                      key={year}
+                      value={year}
+                    >
+                      {year}
+                    </option>
+                  )
                 )}
               </select>
             </div>
@@ -2233,6 +2313,20 @@ function TeamMemberDetails({
               </div>
             )}
 
+            {(permissionsByDate[selectedDate] || []).length > 0 && (
+              <div className="team-selected-info mt-3">
+                <span>
+                  Permission
+                </span>
+
+                {permissionsByDate[selectedDate].map((item, index) => (
+                  <strong className="d-block" key={`${item.start_time}-${index}`}>
+                    {item.start_time} – {item.end_time} ({item.status === "approved" ? "Approved" : "Pending"})
+                  </strong>
+                ))}
+              </div>
+            )}
+
           </div>
         )}
 
@@ -2242,7 +2336,8 @@ function TeamMemberDetails({
             userId={memberId}
             title="Team member · working time and breaks"
             date={selectedDate || undefined}
-            onDateChange={setSelectedDate}
+            minDate={minSelectableDate(calendarRange)}
+            onDateChange={selectCalendarDate}
           />
 
           {/* Attendance error */}

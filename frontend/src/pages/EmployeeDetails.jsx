@@ -325,6 +325,13 @@ function TextAreaField({
    SELECT FIELD
 ========================================================= */
 
+const EMPTY_LEAVE_APPROVERS = {
+  hod_id: "",
+  hr_admin_id: "",
+  hod: null,
+  hr_admin: null,
+};
+
 function SelectField({
   label,
   value,
@@ -390,6 +397,10 @@ export default function EmployeeDetails({
 
   const [managerOptions, setManagerOptions] =
     useState([]);
+
+  // Leave approvers assigned by HR Admin (stable user IDs + display summary).
+  const [leaveApprovers, setLeaveApprovers] =
+    useState(EMPTY_LEAVE_APPROVERS);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -567,14 +578,22 @@ export default function EmployeeDetails({
           setReportingManager(
             managerData?.manager ||
               managerData?.reporting_manager ||
-              managerData ||
               null
           );
+
+          setLeaveApprovers({
+            hod_id: managerData?.hod_id || "",
+            hr_admin_id: managerData?.hr_admin_id || "",
+            hod: managerData?.hod || null,
+            hr_admin: managerData?.hr_admin || null,
+          });
         } else {
           setReportingManager(null);
+          setLeaveApprovers(EMPTY_LEAVE_APPROVERS);
         }
       } catch {
         setReportingManager(null);
+        setLeaveApprovers(EMPTY_LEAVE_APPROVERS);
       }
     } catch (err) {
       console.error(
@@ -715,6 +734,19 @@ export default function EmployeeDetails({
           }
         : null
     );
+  }
+
+  /* =========================================================
+     HOD / HR ADMIN CHANGE
+  ========================================================= */
+
+  function handleLeaveApproverChange(event) {
+    const { name, value } = event.target;
+
+    setLeaveApprovers((previous) => ({
+      ...previous,
+      [name]: value,
+    }));
   }
 
   /* =========================================================
@@ -966,13 +998,17 @@ export default function EmployeeDetails({
           body: JSON.stringify({
             reporting_manager_id:
               managerId,
+            hod_id:
+              leaveApprovers.hod_id || null,
+            hr_admin_id:
+              leaveApprovers.hr_admin_id || null,
           }),
         }
       );
 
     if (!response.ok) {
       let message =
-        "Reporting manager could not be updated.";
+        "Reporting Manager, HOD or HR Admin assignment could not be updated.";
 
       try {
         const errorData =
@@ -1207,6 +1243,36 @@ export default function EmployeeDetails({
           "Employee",
       }));
 
+  // HOD keeps the stored role "HR Manager"; the backend re-validates both roles.
+  const approverOptionsForRole = (role) =>
+    managerOptions
+      .filter((item) => {
+        const id = item?.id || item?._id || item?.user_id;
+
+        return (
+          item?.is_active !== false &&
+          String(item?.role || "").trim().toLowerCase() === role &&
+          String(id) !== String(employee?.id || userId)
+        );
+      })
+      .map((item) => ({
+        value: item?.id || item?._id || item?.user_id,
+        label: [item?.name, item?.employee_id && `(${item.employee_id})`]
+          .filter(Boolean)
+          .join(" ") || item?.work_email || "Employee",
+      }));
+
+  const hodSelectOptions = approverOptionsForRole("hr manager");
+
+  const hrAdminSelectOptions = approverOptionsForRole("hr admin");
+
+  const approverSummary = (person) =>
+    person
+      ? [person.name, person.employee_id && `(${person.employee_id})`]
+          .filter(Boolean)
+          .join(" ")
+      : "";
+
   const roleOptions = [
     {
       value: "HR Admin",
@@ -1218,7 +1284,7 @@ export default function EmployeeDetails({
     },
     {
       value: "HR Manager",
-      label: "HR Manager",
+      label: "HOD",
     },
     {
       value: "Employee",
@@ -1755,6 +1821,77 @@ export default function EmployeeDetails({
                       reportingManager?.phone,]
                       .filter(Boolean)
                       .join(" ")
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+        </div>
+      </section>
+
+      {/* =====================================================
+          LEAVE APPROVERS (HOD / HR ADMIN)
+      ===================================================== */}
+
+      <section className="employee-details-section">
+
+        <div className="employee-details-section-header">
+          <div>
+            <h3>
+              Leave Approvers
+            </h3>
+
+            <p>
+              HOD and HR Admin who approve this employee's leave, assigned by HR Admin
+            </p>
+          </div>
+        </div>
+
+        <div className="employee-details-grid">
+
+          {isEditing ? (
+            <>
+              <SelectField
+                label="HOD"
+                name="hod_id"
+                value={leaveApprovers.hod_id}
+                options={hodSelectOptions}
+                editing={true}
+                onChange={handleLeaveApproverChange}
+              />
+
+              <SelectField
+                label="HR Admin"
+                name="hr_admin_id"
+                value={leaveApprovers.hr_admin_id}
+                options={hrAdminSelectOptions}
+                editing={true}
+                onChange={handleLeaveApproverChange}
+              />
+            </>
+          ) : (
+            <>
+              <div className="employee-details-field">
+                <label className="employee-details-label">
+                  HOD
+                </label>
+
+                <div className="employee-details-value">
+                  {getDisplayValue(
+                    approverSummary(leaveApprovers.hod)
+                  )}
+                </div>
+              </div>
+
+              <div className="employee-details-field">
+                <label className="employee-details-label">
+                  HR Admin
+                </label>
+
+                <div className="employee-details-value">
+                  {getDisplayValue(
+                    approverSummary(leaveApprovers.hr_admin)
                   )}
                 </div>
               </div>

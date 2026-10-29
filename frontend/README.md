@@ -1,6 +1,6 @@
 # HRMS Frontend
 
-The HRMS frontend is a React single-page application for employee, attendance, attendance-request, leave, holiday-calendar, organization, notification, and payroll workflows. It communicates with the Python FastAPI backend over HTTP(S).
+The HRMS frontend is a React single-page application for employee, attendance, attendance-request, leave and permission, holiday-calendar, organization, notification, and payroll workflows. It communicates with the Python FastAPI backend over HTTP(S). Roles, approval routing and date rules are described in the root [`README.md`](../README.md#roles-and-approval-hierarchy).
 
 ## Contents
 
@@ -24,6 +24,7 @@ The HRMS frontend is a React single-page application for employee, attendance, a
 - Bootstrap 5 and Bootstrap Icons
 - `libphonenumber-js` for phone-number utilities
 - `qrcode.react` for QR-code rendering
+- `pdfjs-dist` for rendering payslip PDFs on phones and tablets
 - Oxlint for linting
 
 Dependency versions are defined in `package.json` and `package-lock.json`. Use `npm ci` for a reproducible installation.
@@ -52,17 +53,21 @@ frontend/
     ├── logout.js
     ├── config/
     │   └── api.js             # shared API base URL
+    ├── assets/
+    │   └── notification.wav           # notification sound
     ├── components/
     │   ├── Header.jsx
     │   ├── MainLayout.jsx
     │   ├── Sidebar.jsx
-    │   ├── NotificationBell.jsx
+    │   ├── AuthLayout.jsx               # shared sign-in / password-recovery layout
+    │   ├── NotificationBell.jsx         # unread count + notification sound
     │   ├── NotificationPanel.jsx
-    │   ├── AttendanceDayBreakdown.jsx   # daily working time and breaks
-    │   ├── MyAttendanceCalendar.jsx     # monthly attendance calendar (My Attendance)
+    │   ├── AttendanceDayBreakdown.jsx   # daily working time, breaks, status and permissions
+    │   ├── MyAttendanceCalendar.jsx     # Monthly Attendance Calendar (My Attendance, Employee Attendance)
     │   ├── MyAttendanceRequests.jsx     # employee attendance request dialog + history
     │   ├── AttendanceRequestInbox.jsx   # HR Admin per-date review/response
     │   ├── MyHolidayCalendar.jsx        # employee's religion + company holidays
+    │   ├── PayslipViewer.jsx            # on-screen payslip (browser PDF viewer / PDF.js on mobile)
     │   └── EsslAdminSettings.jsx
     ├── pages/
     │   ├── AccessDenied.jsx
@@ -95,10 +100,12 @@ frontend/
     │   ├── WfhAttendance.jsx
     │   └── WfhEmailVerification.jsx
     └── services/
-        ├── attendanceRequestApi.js   # attendance request API + date/time formatters
+        ├── attendanceCalendarRange.js # shared calendar date rules (joining date, 90-day window)
+        ├── attendanceRequestApi.js   # attendance request + calendar API, date/time formatters
         ├── authenticatedFetch.js
         ├── notificationApi.js
         ├── payrollApi.js
+        ├── roleLabels.js             # role display names ("HR Manager" shown as "HOD")
         └── weeklyOff.js              # HR-configured weekly-off days hook
 ```
 
@@ -190,47 +197,55 @@ npm run lint
 npm run build
 ```
 
+`npm run lint` currently exits successfully with warnings (mostly React hook dependency hints); there are no lint errors.
+
 ## Application areas
 
 ### Authentication and account management
 - Login and session handling.
+- Shared `AuthLayout` for Login, Forgot Password, Verify OTP and Reset Password: product showcase panel (hidden on narrow screens), Identify → Verify → Reset step indicator, six-box OTP entry with paste support and countdown ring, password strength meter and checklist, Caps Lock warning.
 - Account activation.
-- Forgot password, reset OTP verification, and password reset.
 - Change password.
 - Profile and access-denied screen.
 
 ### Dashboard and layout
 - Dashboard.
 - Shared header, sidebar, main layout, and logout handling.
-- Role-aware navigation.
+- Role-aware navigation. Role names are shown through `roleLabel()`, so the stored `HR Manager` role appears as **HOD**.
 
 ### Company, organization, and employees
 - Company setup.
 - Organization setup.
-- Holiday calendar setup: religion + year selection (from employee records; current/next year only), draft → publish, add/edit/delete holidays with in-page confirmation and reason dialogs.
+- Holiday calendar setup: religion + year selection (from employee records; current/next year only), draft → publish, add/edit/delete holidays with in-page confirmation and reason dialogs. Publish and edit times are shown in India time.
 - Employee holiday calendar on Profile: own religion's published holidays plus company holidays, year switch, list and calendar views.
-- Employee master and employee details.
-- User management.
+- Employee master and employee details. Employee Details includes the **Reporting Manager** and **Leave Approvers** (HOD and HR Admin) sections; dropdowns list only eligible accounts and HR Admin saves them.
+- User management (role dropdown shows HOD and saves `HR Manager`).
 - Reporting-manager team list and team-member details, including the member's monthly attendance calendar and daily working time.
 
 ### Attendance and WFH
-- Attendance overview.
-- Monthly attendance calendar: colour-coded Present, Absent, Holiday (name), Leave (CL/ML), Weekly Off, Not Applicable; clicking a date loads that day's working time and breaks (My Attendance, Profile, Team Member Details).
+- Attendance overview (manual attendance blocks employees whose joining date is after the selected date).
+- Monthly Attendance Calendar (`MyAttendanceCalendar`) on My Attendance and the HR Admin Employee Attendance page; Profile and Team Member Details use their own calendars with the same rules:
+  - colour-coded Present, Absent, Holiday (name), Leave (CL/ML), Weekly Off, Not Applicable;
+  - range from the joining date to today + 89 days; the 90th day's month is shown in full, with holidays/leave/permissions only up to the 90th day; months before joining are not offered;
+  - today and past dates load the day's working time and breaks; future dates are view-only, and upcoming holiday, leave and permission dates open a read-only details panel;
+  - permissions are shown on the day cell as `P HH:MM–HH:MM` and in the details.
 - Attendance requests: employees pick past dates by status, choose an allowed new status (Present with times, Absent, Holiday, Weekly Off, Medical Leave); HR Admin responds per date from the inbox or a notification. Dates show the weekday.
-- Employee attendance and individual user attendance.
+- Employee attendance (HR Admin) with summary cards, monthly details table and Excel export (current and past months).
 - WFH attendance.
 - WFH admin settings.
 - WFH email verification.
-- ESSL setup and ESSL admin settings.
+- ESSL setup and ESSL admin settings (import/sync summaries include punches skipped before the joining date).
 - Attendance-day breakdown component.
 
 ### Leave, notifications, and payroll
-- Leave and permission workflows, HR weekly-off configuration and Medical Leave (`ML`, 1 day/month after 4 Weekly Offs).
-- Notification bell and panel.
+- Leave: apply for today up to day 90 (today + 89); the form previews the working-day count and the approver (Reporting Manager, HOD or HR Admin) and shows a clear error when an approver is missing. Approval Queue lists only requests assigned to the signed-in approver.
+- Permission: apply for today up to today + 14; requests go to the Reporting Manager, who approves or rejects them in the Permission Approval Queue.
+- HR weekly-off configuration and Medical Leave (`ML`, 1 day/month after 4 Weekly Offs).
+- Notification bell and panel. The sound is loaded once as an in-memory blob and unlocked on the first click/key press.
 - Notification management.
 - Employee salary setup.
 - Payroll workspace (Weekly Off, Medical Leave and Not Applicable/LOP columns; outdated-payroll badge).
-- Employee payslips.
+- Employee payslips with on-screen viewer and PDF download.
 
 The frontend is the user interface, not the source of truth for permissions. Backend APIs must validate the current session and the user's role for protected operations.
 
@@ -240,7 +255,9 @@ The frontend is the user interface, not the source of truth for permissions. Bac
 - `src/services/authenticatedFetch.js` provides the shared authenticated request helper used by API consumers.
 - `src/services/notificationApi.js` contains notification-related API calls.
 - `src/services/payrollApi.js` contains payroll-related API calls.
-- `src/services/attendanceRequestApi.js` contains attendance-request calls and shared date/time formatting.
+- `src/services/attendanceRequestApi.js` contains attendance-request and calendar calls (`getAttendanceCalendar`, `getEmployeeAttendanceCalendar` for HR Admin) and shared date/time formatting.
+- `src/services/attendanceCalendarRange.js` holds the shared calendar rules: company "today" (Asia/Kolkata), `buildCalendarRange(joiningDate)`, month/year options, and `dateState()` (before joining, after the 90-day window, future, selectable).
+- `src/services/roleLabels.js` maps stored role values to display names.
 - `src/services/weeklyOff.js` reads the HR-configured weekly-off days.
 - `src/auth.js` includes session-reading and user-management role helpers.
 
@@ -281,6 +298,8 @@ Before deploying:
 - Preserve accessible labels, keyboard navigation, responsive layouts, and clear loading/empty/error states.
 - Responsive rules live in `src/index.css`: tables inside `.table-responsive` keep natural widths and scroll; dialogs use `modal-fullscreen-md-down` or in-page modals instead of `window.prompt`/`confirm`. Check pages at 320, 375, 430, 768, 1024 and 1440px.
 - Avoid introducing a second API base URL or duplicate authentication implementation.
+- Use `roleLabel()` whenever a role is displayed; compare stored role values (for example `"hr manager"`) in logic, never the display label.
+- Use `attendanceCalendarRange.js` for calendar date limits and India-time "today" instead of `new Date().toISOString()` (which is UTC). The backend enforces the same limits.
 - Keep role-based UI aligned with backend permissions, but never rely on frontend checks alone.
 - Do not hardcode server IP addresses, credentials, tokens, or environment-specific values.
 - When changing dependencies, update `package.json` and `package-lock.json` together.
@@ -295,6 +314,8 @@ Before deploying:
 | Port `5173` is already in use | Stop the process using the port or update the Vite config intentionally; `strictPort` prevents automatic port changes. |
 | API/network errors | Confirm the backend is running, API base URL is correct, and CORS permits the frontend origin. Inspect browser Network/Console details. |
 | Login works but a page is forbidden | Check the signed-in role and backend authorization. Client navigation rules do not grant API access. |
+| Leave form says no HOD / HR Admin is assigned | HR Admin must set the employee's Leave Approvers in Employee Details. |
+| Chrome Issues panel lists form-field id/name or label warnings | These are accessibility/autofill suggestions, not errors; they do not affect behaviour. |
 | Camera/geolocation does not work | Use localhost or HTTPS, grant browser permissions, and test with the intended hostname/IP. |
 | HTTPS certificate error | Use a trusted certificate containing the exact hostname/IP and ensure both certificate files are present. |
 | Lint/build fails | Run `npm ci`, then inspect the first meaningful error from `npm run lint` or `npm run build`. |

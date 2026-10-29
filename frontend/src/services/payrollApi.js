@@ -36,6 +36,9 @@ export const getAttendanceSummary = (month, year) =>
   request(`/attendance-summary?month=${encodeURIComponent(month)}&year=${encodeURIComponent(year)}`);
 
 export const getMyPayslips = () => request("/my-payslips");
+// On-screen payslip content (HR Admin: any Paid record; employee: own record only).
+export const getPayslipDetail = (recordId) => request(`/payslips/${encodeURIComponent(recordId)}`);
+export const getMyPayslipDetail = (recordId) => request(`/my-payslips/${encodeURIComponent(recordId)}`);
 
 async function getMyPayslipPdf(recordId, inline = false) {
   const response = await authenticatedFetch(

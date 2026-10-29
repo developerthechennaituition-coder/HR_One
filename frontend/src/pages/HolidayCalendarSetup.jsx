@@ -1,7 +1,8 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { isWeeklyOff, useCompanyWeeklyOffs, weeklyOffLabel } from "../services/weeklyOff";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
+import { formatRequestDateTime } from "../services/attendanceRequestApi";
 
 // A calendar belongs to a company/location and contains holidays and employee assignments.
 const API_ROOT = HRONE_API_BASE + "/api";
@@ -51,6 +52,56 @@ const monthNames = [
   "July", "August", "September", "October", "November", "December",
 ];
 
+// "Company - Legal entity" is the existing selection format for company records.
+const entityKey = (org) => `${org.company} - ${org.legal_entity}`;
+
+// Checkbox dropdown used for the cascading Company -> Branch -> Location selectors.
+function MultiSelectDropdown({ id, label, placeholder, options, selected, onChange, disabled, emptyText }) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = (event) => {
+      if (event.type === "keydown" ? event.key === "Escape" : !containerRef.current?.contains(event.target)) {
+        if (event.type === "keydown") event.stopPropagation();
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close, true);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", close, true);
+    };
+  }, [open]);
+  const chosen = options.filter((option) => selected.includes(option.value));
+  const toggle = (value) =>
+    onChange(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]);
+  return (
+    <div className="holiday-multiselect" ref={containerRef}>
+      <label className="form-label" htmlFor={id}>{label}</label>
+      <button id={id} type="button" className="form-select holiday-multiselect-toggle" aria-haspopup="listbox"
+        aria-expanded={open} disabled={disabled} onClick={() => setOpen((current) => !current)}
+        title={chosen.map((option) => option.label).join(", ")}>
+        <span>{chosen.length ? (chosen.length === 1 ? chosen[0].label : `${chosen.length} selected`) : placeholder}</span>
+      </button>
+      {open && (
+        <div className="holiday-multiselect-menu" role="listbox" aria-multiselectable="true" aria-label={label}>
+          {options.length ? options.map((option) => (
+            <label key={option.value} className="holiday-multiselect-option">
+              <input type="checkbox" className="form-check-input" checked={selected.includes(option.value)} onChange={() => toggle(option.value)} />
+              <span>
+                <strong>{option.label}</strong>
+                {option.hint && <small>{option.hint}</small>}
+              </span>
+            </label>
+          )) : <div className="holiday-multiselect-empty">{emptyText}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const readError = async (response) => {
   try {
     const error = await response.json();
@@ -88,6 +139,11 @@ function HolidayCalendarSetup({ currentUser }) {
   const [confirmDialog, setConfirmDialog] = useState(null);
   const [confirmReason, setConfirmReason] = useState("");
   const [confirmBusy, setConfirmBusy] = useState(false);
+  const [confirmAck, setConfirmAck] = useState(false);
+  const [confirmError, setConfirmError] = useState("");
+  // Organizational assignment selections in the create/edit popup.
+  const [orgSelection, setOrgSelection] = useState({ entities: [], branches: [], locations: [] });
+  const [calendarFormError, setCalendarFormError] = useState("");
   const canManage = ["hr admin", "administrator"].includes(
     String(currentUser?.role || "").trim().toLowerCase(),
   );
@@ -106,19 +162,68 @@ function HolidayCalendarSetup({ currentUser }) {
 
   const askConfirm = (dialog) => {
     setConfirmReason("");
+    setConfirmAck(false);
+    setConfirmError("");
     setConfirmDialog(dialog);
   };
 
+  // onConfirm may return a follow-up dialog (two-step confirmations) or throw
+  // to keep the dialog open with the server error.
   const runConfirm = async () => {
     if (!confirmDialog) return;
     if (confirmDialog.requireReason && confirmReason.trim().length < 3) return;
+    if (confirmDialog.requireAck && !confirmAck) return;
     setConfirmBusy(true);
+    setConfirmError("");
     try {
-      await confirmDialog.onConfirm(confirmReason.trim());
-      setConfirmDialog(null);
+      const next = await confirmDialog.onConfirm(confirmReason.trim());
+      if (next?.title) askConfirm(next);
+      else setConfirmDialog(null);
+    } catch (error) {
+      setConfirmError(error.message || "The request could not be completed.");
     } finally {
       setConfirmBusy(false);
     }
+  };
+
+  // Lock background scrolling while a popup is open.
+  useEffect(() => {
+    if (!isCalendarFormOpen && !confirmDialog) return undefined;
+    const scroller = document.querySelector(".main-content");
+    const previous = scroller?.style.overflow;
+    if (scroller) scroller.style.overflow = "hidden";
+    return () => { if (scroller) scroller.style.overflow = previous || ""; };
+  }, [isCalendarFormOpen, confirmDialog]);
+
+  const organization = options.organization || [];
+  const orgById = new Map(organization.map((org) => [org.id, org]));
+  const entityOptions = [...new Set(organization.map(entityKey))].map((key) => ({ value: key, label: key }));
+  const branchOptions = organization
+    .filter((org) => orgSelection.entities.includes(entityKey(org)))
+    .map((org) => ({ value: org.id, label: org.branch, hint: `${entityKey(org)}${org.branch_code ? ` · Code ${org.branch_code}` : ""}` }));
+  const locationOptions = organization
+    .filter((org) => orgSelection.branches.includes(org.id))
+    .map((org) => ({ value: org.id, label: org.location, hint: `Branch: ${org.branch}` }));
+  // Changing a parent selection drops children that no longer belong to it.
+  const setEntities = (entities) => setOrgSelection((current) => {
+    const branches = current.branches.filter((id) => orgById.has(id) && entities.includes(entityKey(orgById.get(id))));
+    return { entities, branches, locations: current.locations.filter((id) => branches.includes(id)) };
+  });
+  const setBranches = (branches) => setOrgSelection((current) => ({
+    ...current, branches, locations: current.locations.filter((id) => branches.includes(id)),
+  }));
+  const setLocations = (locations) => setOrgSelection((current) => ({ ...current, locations }));
+  const selectedAssignments = orgSelection.locations
+    .filter((id) => orgSelection.branches.includes(id) && orgById.has(id))
+    .map((id) => orgById.get(id));
+
+  const assignmentSummary = (calendar) => {
+    const items = calendar.assignments || [];
+    if (!items.length) {
+      return calendar.religion_key ? "All branches" : `${companyName(calendar.company_id)} · ${calendar.location}`;
+    }
+    const entities = [...new Set(items.map((item) => item.legal_entity || item.company))];
+    return `${entities.join(", ")} · ${items.map((item) => item.branch).join(", ")}`;
   };
 
   const loadOptions = async () => {
@@ -370,6 +475,13 @@ function HolidayCalendarSetup({ currentUser }) {
 
   const openCalendarForm = (calendar = null) => {
     setEditingCalendarId(calendar?.id || null);
+    setCalendarFormError("");
+    const assigned = (calendar?.assignments || []).filter((item) => orgById.has(item.company_id));
+    setOrgSelection({
+      entities: [...new Set(assigned.map((item) => entityKey(orgById.get(item.company_id))))],
+      branches: assigned.map((item) => item.company_id),
+      locations: assigned.map((item) => item.company_id),
+    });
     setCalendarForm(
       calendar
         ? { ...calendar, religion: calendar.religion || "", description: calendar.description || "" }
@@ -420,23 +532,28 @@ function HolidayCalendarSetup({ currentUser }) {
   // Validate and persist a calendar; the API enforces company/location rules.
   const saveCalendar = async (event) => {
     event.preventDefault();
-    if (
-      !calendarForm.company_id ||
-      !calendarForm.location.trim() ||
-      !calendarForm.calendar_name.trim() ||
-      !calendarForm.calendar_year ||
-      (!editingCalendarId && !calendarForm.religion)
-    ) {
-      setFeedback({
-        type: "danger",
-        message: "Religion, company, location, calendar name and year are required.",
-      });
+    if (isSaving) return;
+    const religionCalendar = Boolean(calendarForm.religion);
+    const missingLocation = orgSelection.branches.filter((id) => !orgSelection.locations.includes(id));
+    let problem = "";
+    if (!calendarForm.calendar_name.trim() || !calendarForm.calendar_year || (!editingCalendarId && !calendarForm.religion)) {
+      problem = "Religion, calendar year and calendar name are required.";
+    } else if (religionCalendar && !orgSelection.entities.length) {
+      problem = "Select at least one company / legal entity.";
+    } else if (religionCalendar && !orgSelection.branches.length) {
+      problem = "Select at least one branch.";
+    } else if (missingLocation.length) {
+      problem = `Select the location for branch ${missingLocation.map((id) => orgById.get(id)?.branch).join(", ")}.`;
+    } else if (religionCalendar && !selectedAssignments.length) {
+      problem = "Select at least one location.";
+    } else if (duplicateCalendar) {
+      problem = `A ${duplicateCalendar.religion} calendar for ${duplicateCalendar.calendar_year} already exists. Open it to make changes.`;
+    }
+    if (problem) {
+      setCalendarFormError(problem);
       return;
     }
-    if (duplicateCalendar) {
-      setFeedback({ type: "danger", message: `A ${duplicateCalendar.religion} calendar for ${duplicateCalendar.calendar_year} already exists. Open it to make changes.` });
-      return;
-    }
+    setCalendarFormError("");
     setIsSaving(true);
     try {
       const response = await fetch(
@@ -451,6 +568,9 @@ function HolidayCalendarSetup({ currentUser }) {
             calendar_year: Number(calendarForm.calendar_year),
             description: calendarForm.description || null,
             religion: calendarForm.religion || null,
+            assignments: selectedAssignments.map((org) => ({ company_id: org.id, location: org.location })),
+            company_id: selectedAssignments[0]?.id || calendarForm.company_id,
+            location: selectedAssignments[0]?.location || calendarForm.location,
           }),
         },
       );
@@ -459,9 +579,9 @@ function HolidayCalendarSetup({ currentUser }) {
       setCalendars((current) =>
         editingCalendarId
           ? current.map((calendar) =>
-              calendar.id === editingCalendarId ? savedCalendar : calendar,
+              calendar.id === editingCalendarId ? { ...savedCalendar, holiday_count: calendar.holiday_count } : calendar,
             )
-          : [savedCalendar, ...current],
+          : [{ ...savedCalendar, holiday_count: 0 }, ...current],
       );
       setSelectedCalendarId(savedCalendar.id);
       setFeedback({
@@ -473,10 +593,7 @@ function HolidayCalendarSetup({ currentUser }) {
       setIsCalendarFormOpen(false);
       loadOptions();
     } catch (error) {
-      setFeedback({
-        type: "danger",
-        message: error.message || "Unable to save holiday calendar.",
-      });
+      setCalendarFormError(error.message || "Unable to save holiday calendar.");
     } finally {
       setIsSaving(false);
     }
@@ -566,6 +683,11 @@ function HolidayCalendarSetup({ currentUser }) {
               left.holiday_date.localeCompare(right.holiday_date),
             ),
       );
+      if (!editingHolidayId) {
+        setCalendars((current) => current.map((item) =>
+          item.id === selectedCalendar.id ? { ...item, holiday_count: (item.holiday_count || 0) + 1 } : item,
+        ));
+      }
       setFeedback({
         type: "success",
         message: `${savedHoliday.holiday_name} ${editingHolidayId ? "updated" : "added"} successfully.`,
@@ -581,40 +703,78 @@ function HolidayCalendarSetup({ currentUser }) {
     }
   };
 
+  const calendarSummary = (calendar) => (
+    <dl className="holiday-delete-summary">
+      <div><dt>Calendar</dt><dd>{calendar.calendar_name}</dd></div>
+      <div><dt>Religion · Year</dt><dd>{calendarTitle(calendar)}</dd></div>
+      <div><dt>Status</dt><dd>{calendar.status || "Draft"} · {calendar.holiday_count ?? holidays.length} holiday(s)</dd></div>
+      <div><dt>Company / legal entity</dt><dd>{[...new Set((calendar.assignments || []).map((item) => `${item.company} - ${item.legal_entity}`))].join(", ") || companyName(calendar.company_id)}</dd></div>
+      <div><dt>Branches</dt><dd>{(calendar.assignments || []).map((item) => item.branch).join(", ") || "All branches"}</dd></div>
+      <div><dt>Locations</dt><dd>{(calendar.assignments || []).map((item) => item.location).join("; ") || calendar.location}</dd></div>
+    </dl>
+  );
+
   const deactivateCalendar = () => {
     if (!selectedCalendar) return;
+    const calendar = selectedCalendar;
+    if (calendar.status !== "Published") {
+      askConfirm({
+        title: "Delete draft calendar",
+        message: <>{calendarSummary(calendar)}<p className="mb-0">This draft and its holiday entries are removed. Employees never saw it.</p></>,
+        confirmLabel: "Delete draft",
+        variant: "danger",
+        onConfirm: () => performDeactivateCalendar(calendar),
+      });
+      return;
+    }
     askConfirm({
-      title: "Delete draft calendar",
-      message: `Delete the draft ${selectedCalendar.calendar_name}? It is hidden from active calendars and kept for audit.`,
-      confirmLabel: "Delete draft",
+      title: "Delete published calendar (step 1 of 2)",
+      message: (
+        <>
+          {calendarSummary(calendar)}
+          <div className="alert alert-warning small mb-0">
+            Employees covered by this calendar will no longer see it in their Holiday Calendar or Profile, and its upcoming
+            holidays will stop applying to their attendance. Holidays already past stay in attendance history; payroll
+            already approved or paid is not changed.
+          </div>
+        </>
+      ),
+      confirmLabel: "Continue",
       variant: "danger",
-      onConfirm: performDeactivateCalendar,
+      onConfirm: () => ({
+        title: "Confirm deletion (step 2 of 2)",
+        message: (
+          <>
+            <p>
+              <strong>{calendar.calendar_name}</strong> ({calendarTitle(calendar)}) will be removed together with its{" "}
+              {calendar.holiday_count ?? holidays.length} holiday entries and any employee holiday-calendar assignments.
+              They will no longer be available through this calendar. Affected employees are notified.
+            </p>
+            <p className="mb-0 small text-muted">The records are kept in the audit history but cannot be restored from this screen.</p>
+          </>
+        ),
+        confirmLabel: "Delete calendar",
+        variant: "danger",
+        requireAck: "I understand that this published calendar will be deleted.",
+        onConfirm: () => performDeactivateCalendar(calendar),
+      }),
     });
   };
 
-  const performDeactivateCalendar = async () => {
-    try {
-      const response = await fetch(
-        `${API_ROOT}/holiday-calendars/${selectedCalendar.id}`,
-        { method: "DELETE" },
-      );
-      if (!response.ok) throw new Error(await readError(response));
-      const remaining = calendars.filter(
-        (calendar) => calendar.id !== selectedCalendar.id,
-      );
-      setCalendars(remaining);
-      setSelectedCalendarId(remaining[0]?.id || "");
-      setFeedback({
-        type: "success",
-        message: `${selectedCalendar.calendar_name} deleted. It is kept for audit history.`,
-      });
-      loadOptions();
-    } catch (error) {
-      setFeedback({
-        type: "danger",
-        message: error.message || "Unable to deactivate calendar.",
-      });
-    }
+  // Throws on failure so the dialog stays open and shows the server error.
+  const performDeactivateCalendar = async (calendar) => {
+    const published = calendar.status === "Published";
+    const response = await fetch(
+      `${API_ROOT}/holiday-calendars/${calendar.id}${published ? `?confirm=${encodeURIComponent(calendar.id)}` : ""}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new Error(await readError(response));
+    const result = await response.json().catch(() => ({}));
+    const remaining = calendars.filter((item) => item.id !== calendar.id);
+    setCalendars(remaining);
+    setSelectedCalendarId(remaining[0]?.id || "");
+    setFeedback({ type: "success", message: result.message || `${calendar.calendar_name} was deleted.` });
+    loadOptions();
   };
 
   const publishCalendar = () => {
@@ -640,7 +800,7 @@ function HolidayCalendarSetup({ currentUser }) {
       if (!response.ok) throw new Error(await readError(response));
       const published = await response.json();
       setCalendars((current) => current.map((item) =>
-        item.id === published.id ? published : item,
+        item.id === published.id ? { ...published, holiday_count: item.holiday_count } : item,
       ));
       setHolidays((current) => current.map((item) =>
         item.status === "Cancelled" ? item : { ...item, status: "Published" },
@@ -675,6 +835,9 @@ function HolidayCalendarSetup({ currentUser }) {
       if (!response.ok) throw new Error(await readError(response));
       setHolidays((current) => current.map((item) =>
         item.id === holiday.id ? { ...item, status: "Cancelled" } : item,
+      ));
+      setCalendars((current) => current.map((item) =>
+        item.id === holiday.calendar_id ? { ...item, holiday_count: Math.max(0, (item.holiday_count || 1) - 1) } : item,
       ));
       setFeedback({
         type: "success",
@@ -782,7 +945,7 @@ function HolidayCalendarSetup({ currentUser }) {
               <div className="holiday-list-header p-4">
                 <h5 className="mb-1">Calendars</h5>
                 <small className="text-muted">
-                  {calendars.length} active calendars
+                  {calendars.length} calendar(s) · one per religion and year
                 </small>
                 <input
                   className="form-control mt-3"
@@ -817,14 +980,17 @@ function HolidayCalendarSetup({ currentUser }) {
                         <i className="bi bi-calendar3" />
                       </span>
                       <span className="holiday-calendar-copy">
-                        <strong>{calendar.calendar_name}</strong>
-                        <small>{calendarTitle(calendar)}</small>
-                        <small>
-                          <span className={`badge ${calendar.status === "Published" ? "text-bg-success" : "text-bg-secondary"} me-1`}>
+                        <span className="holiday-calendar-title">
+                          <strong>{calendar.religion || "Company-wide"} · {calendar.calendar_year}</strong>
+                          <span className={`badge ${calendar.status === "Published" ? "text-bg-success" : "text-bg-secondary"}`}>
                             {calendar.status || "Draft"}
                           </span>
-                          {companyName(calendar.company_id)} · {calendar.location}
+                        </span>
+                        <small className="holiday-calendar-name">{calendar.calendar_name}</small>
+                        <small title={assignmentSummary(calendar)}>
+                          <i className="bi bi-diagram-3 me-1" aria-hidden="true" />{assignmentSummary(calendar)}
                         </small>
+                        <small><i className="bi bi-calendar-event me-1" aria-hidden="true" />{calendar.holiday_count ?? 0} holiday(s)</small>
                       </span>
                       <i className="bi bi-chevron-right" />
                     </button>
@@ -846,13 +1012,21 @@ function HolidayCalendarSetup({ currentUser }) {
                         {calendarTitle(selectedCalendar)}
                       </p>
                       <h4 className="mb-1">{selectedCalendar.calendar_name}</h4>
-                      <p className="text-muted mb-0">
-                        <i className="bi bi-building me-2" />
-                        {companyName(selectedCalendar.company_id)}{" "}
-                        <span className="mx-2">·</span>
-                        <i className="bi bi-geo-alt me-1" />
-                        {selectedCalendar.location}
-                      </p>
+                      {(selectedCalendar.assignments || []).length ? (
+                        <ul className="holiday-assignment-chips" aria-label="Organizational assignments">
+                          {selectedCalendar.assignments.map((item) => (
+                            <li key={item.company_id} title={`${item.company} - ${item.legal_entity} › ${item.branch} › ${item.location}`}>
+                              <i className="bi bi-building" aria-hidden="true" />
+                              <span><strong>{item.legal_entity || item.company}</strong> › {item.branch} › {item.location}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-muted mb-0">
+                          <i className="bi bi-building me-2" />
+                          {isReligionCalendar ? "All branches (no organization assigned yet — edit to assign)" : `${companyName(selectedCalendar.company_id)} · ${selectedCalendar.location}`}
+                        </p>
+                      )}
                       {selectedCalendar.description && (
                         <p className="small text-muted mt-2 mb-0">
                           {selectedCalendar.description}
@@ -860,8 +1034,8 @@ function HolidayCalendarSetup({ currentUser }) {
                       )}
                       {selectedCalendar.published_at && (
                         <p className="small text-muted mt-1 mb-0">
-                          Published {new Date(selectedCalendar.published_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" })}
-                          {selectedCalendar.updated_at ? ` · Last edited ${new Date(selectedCalendar.updated_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" })}` : ""}
+                          Published {formatRequestDateTime(selectedCalendar.published_at)}
+                          {selectedCalendar.updated_at ? ` · Last edited ${formatRequestDateTime(selectedCalendar.updated_at)}` : ""}
                         </p>
                       )}
                     </div>
@@ -885,13 +1059,13 @@ function HolidayCalendarSetup({ currentUser }) {
                         <i className="bi bi-pencil me-1" />
                         Edit
                       </button>}
-                      {canManage && selectedCalendar.status !== "Published" && <button
+                      {canManage && <button
                         type="button"
                         className="btn btn-sm btn-outline-danger"
                         onClick={deactivateCalendar}
                       >
                         <i className="bi bi-trash3 me-1" />
-                        Delete draft
+                        Delete
                       </button>}
                     </div>
                   </div>
@@ -1129,7 +1303,7 @@ function HolidayCalendarSetup({ currentUser }) {
                       </div>
                     </form>
                   )}
-                  <div className="table-responsive">
+                  <div className="table-responsive holiday-entries-scroll">
                     <table className="holiday-table table align-middle mb-0">
                       <thead>
                         <tr>
@@ -1365,209 +1539,161 @@ function HolidayCalendarSetup({ currentUser }) {
       </div>
 
       {isCalendarFormOpen && (
-        <div className="card holiday-form-card border-0 shadow-sm mt-4">
-          <div className="card-body p-4">
-            <div className="d-flex justify-content-between align-items-center mb-4">
-              <div>
-                <p className="eyebrow mb-1">
-                  {editingCalendarId ? "Update calendar" : "New calendar"}
-                </p>
-                <h5 className="mb-0">
-                  {editingCalendarId
-                    ? "Edit Holiday Calendar"
-                    : "Create Holiday Calendar"}
-                </h5>
+        <div className="modal d-block holiday-modal" tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="calendar-form-title"
+          onKeyDown={(event) => { if (event.key === "Escape" && !isSaving) setIsCalendarFormOpen(false); }}>
+          <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable modal-fullscreen-sm-down">
+            <form className="modal-content" onSubmit={saveCalendar} noValidate>
+              <div className="modal-header">
+                <div>
+                  <p className="eyebrow mb-1">{editingCalendarId ? "Update calendar" : "New calendar"}</p>
+                  <h5 className="modal-title" id="calendar-form-title">{editingCalendarId ? "Edit Holiday Calendar" : "Create Holiday Calendar"}</h5>
+                </div>
+                <button type="button" className="btn-close" aria-label="Close calendar form" onClick={() => setIsCalendarFormOpen(false)} disabled={isSaving} />
               </div>
-              <button
-                type="button"
-                className="btn-close"
-                aria-label="Close calendar form"
-                onClick={() => setIsCalendarFormOpen(false)}
-              />
-            </div>
-            <form onSubmit={saveCalendar}>
-              <div className="row g-3">
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-religion">
-                    Religion
-                  </label>
-                  <select
-                    id="calendar-religion"
-                    className="form-select"
-                    name="religion"
-                    value={calendarForm.religion || ""}
-                    onChange={handleCalendarChange}
-                    disabled={Boolean(editingCalendarId) && (selectedCalendar?.status === "Published" || !selectedCalendar?.religion_key)}
-                    required={!editingCalendarId}
-                  >
-                    <option value="">{editingCalendarId && !calendarForm.religion ? "Company-wide (existing calendar)" : "Select religion"}</option>
-                    {[...new Set([...options.religions, ...(calendarForm.religion ? [calendarForm.religion] : [])])].map((religion) => (
-                      <option key={religion} value={religion}>{religion}</option>
-                    ))}
-                  </select>
-                  <div className="form-text">
-                    {options.religions.length
-                      ? "Only religions assigned to active employees are listed."
-                      : "No employee has a religion recorded yet. Add it in Employee Master first."}
-                  </div>
-                </div>
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-year">
-                    Calendar year
-                  </label>
-                  <select
-                    id="calendar-year"
-                    className="form-select"
-                    name="calendar_year"
-                    value={calendarForm.calendar_year}
-                    onChange={handleCalendarChange}
-                    disabled={Boolean(editingCalendarId) && selectedCalendar?.status === "Published"}
-                  >
-                    {[...new Set([...options.allowed_years, Number(calendarForm.calendar_year)])].filter(Boolean).map((year) => (
-                      <option key={year} value={year} disabled={!options.allowed_years.includes(year)}>{year}</option>
-                    ))}
-                  </select>
-                  <div className="form-text">
-                    {options.allowed_years.length
-                      ? `Calendars can be created only for ${options.allowed_years[0]} (current year) and ${options.allowed_years[1]} (next year).`
-                      : "Allowed years could not be loaded."}
-                    {editingCalendarId && selectedCalendar?.status === "Published" ? " The religion and year of a published calendar are fixed." : ""}
-                  </div>
-                </div>
-                {duplicateCalendar && (
-                  <div className="col-12">
-                    <div className="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2 py-2 mb-0">
-                      <span>A {duplicateCalendar.religion} calendar for {duplicateCalendar.calendar_year} already exists ({duplicateCalendar.status || "Draft"}).</span>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-outline-dark"
-                        onClick={() => { setSelectedCalendarId(duplicateCalendar.id); setIsCalendarFormOpen(false); }}
-                      >
-                        Open existing calendar
-                      </button>
+              <div className="modal-body">
+                {calendarFormError && <div className="alert alert-danger py-2" role="alert">{calendarFormError}</div>}
+                <div className="row g-3">
+                  <div className="col-md-6">
+                    <label className="form-label" htmlFor="calendar-religion">Religion</label>
+                    <select
+                      id="calendar-religion"
+                      className="form-select"
+                      name="religion"
+                      value={calendarForm.religion || ""}
+                      onChange={handleCalendarChange}
+                      disabled={Boolean(editingCalendarId) && (selectedCalendar?.status === "Published" || !selectedCalendar?.religion_key)}
+                      required={!editingCalendarId}
+                    >
+                      <option value="">{editingCalendarId && !calendarForm.religion ? "Company-wide (existing calendar)" : "Select religion"}</option>
+                      {[...new Set([...options.religions, ...(calendarForm.religion ? [calendarForm.religion] : [])])].map((religion) => (
+                        <option key={religion} value={religion}>{religion}</option>
+                      ))}
+                    </select>
+                    <div className="form-text">
+                      {options.religions.length
+                        ? "Only religions assigned to active employees are listed."
+                        : "No employee has a religion recorded yet. Add it in Employee Master first."}
                     </div>
                   </div>
-                )}
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-country">
-                    Country
-                  </label>
-                  <select
-                    id="calendar-country"
-                    className="form-select"
-                    name="country"
-                    value={calendarForm.country}
-                    onChange={(event) => setCalendarForm((current) => ({
-                      ...current,
-                      country: event.target.value,
-                      state: "",
-                    }))}
-                  >
-                    {countryOptions.map((item) => (
-                      <option key={item.code} value={item.name} disabled={item.disabled}>{item.name}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-state">
-                    State / region
-                  </label>
-                  {calendarForm.country === "India" ? (
+                  <div className="col-md-6">
+                    <label className="form-label" htmlFor="calendar-year">Calendar year</label>
                     <select
-                      id="calendar-state"
+                      id="calendar-year"
                       className="form-select"
-                      name="state"
-                      value={calendarForm.state || ""}
+                      name="calendar_year"
+                      value={calendarForm.calendar_year}
                       onChange={handleCalendarChange}
-                      required
+                      disabled={Boolean(editingCalendarId) && selectedCalendar?.status === "Published"}
                     >
-                      <option value="">Select state / union territory</option>
-                      {indiaStates.map((state) => <option key={state}>{state}</option>)}
+                      {[...new Set([...options.allowed_years, Number(calendarForm.calendar_year)])].filter(Boolean).map((year) => (
+                        <option key={year} value={year} disabled={!options.allowed_years.includes(year)}>{year}</option>
+                      ))}
                     </select>
-                  ) : (
-                    <input
-                      id="calendar-state"
-                      className="form-control"
-                      name="state"
-                      value={calendarForm.state || ""}
-                      onChange={handleCalendarChange}
-                      placeholder="State / region"
-                    />
+                    <div className="form-text">
+                      {options.allowed_years.length
+                        ? `Only ${options.allowed_years[0]} (current year) and ${options.allowed_years[1]} (next year) are allowed.`
+                        : "Allowed years could not be loaded."}
+                      {editingCalendarId && selectedCalendar?.status === "Published" ? " The religion and year of a published calendar are fixed." : ""}
+                    </div>
+                  </div>
+                  {duplicateCalendar && (
+                    <div className="col-12">
+                      <div className="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2 py-2 mb-0">
+                        <span>A {duplicateCalendar.religion} calendar for {duplicateCalendar.calendar_year} already exists ({duplicateCalendar.status || "Draft"}).</span>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-outline-dark"
+                          onClick={() => { setSelectedCalendarId(duplicateCalendar.id); setIsCalendarFormOpen(false); }}
+                        >
+                          Open existing calendar
+                        </button>
+                      </div>
+                    </div>
                   )}
-                </div>
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-company">
-                    Company / legal entity
-                  </label>
-                  <select
-                    id="calendar-company"
-                    className="form-select"
-                    name="company_id"
-                    value={calendarForm.company_id}
-                    onChange={handleCalendarChange}
-                  >
-                    <option value="">Select company</option>
-                    {companies.map((company) => (
-                      <option key={company.id} value={company.id}>
-                        {company.company} - {company.legal_entity}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-location">
-                    Location
-                  </label>
-                  <input
-                    id="calendar-location"
-                    className="form-control"
-                    name="location"
-                    value={calendarForm.location}
-                    onChange={handleCalendarChange}
-                    placeholder="Must match company location"
-                  />
-                </div>
-                <div className="col-md-6">
-                  <label className="form-label" htmlFor="calendar-name">
-                    Calendar name
-                  </label>
-                  <input
-                    id="calendar-name"
-                    className="form-control"
-                    name="calendar_name"
-                    value={calendarForm.calendar_name}
-                    onChange={handleCalendarChange}
-                    placeholder="e.g. Hindu Festival Holidays"
-                  />
-                </div>
-                <div className="col-12">
-                  <label className="form-label" htmlFor="calendar-description">
-                    Description
-                  </label>
-                  <textarea
-                    id="calendar-description"
-                    className="form-control"
-                    name="description"
-                    rows="2"
-                    value={calendarForm.description}
-                    onChange={handleCalendarChange}
-                  />
+
+                  <div className="col-12">
+                    <fieldset className="holiday-org-fieldset">
+                      <legend>Applies to</legend>
+                      <p className="small text-muted mb-2">
+                        Company / legal entity → Branch → Location. The calendar applies to employees of this religion in the selected branches.
+                      </p>
+                      {!organization.length ? (
+                        <div className="small text-muted">{canManage ? "No active companies or branches are set up yet. Add them in Company Setup." : "Organization data is unavailable."}</div>
+                      ) : (
+                        <div className="row g-3">
+                          <div className="col-md-4">
+                            <MultiSelectDropdown id="calendar-entities" label="Company / legal entity" placeholder="Select companies"
+                              options={entityOptions} selected={orgSelection.entities} onChange={setEntities} emptyText="No companies available." />
+                          </div>
+                          <div className="col-md-4">
+                            <MultiSelectDropdown id="calendar-branches" label="Branch" placeholder={orgSelection.entities.length ? "Select branches" : "Select a company first"}
+                              options={branchOptions} selected={orgSelection.branches} onChange={setBranches}
+                              disabled={!orgSelection.entities.length} emptyText="No branches for the selected companies." />
+                          </div>
+                          <div className="col-md-4">
+                            <MultiSelectDropdown id="calendar-locations" label="Location" placeholder={orgSelection.branches.length ? "Select locations" : "Select a branch first"}
+                              options={locationOptions} selected={orgSelection.locations} onChange={setLocations}
+                              disabled={!orgSelection.branches.length} emptyText="No locations for the selected branches." />
+                          </div>
+                        </div>
+                      )}
+                      {selectedAssignments.length > 0 && (
+                        <ul className="holiday-assignment-chips mt-3" aria-label="Selected assignments">
+                          {selectedAssignments.map((org) => (
+                            <li key={org.id} title={`${entityKey(org)} › ${org.branch} › ${org.location}`}>
+                              <span><strong>{org.legal_entity}</strong> › {org.branch} › {org.location}</span>
+                              <button type="button" className="btn-close btn-close-sm" aria-label={`Remove ${org.branch}`}
+                                onClick={() => setBranches(orgSelection.branches.filter((id) => id !== org.id))} />
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </fieldset>
+                  </div>
+
+                  <div className="col-md-6">
+                    <label className="form-label" htmlFor="calendar-name">Calendar name</label>
+                    <input id="calendar-name" className="form-control" name="calendar_name" value={calendarForm.calendar_name}
+                      onChange={handleCalendarChange} placeholder="e.g. Hindu Festival Holidays" maxLength={120} />
+                  </div>
+                  <div className="col-md-3">
+                    <label className="form-label" htmlFor="calendar-country">Country</label>
+                    <select
+                      id="calendar-country"
+                      className="form-select"
+                      name="country"
+                      value={calendarForm.country}
+                      onChange={(event) => setCalendarForm((current) => ({ ...current, country: event.target.value, state: "" }))}
+                    >
+                      {countryOptions.map((item) => (
+                        <option key={item.code} value={item.name} disabled={item.disabled}>{item.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="col-md-3">
+                    <label className="form-label" htmlFor="calendar-state">State / region</label>
+                    {calendarForm.country === "India" ? (
+                      <select id="calendar-state" className="form-select" name="state" value={calendarForm.state || ""} onChange={handleCalendarChange}>
+                        <option value="">Select state</option>
+                        {indiaStates.map((state) => <option key={state}>{state}</option>)}
+                      </select>
+                    ) : (
+                      <input id="calendar-state" className="form-control" name="state" value={calendarForm.state || ""} onChange={handleCalendarChange} placeholder="State / region" />
+                    )}
+                  </div>
+                  <div className="col-12">
+                    <label className="form-label" htmlFor="calendar-description">Description</label>
+                    <textarea id="calendar-description" className="form-control" name="description" rows="2"
+                      value={calendarForm.description} onChange={handleCalendarChange} />
+                  </div>
                 </div>
               </div>
-              <div className="d-flex justify-content-end gap-2 mt-4">
-                <button
-                  type="button"
-                  className="btn btn-outline-secondary"
-                  onClick={() => setIsCalendarFormOpen(false)}
-                >
+              <div className="modal-footer flex-wrap">
+                <button type="button" className="btn btn-outline-secondary" onClick={() => setIsCalendarFormOpen(false)} disabled={isSaving}>
                   Cancel
                 </button>
-                <button
-                  type="submit"
-                  className="btn btn-primary"
-                  disabled={isSaving || Boolean(duplicateCalendar)}
-                >
-                  {isSaving ? "Saving..." : editingCalendarId ? "Save calendar" : "Create draft calendar"}
+                <button type="submit" className="btn btn-primary" disabled={isSaving || Boolean(duplicateCalendar)}>
+                  {isSaving ? "Saving..." : editingCalendarId ? "Save changes" : "Create calendar"}
                 </button>
               </div>
             </form>
@@ -1576,16 +1702,17 @@ function HolidayCalendarSetup({ currentUser }) {
       )}
 
       {confirmDialog && (
-        <div className="modal d-block" tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="holiday-confirm-title"
-          style={{ backgroundColor: "rgba(15, 23, 42, 0.45)" }}>
-          <div className="modal-dialog modal-dialog-centered">
+        <div className="modal d-block holiday-modal" tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="holiday-confirm-title"
+          onKeyDown={(event) => { if (event.key === "Escape" && !confirmBusy) setConfirmDialog(null); }}>
+          <div className="modal-dialog modal-dialog-centered modal-dialog-scrollable">
             <div className="modal-content">
               <div className="modal-header">
                 <h5 className="modal-title" id="holiday-confirm-title">{confirmDialog.title}</h5>
                 <button type="button" className="btn-close" aria-label="Close" onClick={() => setConfirmDialog(null)} disabled={confirmBusy} />
               </div>
               <div className="modal-body">
-                <p className="mb-2">{confirmDialog.message}</p>
+                {confirmError && <div className="alert alert-danger py-2" role="alert">{confirmError}</div>}
+                <div className="mb-2">{confirmDialog.message}</div>
                 {confirmDialog.requireReason && (
                   <>
                     <label className="form-label" htmlFor="holiday-confirm-reason">Reason (shown to employees)</label>
@@ -1594,11 +1721,17 @@ function HolidayCalendarSetup({ currentUser }) {
                     {confirmReason.trim().length < 3 && <div className="form-text">Enter at least 3 characters.</div>}
                   </>
                 )}
+                {confirmDialog.requireAck && (
+                  <label className="form-check mt-3">
+                    <input type="checkbox" className="form-check-input" checked={confirmAck} onChange={(event) => setConfirmAck(event.target.checked)} autoFocus />
+                    <span className="form-check-label">{confirmDialog.requireAck}</span>
+                  </label>
+                )}
               </div>
               <div className="modal-footer flex-wrap">
                 <button type="button" className="btn btn-outline-secondary" onClick={() => setConfirmDialog(null)} disabled={confirmBusy}>Cancel</button>
                 <button type="button" className={`btn btn-${confirmDialog.variant || "primary"}`} onClick={runConfirm}
-                  disabled={confirmBusy || (confirmDialog.requireReason && confirmReason.trim().length < 3)}>
+                  disabled={confirmBusy || (confirmDialog.requireReason && confirmReason.trim().length < 3) || (confirmDialog.requireAck && !confirmAck)}>
                   {confirmBusy ? "Working..." : confirmDialog.confirmLabel || "Confirm"}
                 </button>
               </div>

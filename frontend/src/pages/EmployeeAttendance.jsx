@@ -4,6 +4,7 @@ import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
 import MyAttendanceRequests from "../components/MyAttendanceRequests";
 import { getAttendanceCalendar } from "../services/attendanceRequestApi";
+import { buildCalendarRange, clampMonth, isMonthInRange, isSelectableDate, minSelectableDate } from "../services/attendanceCalendarRange";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
@@ -97,11 +98,16 @@ function EmployeeAttendance({ session, onNavigate }) {
   const [selectedDate, setSelectedDate] = useState(todayDate);
   const [requestFormOpen, setRequestFormOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  // Authoritative joining date, returned with every calendar month.
+  const [joiningDate, setJoiningDate] = useState(null);
+  const calendarRange = useMemo(() => buildCalendarRange(joiningDate, todayDate), [joiningDate, todayDate]);
 
   const loadCalendar = useCallback(async () => {
     setCalendarLoading(true);
     try {
-      setCalendar(await getAttendanceCalendar(calendarYear, calendarMonth));
+      const data = await getAttendanceCalendar(calendarYear, calendarMonth);
+      setCalendar(data);
+      setJoiningDate(data?.joining_date || null);
       setCalendarError("");
     } catch (loadError) {
       setCalendar(null);
@@ -115,8 +121,19 @@ function EmployeeAttendance({ session, onNavigate }) {
     loadCalendar();
   }, [loadCalendar]);
 
+  // Keep the month and selected date valid once the joining date is known.
+  useEffect(() => {
+    if (!isMonthInRange(calendarRange, calendarYear, calendarMonth)) {
+      const target = clampMonth(calendarRange, calendarYear, calendarMonth);
+      setCalendarYear(target.year);
+      setCalendarMonth(target.month);
+    }
+    setSelectedDate((current) => (isSelectableDate(calendarRange, current) ? current : todayDate));
+  }, [calendarRange, calendarYear, calendarMonth, todayDate]);
+
+  // Only today and eligible past dates can be selected; future dates are view-only.
   const selectDate = (iso) => {
-    if (!iso) return;
+    if (!isSelectableDate(calendarRange, iso)) return;
     setSelectedDate(iso);
     const [selectedYear, selectedMonth] = iso.split("-").map(Number);
     if (selectedYear !== calendarYear || selectedMonth !== calendarMonth) {
@@ -126,15 +143,17 @@ function EmployeeAttendance({ session, onNavigate }) {
   };
 
   const changeCalendarMonth = (nextYear, nextMonth) => {
-    setCalendarYear(nextYear);
-    setCalendarMonth(nextMonth);
+    const target = clampMonth(calendarRange, nextYear, nextMonth);
+    setCalendarYear(target.year);
+    setCalendarMonth(target.month);
     setRequestFormOpen(false);
   };
 
   // Keeps the request dialog open while it browses another month.
   const browseRequestMonth = (nextYear, nextMonth) => {
-    setCalendarYear(nextYear);
-    setCalendarMonth(nextMonth);
+    const target = clampMonth(calendarRange, nextYear, nextMonth);
+    setCalendarYear(target.year);
+    setCalendarMonth(target.month);
   };
 
   // HR Admin decided a request: refresh every attendance view on this page.
@@ -339,8 +358,7 @@ function EmployeeAttendance({ session, onNavigate }) {
       <MyAttendanceCalendar
         year={calendarYear}
         month={calendarMonth}
-        maxYear={year}
-        maxMonth={month}
+        range={calendarRange}
         calendar={calendar}
         loading={calendarLoading}
         selectedDate={selectedDate}
@@ -352,6 +370,7 @@ function EmployeeAttendance({ session, onNavigate }) {
         userId="me"
         title="Detailed attendance by date"
         date={selectedDate}
+        minDate={minSelectableDate(calendarRange)}
         onDateChange={selectDate}
         showStatus
         calendarDay={selectedCalendarDay}

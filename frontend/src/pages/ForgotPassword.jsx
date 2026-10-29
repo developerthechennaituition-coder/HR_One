@@ -1,5 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useState } from "react";
+import AuthLayout, { AuthAlert } from "../components/AuthLayout";
 
 
 function ForgotPassword() {
@@ -115,126 +116,60 @@ function ForgotPassword() {
 
 
   return (
-    <div className="container-fluid min-vh-100 d-flex align-items-center justify-content-center bg-light">
+    <AuthLayout
+      icon="bi-key"
+      step={1}
+      title="Forgot your password?"
+      subtitle="No worries. Enter your Employee ID or Work Email and we'll send a 6-digit OTP to your registered email."
+      footer={
+        <button
+          type="button"
+          className="auth-link"
+          onClick={() => {
+            window.location.href = "/login";
+          }}
+        >
+          <i className="bi bi-arrow-left" /> Back to Login
+        </button>
+      }
+    >
+      <AuthAlert type="error">{error}</AuthAlert>
+      <AuthAlert type="success">{message}</AuthAlert>
 
-      <div
-        className="card shadow-sm border-0"
-        style={{
-          width: "100%",
-          maxWidth: "450px",
-        }}
-      >
-
-        <div className="card-body p-4">
-
-          {/* ------------------------------------------------
-              Heading
-          ------------------------------------------------ */}
-          <div className="text-center mb-4">
-
-            <h3 className="fw-bold">
-              Forgot Password
-            </h3>
-
-            <p className="text-muted mb-0">
-              Enter your Employee ID or Work Email to
-              reset your password.
-            </p>
-
-          </div>
-
-
-          {/* ------------------------------------------------
-              Error
-          ------------------------------------------------ */}
-          {error && (
-            <div
-              className="alert alert-danger"
-              role="alert"
-            >
-              {error}
-            </div>
-          )}
-
-
-          {/* ------------------------------------------------
-              Success
-          ------------------------------------------------ */}
-          {message && (
-            <div
-              className="alert alert-success"
-              role="alert"
-            >
-              {message}
-            </div>
-          )}
-
-
-          {/* ------------------------------------------------
-              Form
-          ------------------------------------------------ */}
-          <form onSubmit={handleSubmit}>
-
-            <div className="mb-3">
-
-              <label
-                htmlFor="identifier"
-                className="form-label fw-semibold"
-              >
-                Employee ID / Work Email
-              </label>
-
-              <input
-                id="identifier"
-                type="text"
-                className="form-control"
-                placeholder="Enter Employee ID or Work Email"
-                value={identifier}
-                onChange={(event) =>
-                  setIdentifier(event.target.value)
-                }
-                disabled={loading}
-                autoFocus
-              />
-
-            </div>
-
-
-            <button
-              type="submit"
-              className="btn btn-primary w-100"
+      <form className="auth-form" onSubmit={handleSubmit}>
+        <div className="auth-field">
+          <label htmlFor="identifier">Employee ID / Work Email</label>
+          <div className="auth-input">
+            <i className="bi bi-envelope-at auth-input-icon" />
+            <input
+              id="identifier"
+              type="text"
+              placeholder="Enter Employee ID or Work Email"
+              value={identifier}
+              onChange={(event) =>
+                setIdentifier(event.target.value)
+              }
               disabled={loading}
-            >
-              {loading
-                ? "Sending OTP..."
-                : "Send OTP"}
-            </button>
-
-          </form>
-
-
-          {/* ------------------------------------------------
-              Back to Login
-          ------------------------------------------------ */}
-          <div className="text-center mt-3">
-
-            <button
-              type="button"
-              className="btn btn-link text-decoration-none"
-              onClick={() => {
-                window.location.href = "/login";
-              }}
-            >
-              Back to Login
-            </button>
-
+              autoComplete="username"
+              autoFocus
+            />
           </div>
-
         </div>
 
-      </div>
-
-    </div>
+        <button type="submit" className="auth-submit" disabled={loading}>
+          {loading ? (
+            <>
+              <span className="spinner-border spinner-border-sm" aria-hidden="true" />
+              Sending OTP...
+            </>
+          ) : (
+            <>
+              Send OTP <i className="bi bi-send" />
+            </>
+          )}
+        </button>
+      </form>
+    </AuthLayout>
   );
 }
 

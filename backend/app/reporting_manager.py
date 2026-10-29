@@ -7,6 +7,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
+from app.attendance import employee_joining_date
 from app.db.mongodb import db
 from app.session import active_sessions
 
@@ -30,6 +31,18 @@ leave_types_collection = db["leave_types"]
 
 class ReportingManagerPayload(BaseModel):
     reporting_manager_id: str | None = None
+    # Optional so existing clients that send only the Reporting Manager keep
+    # working; fields left out of the request are not changed.
+    hod_id: str | None = None
+    hr_admin_id: str | None = None
+
+
+# Leave-approval assignments: field on the user -> (required stored role, label).
+# HOD keeps the stored role identifier "HR Manager".
+APPROVER_ASSIGNMENTS = {
+    "hod_id": ("hr manager", "HOD"),
+    "hr_admin_id": ("hr admin", "HR Admin"),
+}
 
 
 # ============================================================
@@ -174,6 +187,14 @@ def _serialize_team_member(
         "date_of_birth": details.get("date_of_birth"),
         "blood_group": details.get("blood_group"),
         "date_of_joining": details.get("date_of_joining"),
+        # Same precedence as the attendance module: user record, then employee details.
+        "joining_date": employee_joining_date({
+            "date_of_joining": (
+                user.get("date_of_joining")
+                if user.get("date_of_joining") is not None
+                else details.get("date_of_joining")
+            ),
+        }),
         "work_field": details.get("work_field"),
         "nationality": details.get("nationality"),
         "religion": details.get("religion"),
@@ -382,7 +403,41 @@ def get_reporting_manager(
             if manager
             else None
         ),
+        **_approver_assignments(target),
     }
+
+
+def _approver_assignments(target: dict[str, Any]) -> dict[str, Any]:
+    """Assigned HOD and HR Admin (id + summary) for an employee."""
+    result: dict[str, Any] = {}
+    for field in APPROVER_ASSIGNMENTS:
+        assigned_id = str(target.get(field) or "")
+        assigned = (
+            users_collection.find_one({"_id": ObjectId(assigned_id)})
+            if ObjectId.is_valid(assigned_id)
+            else None
+        )
+        result[field] = str(assigned["_id"]) if assigned else None
+        result[field.removesuffix("_id")] = _serialize_manager(assigned) if assigned else None
+    return result
+
+
+def _validate_approver_assignment(field: str, value: str | None, user_id: str) -> str | None:
+    """An active account with the required role that is not the employee."""
+    required_role, label = APPROVER_ASSIGNMENTS[field]
+    value = value.strip() if value else None
+    if not value:
+        return None
+    if not ObjectId.is_valid(value):
+        raise HTTPException(status_code=400, detail=f"Invalid {label} ID")
+    if value == user_id:
+        raise HTTPException(status_code=400, detail=f"An employee cannot be their own {label}")
+    account = users_collection.find_one({"_id": ObjectId(value), "is_active": True})
+    if not account:
+        raise HTTPException(status_code=404, detail=f"{label} not found or inactive")
+    if str(account.get("role", "")).strip().lower() != required_role:
+        raise HTTPException(status_code=400, detail=f"The selected account does not have the {label} role")
+    return value
 
 
 # ============================================================
@@ -495,9 +550,43 @@ def set_reporting_manager(
                 else ""
             )
 
+    # HOD / HR Admin approvers: validate only the fields the client sent.
+    approver_updates = {
+        field: _validate_approver_assignment(field, getattr(payload, field), user_id)
+        for field in APPROVER_ASSIGNMENTS
+        if field in payload.model_fields_set
+    }
+    previous_manager_id = str(target.get("reporting_manager_id") or "")
+
     now = datetime.now(timezone.utc)
 
-    if manager_id:
+    if approver_updates:
+        users_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {
+                "$set": {
+                    **{field: value for field, value in approver_updates.items() if value},
+                    "updated_at": now,
+                },
+                **(
+                    {"$unset": {field: "" for field, value in approver_updates.items() if not value}}
+                    if any(not value for value in approver_updates.values())
+                    else {}
+                ),
+            },
+        )
+
+    # An empty request keeps the original meaning (clear the Reporting Manager);
+    # otherwise the Reporting Manager changes only when it is sent.
+    update_manager = (
+        "reporting_manager_id" in payload.model_fields_set
+        or not payload.model_fields_set
+    )
+
+    if not update_manager:
+        manager_id = previous_manager_id or None
+
+    elif manager_id:
 
         users_collection.update_one(
             {
@@ -554,6 +643,12 @@ def set_reporting_manager(
             },
         )
 
+    # Pending leave of this employee and of the old/new manager (whose own
+    # Reporting Manager status may have changed) is routed again.
+    from app.leave import reroute_pending_leave_requests
+
+    reroute_pending_leave_requests({user_id, previous_manager_id, manager_id or ""})
+
     manager = None
 
     if manager_id:
@@ -566,6 +661,7 @@ def set_reporting_manager(
         )
 
     return {
+        **_approver_assignments(users_collection.find_one({"_id": ObjectId(user_id)}) or {}),
         "user_id": user_id,
         "reporting_manager_id": (
             str(manager["_id"])
@@ -862,6 +958,26 @@ def get_team_member_attendance(
             for day, name in sorted(month_holidays.items())
         ]
 
+    # Pending and approved permission requests shown on the calendar.
+    permissions = []
+    if year is not None and month is not None:
+        permissions = [
+            {
+                "permission_date": item.get("permission_date"),
+                "start_time": item.get("start_time"),
+                "end_time": item.get("end_time"),
+                "status": item.get("status"),
+                "reason": item.get("reason"),
+            }
+            for item in db["permission_requests"].find(
+                {
+                    "user_id": member_id,
+                    "status": {"$in": ["pending", "approved"]},
+                    "permission_date": {"$gte": start_date, "$lt": end_date},
+                }
+            ).sort([("permission_date", 1), ("start_time", 1)])
+        ]
+
     attendance_type=attendance_collection.distinct(
         "attendance_type",
         {"user_id": member_id},
@@ -890,5 +1006,6 @@ def get_team_member_attendance(
         ],
         "approved_leaves": approved_leaves,
         "holidays": holidays,
+        "permissions": permissions,
         "attendance_type":attendance_type,
     }

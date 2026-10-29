@@ -1,6 +1,7 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useMemo, useState } from "react";
 import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
+import { roleLabel } from "../services/roleLabels";
 
 const USERS_API_URL = HRONE_API_BASE + "/api/users";
 const EMPLOYEES_API_URL = HRONE_API_BASE + "/api/employees";
@@ -133,6 +134,10 @@ function Attendance({ session }) {
   const isToday = selectedDate === getTodayDate();
   const isEditableDate =
     isToday || selectedDate === getYesterdayDate();
+
+  // joining_date comes from /api/users (authoritative employee joining date).
+  const isBeforeJoining = (user) =>
+    Boolean(user?.joining_date && selectedDate < String(user.joining_date).slice(0, 10));
 
   const getHeaders = () => {
     const stored = sessionStorage.getItem("hrms_session");
@@ -404,6 +409,14 @@ function Attendance({ session }) {
     const current = attendanceState[user.id];
 
     if (!current) {
+      return;
+    }
+
+    if (isBeforeJoining(user)) {
+      setError(
+        `Attendance cannot be recorded for ${user.name} on ${selectedDate} because it is before their joining date (${user.joining_date}).`
+      );
+
       return;
     }
 
@@ -994,6 +1007,9 @@ function Attendance({ session }) {
                     const onLeave =
                       current.status === "Leave";
 
+                    // Attendance cannot be recorded before the employee joined.
+                    const beforeJoining = isBeforeJoining(user);
+
                     return (
                       <tr key={user.id}>
                         <td>
@@ -1018,9 +1034,14 @@ function Attendance({ session }) {
                               </div>
 
                               <small className="text-muted">
-                                {user.role ||
+                                {roleLabel(user.role) ||
                                   "Unassigned"}
                               </small>
+                              {beforeJoining && (
+                                <small className="text-danger d-block">
+                                  Joins on {user.joining_date}
+                                </small>
+                              )}
                               {current.attendance_source && (
                                 <span
                                   className={`badge d-block mt-1 ${
@@ -1067,7 +1088,7 @@ function Attendance({ session }) {
                               current.status ||
                               "Not Marked"
                             }
-                            disabled={locked || !isEditableDate}
+                            disabled={locked || !isEditableDate || beforeJoining}
                             onChange={(e) =>
                               handleStatusChange(
                                 user.id,
@@ -1216,11 +1237,13 @@ function Attendance({ session }) {
                             type="button"
                             className="btn btn-sm btn-primary"
                             disabled={
-                              saving || locked || !isEditableDate
+                              saving || locked || !isEditableDate || beforeJoining
                             }
                             title={
                               locked
                                 ? "Approved full-day leave - cancel the leave to change attendance"
+                                : beforeJoining
+                                ? `This date is before the employee's joining date (${user.joining_date})`
                                 : !isEditableDate
                                 ? "Manual attendance changes are limited to today and yesterday"
                                 : undefined

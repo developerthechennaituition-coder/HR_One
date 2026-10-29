@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import MyHolidayCalendar from "../components/MyHolidayCalendar";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
+import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
+import { roleLabel } from "../services/roleLabels";
 
 const API_URL = HRONE_API_BASE + "/api/auth/me";
 
@@ -51,7 +53,8 @@ function Profile({ onNavigate }) {
     currentDate.getDate(),
   ).padStart(2, "0")}`;
 
-  const selectedYear = currentYear;
+  const [selectedYear, setSelectedYear] =
+    useState(currentYear);
 
   const [selectedMonth, setSelectedMonth] =
     useState(currentMonth);
@@ -61,6 +64,22 @@ function Profile({ onNavigate }) {
   const [approvedLeaves, setApprovedLeaves] =
     useState([]);
 
+  const [permissions, setPermissions] =
+    useState([]);
+
+  // Pending/approved permissions by date, sorted by start time.
+  const permissionsByDate = useMemo(() => {
+    const map = {};
+    permissions.forEach((item) => {
+      const key = String(item?.permission_date || "").slice(0, 10);
+      if (key) (map[key] = map[key] || []).push(item);
+    });
+    Object.values(map).forEach((items) =>
+      items.sort((a, b) => String(a.start_time).localeCompare(String(b.start_time))),
+    );
+    return map;
+  }, [permissions]);
+
   const [attendanceLoading, setAttendanceLoading] =
     useState(false);
 
@@ -69,6 +88,35 @@ function Profile({ onNavigate }) {
 
   const [selectedAttendanceDate, setSelectedAttendanceDate] =
     useState(null);
+
+  /*
+   * Calendar bounds: this profile employee's joining date through
+   * today + 89 days. Future dates are view-only.
+   */
+  const calendarRange = useMemo(
+    () => buildCalendarRange(user?.joining_date, todayDateKey),
+    [user?.joining_date, todayDateKey],
+  );
+
+  const changeCalendarMonth = (year, month) => {
+    const target = clampMonth(calendarRange, year, month);
+    setSelectedYear(target.year);
+    setSelectedMonth(target.month);
+  };
+
+  const selectAttendanceDate = (dateString) => {
+    if (isSelectableDate(calendarRange, dateString)) {
+      setSelectedAttendanceDate(dateString);
+    }
+  };
+
+  useEffect(() => {
+    if (!isMonthInRange(calendarRange, selectedYear, selectedMonth)) {
+      const target = clampMonth(calendarRange, selectedYear, selectedMonth);
+      setSelectedYear(target.year);
+      setSelectedMonth(target.month);
+    }
+  }, [calendarRange, selectedYear, selectedMonth]);
 
   useEffect(() => {
     let cancelled = false;
@@ -432,6 +480,36 @@ function Profile({ onNavigate }) {
             : [];
 
         setApprovedLeaves(approvedOnly);
+
+        /*
+         * --------------------------------------------------------
+         * PERMISSIONS (pending + approved) FOR THE CALENDAR
+         * --------------------------------------------------------
+         */
+
+        const permissionResponse =
+          await fetch(
+            `${LEAVE_API_URL}/permissions/my-requests`,
+            {
+              method: "GET",
+              headers: requestHeaders,
+            },
+          ).catch(() => null);
+
+        const permissionData =
+          permissionResponse?.ok
+            ? await permissionResponse.json().catch(() => [])
+            : [];
+
+        setPermissions(
+          Array.isArray(permissionData)
+            ? permissionData.filter((item) =>
+                ["pending", "approved"].includes(
+                  String(item?.status || "").toLowerCase(),
+                ),
+              )
+            : [],
+        );
       } catch (requestError) {
         console.error(
           "Attendance / Leave loading error:",
@@ -445,6 +523,7 @@ function Profile({ onNavigate }) {
 
         setAttendance([]);
         setApprovedLeaves([]);
+        setPermissions([]);
       } finally {
         setAttendanceLoading(false);
       }
@@ -969,7 +1048,11 @@ function Profile({ onNavigate }) {
       day <= daysInMonth;
       day++
     ) {
-      keys.push(formatDate(day));
+      // Dates before joining or beyond the calendar window are not counted.
+      const state = dateState(calendarRange, formatDate(day));
+      if (!state.hidden && !state.afterWindow) {
+        keys.push(formatDate(day));
+      }
     }
 
     return keys;
@@ -977,6 +1060,7 @@ function Profile({ onNavigate }) {
     selectedYear,
     selectedMonth,
     daysInMonth,
+    calendarRange,
   ]);
 
   const presentCount =
@@ -1074,12 +1158,29 @@ function Profile({ onNavigate }) {
     const dateString =
       formatDate(day);
 
+    const state = dateState(
+      calendarRange,
+      dateString,
+    );
+
+    // Before joining: keep the grid cell empty.
+    if (state.hidden) {
+      return (
+        <div
+          aria-hidden="true"
+          style={{ minHeight: "64px", width: "100%" }}
+        />
+      );
+    }
+
     const isToday = dateString === todayDateKey;
 
-    const record =
-      getCombinedRecordForDate(
-        dateString,
-      );
+    // After the 90th day the date is shown without holiday/leave details.
+    const record = state.afterWindow
+      ? null
+      : getCombinedRecordForDate(
+          dateString,
+        );
 
     const statusKey =
       getStatusKey(record);
@@ -1097,14 +1198,24 @@ function Profile({ onNavigate }) {
     const calendarLabel =
       getCalendarLabel(record);
 
+    const dayPermissions =
+      permissionsByDate[dateString] || [];
+
     return (
       <button
         type="button"
         onClick={() =>
-          setSelectedAttendanceDate(
+          selectAttendanceDate(
             dateString,
           )
         }
+        disabled={state.isFuture}
+        aria-label={`${dateString} ${calendarLabel || "Not Marked"}${state.isFuture ? " (upcoming, not selectable)" : ""}`}
+        title={[
+          calendarLabel,
+          ...dayPermissions.map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`),
+          state.isFuture && "Upcoming date · view only",
+        ].filter(Boolean).join(" · ") || undefined}
         className="w-100"
         style={{
           position: "relative",
@@ -1113,7 +1224,9 @@ function Profile({ onNavigate }) {
 
           border: isSelected
             ? "2px solid #0d6efd"
-            : "1px solid rgba(0,0,0,0.12)",
+            : state.isFuture
+              ? "1px dashed rgba(0,0,0,0.25)"
+              : "1px solid rgba(0,0,0,0.12)",
 
           borderRadius: "8px",
 
@@ -1122,7 +1235,9 @@ function Profile({ onNavigate }) {
 
           color: colors.text,
 
-          cursor: "pointer",
+          opacity: state.isFuture ? 0.8 : 1,
+
+          cursor: state.isFuture ? "not-allowed" : "pointer",
 
           padding: "4px 2px",
 
@@ -1193,6 +1308,22 @@ function Profile({ onNavigate }) {
             }}
           >
             {calendarLabel}
+          </div>
+        )}
+
+        {dayPermissions.length > 0 && (
+          <div
+            style={{
+              fontSize: "9px",
+              fontWeight: "700",
+              maxWidth: "95%",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            P {dayPermissions[0].start_time}–{dayPermissions[0].end_time}
+            {dayPermissions.length > 1 ? ` +${dayPermissions.length - 1}` : ""}
           </div>
         )}
       </button>
@@ -1370,7 +1501,7 @@ function Profile({ onNavigate }) {
               </h4>
 
               <p className="text-muted mb-0">
-                {user.role ||
+                {roleLabel(user.role) ||
                   "Unassigned"}
               </p>
             </div>
@@ -1485,7 +1616,7 @@ function Profile({ onNavigate }) {
                   </small>
 
                   <div className="fw-semibold">
-                    {user.role ||
+                    {roleLabel(user.role) ||
                       "Unassigned"}
                   </div>
                 </div>
@@ -1568,7 +1699,7 @@ function Profile({ onNavigate }) {
                 ATTENDANCE HEADER
             ================================================== */}
 
-            <div className="d-flex justify-content-between align-items-center mb-3">
+            <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
               <div>
                 <h5 className="mb-1">
                   Attendance
@@ -1581,67 +1712,65 @@ function Profile({ onNavigate }) {
 
               <div className="d-flex gap-2">
 
-                {/* MONTH */}
+                {/* MONTH: joining month through the 90-day window */}
 
                 <select
                   className="form-select"
+                  aria-label="Month"
                   value={selectedMonth}
                   onChange={(event) => {
-                    setSelectedMonth(
+                    changeCalendarMonth(
+                      selectedYear,
                       Number(
                         event.target.value,
                       ),
                     );
                   }}
                   style={{
-                    minWidth: "150px",
+                    minWidth: "130px",
                   }}
                 >
-                  {monthNames.map(
-                    (
-                      month,
-                      index,
-                    ) => {
-                      const monthNumber =
-                        index + 1;
-
-                      return (
-                        <option
-                          key={
-                            monthNumber
-                          }
-                          value={
-                            monthNumber
-                          }
-                          disabled={
-                            monthNumber >
-                            currentMonth
-                          }
-                        >
-                          {month}
-                        </option>
-                      );
-                    },
-                  )}
+                  {monthOptions(
+                    calendarRange,
+                    selectedYear,
+                  ).map((item) => (
+                    <option
+                      key={item.value}
+                      value={item.value}
+                    >
+                      {item.label}
+                    </option>
+                  ))}
                 </select>
 
                 {/* YEAR */}
 
                 <select
                   className="form-select"
+                  aria-label="Year"
                   value={selectedYear}
-                  disabled
+                  onChange={(event) => {
+                    changeCalendarMonth(
+                      Number(
+                        event.target.value,
+                      ),
+                      selectedMonth,
+                    );
+                  }}
                   style={{
                     minWidth: "100px",
                   }}
                 >
-                  <option
-                    value={
-                      currentYear
-                    }
-                  >
-                    {currentYear}
-                  </option>
+                  {yearOptions(
+                    calendarRange,
+                  ).map((year) => (
+                    <option
+                      key={year}
+                      value={year}
+                    >
+                      {year}
+                    </option>
+                  ))}
                 </select>
 
               </div>
@@ -2409,6 +2538,28 @@ function Profile({ onNavigate }) {
                       </div>
                     )}
 
+                    {/* PERMISSION ON THE SELECTED DATE */}
+
+                    {(permissionsByDate[selectedAttendanceDate] || []).length > 0 && (
+                      <div className="card mt-3 border-info">
+                        <div className="card-body">
+                          <h6 className="text-info-emphasis mb-2">
+                            Permission
+                          </h6>
+
+                          {permissionsByDate[selectedAttendanceDate].map((item, index) => (
+                            <p className="mb-1" key={`${item.start_time}-${index}`}>
+                              <strong>{item.start_time} – {item.end_time}</strong>{" "}
+                              <span className={`badge ${item.status === "approved" ? "bg-success" : "bg-warning text-dark"}`}>
+                                {item.status === "approved" ? "Approved" : "Pending"}
+                              </span>
+                              {item.reason && <span className="text-muted ms-2">{item.reason}</span>}
+                            </p>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                   </div>
                 )}
 
@@ -2420,7 +2571,8 @@ function Profile({ onNavigate }) {
             userId="me"
             title="Daily working time and breaks"
             date={selectedAttendanceDate || undefined}
-            onDateChange={setSelectedAttendanceDate}
+            minDate={minSelectableDate(calendarRange)}
+            onDateChange={selectAttendanceDate}
           />
 
 

@@ -155,6 +155,60 @@ def company_today() -> date:
     return company_now().date()
 
 
+def employee_joining_date(user: dict[str, Any]) -> date | None:
+    """Authoritative joining date: the user record, else employee details."""
+    value = user.get("date_of_joining")
+    if value is None and user.get("_id") is not None:
+        details = db["employee_details"].find_one(
+            {"user_id": str(user["_id"])},
+            {"date_of_joining": 1},
+        )
+        value = details.get("date_of_joining") if details else None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10]) if value else None
+    except ValueError:
+        return None
+
+
+# Attendance calendars cover today and the following 89 days (a 90-day window).
+CALENDAR_FORWARD_DAYS = 89
+
+
+def validate_calendar_month(year: int, month: int, joining: date | None, today: date) -> tuple[date, date]:
+    """Months from the joining month through the end of the 90-day window."""
+    if month < 1 or month > 12:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid month.")
+    window_end = today + timedelta(days=CALENDAR_FORWARD_DAYS)
+    latest = max((window_end.year, window_end.month), (joining.year, joining.month) if joining else (0, 0))
+    if year < 2000 or (year, month) > latest:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Months beyond the 90-day attendance calendar cannot be viewed.")
+    # The current month always loads (pages open on it before they know the
+    # joining date); its pre-joining dates are still marked Before Joining.
+    earliest = min((joining.year, joining.month), (today.year, today.month)) if joining else None
+    if earliest and (year, month) < earliest:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"The attendance calendar starts from the joining month ({joining.strftime('%B %Y')}).",
+        )
+    last_day = (date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1))
+    return date(year, month, 1), last_day
+
+
+def assert_on_or_after_joining(user: dict[str, Any], attendance_date: date) -> None:
+    """Reject attendance writes dated before the employee's joining date."""
+    joining = employee_joining_date(user)
+    if joining and attendance_date < joining:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Attendance cannot be recorded for {attendance_date.isoformat()} because it is before "
+            f"the employee's joining date ({joining.isoformat()}).",
+        )
+
+
 def _start_time() -> time:
     """
     Convert COMPANY_START_TIME into a time object.
@@ -665,8 +719,14 @@ def _apply_leave_to_date(
         },
         {
             "employee_id": 1,
+            "date_of_joining": 1,
         },
     ) or {}
+
+    # Automated leave sync never creates attendance before the joining date.
+    joining = employee_joining_date({"_id": ObjectId(user_id), **user})
+    if joining and date_iso < joining.isoformat():
+        return
 
     fields = _build_leave_attendance_fields(
         leave,
@@ -2467,6 +2527,7 @@ def wfh_check_in(
     user = _require_wfh_employee(authorization)
     _assert_wfh_email_scope(authorization, "check_in")
     user_id = str(user["_id"])
+    assert_on_or_after_joining(user, company_today())
     distance, radius, approved_location_name, approved_latitude, approved_longitude, approved_location_id, _ = _validate_wfh_biometric_attendance(
         user,
         payload,
@@ -2541,6 +2602,7 @@ def wfh_check_out(
     user = _require_wfh_employee(authorization)
     _assert_wfh_email_scope(authorization, "check_out")
     user_id = str(user["_id"])
+    assert_on_or_after_joining(user, company_today())
     distance, radius, approved_location_name, approved_latitude, approved_longitude, approved_location_id, _ = _validate_wfh_biometric_attendance(
         user,
         payload,
@@ -2790,6 +2852,8 @@ def save_attendance(
     user_id = str(
         user["_id"]
     )
+
+    assert_on_or_after_joining(user, selected)
 
     # ------------------------------------------------------------------
     # Find approved leave for this employee/date
@@ -3202,26 +3266,13 @@ def get_my_attendance(
         user["_id"]
     )
 
-    today = company_today()
-
-    # Current year only.
-    if year != today.year:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Only the current year can be viewed",
-        )
-
-    if month < 1 or month > 12:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Invalid month",
-        )
-
-    if month > today.month:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Future months cannot be viewed",
-        )
+    # Joining month through the 90-day calendar window, as on My Attendance.
+    validate_calendar_month(
+        year,
+        month,
+        employee_joining_date(user),
+        company_today(),
+    )
 
     start_date = (
         f"{year:04d}-{month:02d}-01"

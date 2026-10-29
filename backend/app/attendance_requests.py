@@ -23,17 +23,21 @@ from pymongo.errors import DuplicateKeyError
 
 from app import leave
 from app.attendance import (
+    CALENDAR_FORWARD_DAYS,
     COMPANY_TZ,
     WEEKDAY_NAMES,
     company_weekly_off_weekdays,
     _approved_leaves_for_date,
     _current_user,
+    _get_leave_type_code,
+    _leave_covers,
     _require_hr_admin,
     _sync_leave_for_user_range,
     attendance_collection,
     audit_logs_collection,
     company_today,
     users_collection,
+    validate_calendar_month,
 )
 from app.db.mongodb import db
 
@@ -190,13 +194,54 @@ def _attendance_category(record: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _validate_month(year: int, month: int) -> tuple[date, date]:
-    today = company_today()
-    if month < 1 or month > 12:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid month.")
-    if year < 2000 or (year, month) > (today.year, today.month):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Future months cannot be viewed.")
-    return date(year, month, 1), date(year, month, monthrange(year, month)[1])
+def _validate_month(year: int, month: int, joining: date | None = None) -> tuple[date, date]:
+    return validate_calendar_month(year, month, joining, company_today())
+
+
+def _upcoming_leave(user_id: str, start: date, end: date, today: date) -> dict[date, dict[str, Any]]:
+    """Approved leave on future dates of the range (not yet synced to attendance)."""
+    first = max(start, today + timedelta(days=1))
+    if first > end:
+        return {}
+    result: dict[date, dict[str, Any]] = {}
+    for request in db["leave_requests"].find({
+        "user_id": user_id, "status": "approved",
+        "from_date": {"$lte": end.isoformat()}, "to_date": {"$gte": first.isoformat()},
+    }):
+        leave_type_id = str(request.get("leave_type_id") or "")
+        leave_type = db["leave_types"].find_one({"_id": ObjectId(leave_type_id)}, {"name": 1}) if ObjectId.is_valid(leave_type_id) else None
+        details = {
+            "leave_type_code": _get_leave_type_code(request),
+            "leave_type_name": (leave_type or {}).get("name"),
+            "day_part": request.get("day_part") or "full_day",
+            "from_date": str(request["from_date"])[:10],
+            "to_date": str(request["to_date"])[:10],
+        }
+        current = max(first, date.fromisoformat(details["from_date"]))
+        stop = min(end, date.fromisoformat(details["to_date"]))
+        while current <= stop:
+            if _leave_covers(request, current.isoformat()):
+                result[current] = details
+            current += timedelta(days=1)
+    return result
+
+
+def _permissions_by_date(user_id: str, start: date, end: date) -> dict[date, list[dict[str, Any]]]:
+    """Pending and approved permission requests in the range, per date."""
+    if start > end:
+        return {}
+    result: dict[date, list[dict[str, Any]]] = {}
+    for item in db["permission_requests"].find({
+        "user_id": user_id, "status": {"$in": ["pending", "approved"]},
+        "permission_date": {"$gte": start.isoformat(), "$lte": end.isoformat()},
+    }).sort("start_time", 1):
+        result.setdefault(date.fromisoformat(str(item["permission_date"])[:10]), []).append({
+            "start_time": item.get("start_time"),
+            "end_time": item.get("end_time"),
+            "status": item.get("status"),
+            "reason": item.get("reason"),
+        })
+    return result
 
 
 def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
@@ -204,6 +249,9 @@ def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     user_id = str(user["_id"])
+    today = company_today()
+    # Holiday, leave and permission details are shown only up to the 90th day.
+    window_end = today + timedelta(days=CALENDAR_FORWARD_DAYS)
     # Same lazy approved-leave sync as GET /api/attendance/my (idempotent).
     _sync_leave_for_user_range(user_id, start.isoformat(), end.isoformat())
     return {
@@ -218,7 +266,10 @@ def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any
         "holidays": leave._holiday_names(user, start, end),
         "weekly_offs": company_weekly_off_weekdays(),
         "joining": leave._joining_date(user),
-        "today": company_today(),
+        "today": today,
+        "window_end": window_end,
+        "upcoming_leave": _upcoming_leave(user_id, start, min(end, window_end), today),
+        "permissions": _permissions_by_date(user_id, start, min(end, window_end)),
     }
 
 
@@ -226,6 +277,17 @@ def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any
     if record:
         return str(record.get("status") or "Not Marked")
     if current > ctx["today"]:
+        # Future dates show known holidays, approved leave and weekly offs.
+        if ctx["joining"] and current < ctx["joining"]:
+            return BEFORE_JOINING
+        if current > ctx.get("window_end", date.max):
+            return "Upcoming"
+        if current in ctx["holidays"]:
+            return "Holiday"
+        if current in ctx.get("upcoming_leave", {}):
+            return "Leave"
+        if current.weekday() in ctx["weekly_offs"]:
+            return "Weekly Off"
         return "Upcoming"
     if current in ctx["holidays"]:
         return "Holiday"
@@ -365,7 +427,7 @@ def _status_options(base_status: str, usage: dict[str, int], weekly_limit: int) 
 
 def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
     """Authoritative per-date status, request eligibility and options for one month."""
-    _validate_month(year, month)
+    _validate_month(year, month, leave._joining_date(user))
     ctx = _month_context(user, year, month)
     user_id = str(user["_id"])
     employee_id = str(user.get("employee_id") or "")
@@ -396,6 +458,9 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         iso = current.isoformat()
         record = ctx["records"].get(iso)
         day_status = _day_status(current, record, ctx)
+        in_window = current <= ctx["window_end"]
+        upcoming_leave = ctx["upcoming_leave"].get(current)
+        permissions = ctx["permissions"].get(current, [])
 
         claim_request = requests_by_id.get(claims.get(iso, ""))
         request_info = None
@@ -412,10 +477,11 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         reason = None
         if current >= today:
             reason = "Requests are for past dates only; today's attendance can still be marked."
+        elif day_status == BEFORE_JOINING or (ctx["joining"] and current < ctx["joining"]):
+            # Includes pre-joining weekly offs and holidays.
+            reason = "This date is before your joining date."
         elif day_status == "Leave":
             reason = "Leave dates are managed in the Leave module."
-        elif day_status == BEFORE_JOINING:
-            reason = "This date is before your joining date."
         elif day_status not in STATUS_TRANSITIONS:
             reason = f"{day_status} dates cannot be corrected through an attendance request."
         elif request_info:
@@ -433,11 +499,19 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             "attendance_source": record.get("attendance_source") if record else None,
             "check_in_time": record.get("check_in_time") if record else None,
             "check_out_time": record.get("check_out_time") if record else None,
-            "leave_type_code": record.get("leave_type_code") if record else None,
-            "is_holiday": current in ctx["holidays"],
+            "leave_type_code": record.get("leave_type_code") if record else (upcoming_leave or {}).get("leave_type_code"),
+            "upcoming_leave": upcoming_leave if day_status == "Leave" else None,
+            "permissions": permissions,
+            "is_holiday": current in ctx["holidays"] and in_window,
             "holiday_name": ctx["holidays"].get(current) if day_status == "Holiday" else None,
             "is_weekly_off": current.weekday() in ctx["weekly_offs"],
             "is_future": current > today,
+            "is_after_window": not in_window,
+            # Upcoming holiday / leave / permission dates open a read-only detail view.
+            "has_upcoming_details": current > today and in_window and (
+                day_status in {"Holiday", "Leave"} or bool(permissions)
+            ),
+            "is_before_joining": bool(ctx["joining"] and current < ctx["joining"]),
             "has_record": record is not None,
             "request": request_info,
             "eligible_for_request": reason is None,
@@ -453,6 +527,9 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         "period": period,
         "payroll_status": payroll_status,
         "payroll_locked": payroll_lock,
+        "today": today.isoformat(),
+        "joining_date": ctx["joining"].isoformat() if ctx["joining"] else None,
+        "calendar_end": (today + timedelta(days=CALENDAR_FORWARD_DAYS)).isoformat(),
         "weekly_off_weekdays": [WEEKDAY_NAMES[index] for index in sorted(ctx["weekly_offs"])],
         "weekly_off_configured": bool(ctx["weekly_offs"]),
         "limits": {
@@ -568,6 +645,23 @@ def my_attendance_calendar(
 ):
     """Monthly calendar for the authenticated employee, including request eligibility."""
     return _build_calendar(_current_user(authorization), year, month)
+
+
+@router.get("/calendar/user/{user_id}")
+def employee_attendance_calendar(
+    user_id: str,
+    year: int = Query(...),
+    month: int = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    """The same monthly calendar for one employee; read-only view for HR Admin."""
+    _require_hr_admin(authorization, "Only HR Admin or Administrator can view employee attendance")
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid user ID.")
+    employee = users_collection.find_one({"_id": ObjectId(user_id)})
+    if not employee:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee not found.")
+    return _build_calendar(employee, year, month)
 
 
 @router.get("/eligible-dates")
@@ -929,6 +1023,8 @@ def _apply_date_decision(
         return True, final_status, "Recorded."
     day = date.fromisoformat(attendance_date)
     ctx = _month_context(employee, day.year, day.month)
+    if ctx["joining"] and day < ctx["joining"]:
+        return False, final_status, f"This date is before the employee's joining date ({ctx['joining'].isoformat()}); attendance was not changed."
     current_status = _day_status(day, existing, ctx)
     if not _record_matches_original(item, existing, current_status):
         return False, final_status, f"Attendance for this date changed after the request was submitted (now {current_status}); the existing record was preserved."

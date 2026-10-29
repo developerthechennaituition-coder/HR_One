@@ -73,7 +73,7 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
     def setUp(self):
         for name in ["users", "attendance", "attendance_requests", "attendance_request_date_claims",
                      "monthly_payroll_records", "leave_notifications", "employee_holiday_calendars", "holidays", "leave_policies",
-                     "leave_types", "leave_balances", "leave_requests", "essl_raw_punches", "audit_logs"]:
+                     "leave_types", "leave_balances", "leave_requests", "permission_requests", "essl_raw_punches", "audit_logs"]:
             db[name].delete_many({})
         self.today = patch.object(ar, "company_today", return_value=TODAY)
         self.today.start()
@@ -141,8 +141,128 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         october = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 10, self.employee["auth"])["days"]}
         self.assertFalse(october["2026-10-15"]["eligible_for_request"])  # today
         self.assertEqual(october["2026-10-20"]["status"], "Upcoming")
-        self.assert_http(400, ar.my_attendance_calendar, 2026, 11, self.employee["auth"])
+        # The calendar spans the joining month through today + 89 days (2027-01-12).
+        self.assertEqual(len(ar.my_attendance_calendar(2027, 1, self.employee["auth"])["days"]), 31)
+        self.assert_http(400, ar.my_attendance_calendar, 2027, 2, self.employee["auth"])
+        self.assert_http(400, ar.my_attendance_calendar, 2026, 8, self.employee["auth"])  # before the joining month
         self.assertEqual(db["attendance"].count_documents({}), before)
+
+    def test_calendar_window_and_joining_bounds(self):
+        result = ar.my_attendance_calendar(2026, 9, self.employee["auth"])
+        self.assertEqual((result["joining_date"], result["today"], result["calendar_end"]), ("2026-09-02", "2026-10-15", "2027-01-12"))
+        days = {day["attendance_date"]: day for day in result["days"]}
+        self.assertTrue(days["2026-09-01"]["is_before_joining"])
+        self.assertFalse(days["2026-09-02"]["is_before_joining"])
+        # Year boundary and leap-year months inside a window are accepted.
+        with patch.object(ar, "company_today", return_value=date(2027, 12, 15)):
+            self.assertEqual(len(ar.my_attendance_calendar(2028, 2, self.employee["auth"])["days"]), 29)
+            self.assertEqual(ar.my_attendance_calendar(2028, 3, self.employee["auth"])["calendar_end"], "2028-03-13")
+            self.assert_http(400, ar.my_attendance_calendar, 2028, 4, self.employee["auth"])
+        # Profile's monthly attendance endpoint applies the same bounds.
+        with patch.object(attendance_module, "company_today", return_value=TODAY):
+            self.assertEqual(len(attendance_module.get_my_attendance(2026, 9, self.employee["auth"])), 2)
+            self.assertEqual(attendance_module.get_my_attendance(2027, 1, self.employee["auth"]), [])
+            self.assert_http(400, attendance_module.get_my_attendance, 2026, 8, self.employee["auth"])
+            self.assert_http(400, attendance_module.get_my_attendance, 2027, 2, self.employee["auth"])
+        # A future-dated joiner can still open the current month (no 400);
+        # every date in it is before joining and nothing can be requested.
+        db["users"].update_one({"_id": self.employee["_id"]}, {"$set": {"date_of_joining": datetime(2026, 11, 3)}})
+        october = ar.my_attendance_calendar(2026, 10, self.employee["auth"])
+        self.assertEqual(october["joining_date"], "2026-11-03")
+        self.assertTrue(all(day["is_before_joining"] and not day["eligible_for_request"] for day in october["days"]))
+        self.assertEqual(len(ar.my_attendance_calendar(2026, 11, self.employee["auth"])["days"]), 30)
+        self.assert_http(400, ar.my_attendance_calendar, 2026, 9, self.employee["auth"])
+        with patch.object(attendance_module, "company_today", return_value=TODAY):
+            self.assertEqual(attendance_module.get_my_attendance(2026, 10, self.employee["auth"]), [])
+        # A missing joining date does not invent a lower bound.
+        db["users"].update_one({"_id": self.employee["_id"]}, {"$unset": {"date_of_joining": ""}})
+        self.assertIsNone(ar.my_attendance_calendar(2026, 8, self.employee["auth"])["joining_date"])
+
+    def test_future_dates_show_holidays_and_approved_leave_without_records(self):
+        before = db["attendance"].count_documents({})
+        leave_type = db["leave_types"].insert_one({"name": "Casual Leave", "code": "CL"}).inserted_id
+        db["holidays"].insert_one({"calendar_id": "CAL-1", "holiday_date": datetime(2026, 11, 5), "is_active": True, "holiday_name": "Deepavali"})
+        db["leave_requests"].insert_one({
+            "user_id": str(self.employee["_id"]), "status": "approved", "leave_type_id": str(leave_type),
+            "from_date": "2026-11-10", "to_date": "2026-11-11", "leave_dates": ["2026-11-10", "2026-11-11"], "day_part": "full_day",
+        })
+        days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 11, self.employee["auth"])["days"]}
+        self.assertEqual((days["2026-11-05"]["status"], days["2026-11-05"]["is_holiday"]), ("Holiday", True))
+        self.assertEqual((days["2026-11-10"]["status"], days["2026-11-10"]["leave_type_code"]), ("Leave", "CL"))
+        self.assertEqual(days["2026-11-08"]["status"], "Weekly Off")
+        self.assertEqual(days["2026-11-12"]["status"], "Upcoming")
+        for iso in ["2026-11-05", "2026-11-10", "2026-11-12"]:
+            self.assertTrue(days[iso]["is_future"], iso)
+            self.assertFalse(days[iso]["eligible_for_request"], iso)
+        self.assertEqual(db["attendance"].count_documents({}), before)  # Nothing is generated for future cells.
+
+    def test_last_window_month_is_full_but_details_stop_at_the_90th_day(self):
+        # TODAY = 2026-10-15, so the 90th day is 2027-01-12.
+        db["holidays"].insert_many([
+            {"calendar_id": "CAL-1", "holiday_date": datetime(2027, 1, 11), "is_active": True, "holiday_name": "Pongal"},
+            {"calendar_id": "CAL-1", "holiday_date": datetime(2027, 1, 20), "is_active": True, "holiday_name": "Later"},
+        ])
+        db["permission_requests"].insert_many([
+            {"user_id": str(self.employee["_id"]), "permission_date": "2026-10-20", "start_time": "10:00", "end_time": "11:00", "status": "approved", "reason": "Bank"},
+            {"user_id": str(self.employee["_id"]), "permission_date": "2026-10-21", "start_time": "10:00", "end_time": "11:00", "status": "rejected", "reason": "No"},
+            {"user_id": str(self.employee["_id"]), "permission_date": "2027-01-14", "start_time": "10:00", "end_time": "11:00", "status": "pending", "reason": "Late"},
+        ])
+        january = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2027, 1, self.employee["auth"])["days"]}
+        self.assertEqual(len(january), 31)  # The whole month of the 90th day is returned.
+        self.assertEqual(january["2027-01-11"]["status"], "Holiday")
+        self.assertTrue(january["2027-01-11"]["has_upcoming_details"])
+        self.assertFalse(january["2027-01-12"]["is_after_window"])
+        for iso in ["2027-01-13", "2027-01-14", "2027-01-20"]:
+            self.assertTrue(january[iso]["is_after_window"], iso)
+            self.assertEqual(january[iso]["status"], "Upcoming", iso)
+            self.assertFalse(january[iso]["has_upcoming_details"], iso)
+            self.assertEqual(january[iso]["permissions"], [], iso)
+        october = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 10, self.employee["auth"])["days"]}
+        self.assertEqual([(p["start_time"], p["status"]) for p in october["2026-10-20"]["permissions"]], [("10:00", "approved")])
+        self.assertTrue(october["2026-10-20"]["has_upcoming_details"])
+        self.assertEqual(october["2026-10-21"]["permissions"], [])  # Rejected permissions are not shown.
+        self.assertFalse(october["2026-10-21"]["has_upcoming_details"])
+        # HR Admin sees the same calendar for the employee; employees cannot use the HR view.
+        hr_view = ar.employee_attendance_calendar(str(self.employee["_id"]), 2026, 10, self.hr["auth"])
+        self.assertEqual(hr_view["days"], ar.my_attendance_calendar(2026, 10, self.employee["auth"])["days"])
+        self.assert_http(403, ar.employee_attendance_calendar, str(self.other["_id"]), 2026, 10, self.employee["auth"])
+        self.assert_http(404, ar.employee_attendance_calendar, str(ObjectId()), 2026, 10, self.hr["auth"])
+
+    def test_approval_does_not_write_before_the_joining_date(self):
+        created = ar.create_attendance_request(payload(("2026-09-07", "Present", "09:00", "18:00")), self.employee["auth"])
+        # HR later corrects the joining date to after the requested date.
+        db["users"].update_one({"_id": self.employee["_id"]}, {"$set": {"date_of_joining": datetime(2026, 9, 10)}})
+        detail = self.assert_http(409, ar.respond_to_attendance_request, created["id"], decisions(("2026-09-07", "Present", "09:00", "18:00")), self.hr["auth"])
+        self.assertIn("before the employee's joining date (2026-09-10)", detail["dates"][0]["message"])
+        self.assertIsNone(db["attendance"].find_one({"user_id": str(self.employee["_id"]), "attendance_date": "2026-09-07"}))
+
+    def test_manual_wfh_and_leave_sync_respect_the_joining_date(self):
+        user_id = str(self.employee["_id"])
+        with patch.object(attendance_module, "company_today", return_value=date(2026, 9, 2)):
+            # Manual attendance: yesterday is before joining, today is allowed.
+            detail = self.assert_http(400, attendance_module.save_attendance, attendance_module.AttendanceCreate(
+                user_id=user_id, attendance_date="2026-09-01", status="Absent"), self.hr["auth"])
+            self.assertIn("before the employee's joining date (2026-09-02)", detail)
+            attendance_module.save_attendance(attendance_module.AttendanceCreate(
+                user_id=user_id, attendance_date="2026-09-02", status="Absent"), self.hr["auth"])
+            self.assertEqual(db["attendance"].find_one({"user_id": user_id, "attendance_date": "2026-09-02"})["status"], "Absent")
+        # WFH check-in is refused before the joining date, ahead of biometric checks.
+        with (
+            patch.object(attendance_module, "company_today", return_value=date(2026, 9, 1)),
+            patch.object(attendance_module, "_ensure_wfh_attendance_enabled"),
+            patch.object(attendance_module, "_require_wfh_employee", return_value=self.employee),
+            patch.object(attendance_module, "_assert_wfh_email_scope"),
+            patch.object(attendance_module, "_validate_wfh_biometric_attendance") as biometric,
+        ):
+            self.assert_http(400, attendance_module.wfh_check_in, None, self.employee["auth"])
+            self.assert_http(400, attendance_module.wfh_check_out, None, self.employee["auth"])
+            biometric.assert_not_called()
+        # Automated leave sync skips pre-joining dates and keeps later ones.
+        leave_request = {"_id": ObjectId(), "user_id": user_id, "day_part": "full_day"}
+        attendance_module._apply_leave_to_date(leave_request, "2026-09-01", override_absent=False)
+        attendance_module._apply_leave_to_date(leave_request, "2026-09-05", override_absent=False)
+        self.assertIsNone(db["attendance"].find_one({"user_id": user_id, "attendance_date": "2026-09-01"}))
+        self.assertEqual(db["attendance"].find_one({"user_id": user_id, "attendance_date": "2026-09-05"})["status"], "Leave")
 
     # -- Employee requests --------------------------------------------------
 

@@ -141,6 +141,12 @@
   box-shadow: 0 3px 8px rgba(0, 0, 0, 0.12);
 }
 
+/* Upcoming dates are view-only. */
+.team-attendance-day:disabled:hover {
+  transform: none;
+  box-shadow: none;
+}
+
 .team-calendar-weekday {
   font-size: 9px;
   opacity: 0.85;

@@ -18,10 +18,12 @@ from pymongo.errors import DuplicateKeyError
 from pymongo import ReturnDocument
 
 from app.attendance import (
+    CALENDAR_FORWARD_DAYS,
     COMPANY_START_TIME,
     WEEKDAY_NAMES,
     company_now,
     company_weekly_off_weekdays,
+    employee_joining_date,
     leave_cancel_deadline,
     remove_leave_attendance,
     sync_leave_for_today,
@@ -52,6 +54,16 @@ APPROVER_ROLES = {"hr admin", "administrator", "hr manager"}
 MEDICAL_LEAVE_CODE = "ML"
 MEDICAL_LEAVE_DAYS_PER_MONTH = 1
 HR_ADMIN_ROLE = "hr admin"
+# The HOD role keeps its stored identifier "HR Manager" (permissions and
+# role_id depend on it); only the displayed label is "HOD".
+HOD_ROLE = "hr manager"
+PENDING_STATUSES = ("pending", "pending_hr_admin")
+# Approval stage -> (assignment field on the user, required approver role, label).
+APPROVAL_STAGES: dict[str, tuple[str, str | None, str]] = {
+    "reporting_manager": ("reporting_manager_id", None, "Reporting Manager"),
+    "hod": ("hod_id", HOD_ROLE, "HOD"),
+    "hr_admin": ("hr_admin_id", HR_ADMIN_ROLE, "HR Admin"),
+}
 
 
 class LeaveTypeCreate(BaseModel):
@@ -377,21 +389,145 @@ def _direct_report_ids(manager_id: str) -> set[str]:
     return report_ids
 
 
-def _is_reporting_manager_for(record: dict[str, Any], approver: dict[str, Any]) -> bool:
-    manager_id = str(approver["_id"])
-    assigned_manager_id = record.get("reporting_manager_id")
-    if assigned_manager_id:
-        return str(assigned_manager_id) == manager_id
-    employee = users_collection.find_one(
-        {"_id": _parse_object_id(record["user_id"], "employee user")},
-        {"reporting_manager_id": 1},
+def _applicant_category(user: dict[str, Any]) -> str:
+    """Role precedence for leave routing: HR Admin > Reporting Manager > employee.
+
+    A Reporting Manager is anyone with at least one active direct report
+    (the existing Team Members rule), whatever their stored role.
+    """
+    if _is_hr_admin(user):
+        return "hr_admin"
+    if _direct_report_ids(str(user["_id"])):
+        return "reporting_manager"
+    return "employee"
+
+
+def _required_approval_stage(category: str, days: float) -> str:
+    """Approval level for an applicant category and leave duration (working days)."""
+    if category == "hr_admin":
+        return "hr_admin"
+    if category == "reporting_manager":
+        return "hod" if days <= 1 else "hr_admin"
+    if days <= 1:
+        return "reporting_manager"
+    if days <= 2:
+        return "hod"
+    return "hr_admin"
+
+
+def resolve_leave_approver(user: dict[str, Any], days: float) -> tuple[str, dict[str, Any]]:
+    """The single approver for this applicant and duration, validated.
+
+    Raises HTTP 400 with a clear message when the assigned approver is
+    missing, inactive, lacks the required role or is the applicant.
+    """
+    stage = _required_approval_stage(_applicant_category(user), days)
+    field, required_role, label = APPROVAL_STAGES[stage]
+    approver_id = (
+        _get_reporting_manager_id(user)
+        if stage == "reporting_manager"
+        else (str(user[field]) if user.get(field) else None)
     )
-    return bool(employee and _get_reporting_manager_id(employee) == manager_id)
+    duration = f"{days:g} day(s) of leave"
+    if not approver_id or not ObjectId.is_valid(approver_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {label} is assigned to approve {duration}. Please ask HR Admin to assign a valid {label} in your employee details.",
+        )
+    approver = users_collection.find_one({"_id": ObjectId(approver_id), "is_active": True})
+    if (
+        not approver
+        or approver_id == str(user["_id"])
+        or (required_role and str(approver.get("role", "")).strip().lower() != required_role)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"The assigned {label} cannot approve {duration}: the account is inactive, does not have the {label} role, or is the applicant. Please ask HR Admin to assign a valid {label} in your employee details.",
+        )
+    return stage, approver
 
 
-def _notify_user_role(role: str, title: str, message: str, request_id: str | None = None) -> None:
-    for approver in users_collection.find({"is_active": True, "role": {"$regex": f"^{role}$", "$options": "i"}}):
-        _notify(str(approver["_id"]), title, message, request_id=request_id)
+def _history_entry(action: str, stage: str | None, approver: dict[str, Any] | None, now: datetime, **extra: Any) -> dict[str, Any]:
+    return {
+        "action": action,
+        "stage": stage,
+        "approver_id": str(approver["_id"]) if approver else None,
+        "approver_name": approver.get("name") if approver else None,
+        "at": now,
+        **extra,
+    }
+
+
+def _reroute_pending_request(record: dict[str, Any]) -> str:
+    """Recalculate the approver of one pending request. Returns the outcome."""
+    request_id = str(record["_id"])
+    employee_id = str(record.get("user_id", ""))
+    employee = users_collection.find_one({"_id": ObjectId(employee_id)}) if ObjectId.is_valid(employee_id) else None
+    now = datetime.now(timezone.utc)
+    match = {"_id": record["_id"], "status": record.get("status"), "approver_id": record.get("approver_id")}
+    try:
+        if not employee:
+            raise HTTPException(status_code=400, detail="The applicant account is missing.")
+        stage, approver = resolve_leave_approver(employee, float(record.get("days", 0)))
+    except HTTPException as exc:
+        # Never auto-approve, reject or hand the request to an arbitrary user.
+        if record.get("approver_id") or record.get("routing_problem") != exc.detail:
+            leave_requests_collection.update_one(match, {
+                "$set": {"approver_id": None, "routing_problem": exc.detail, "updated_at": now},
+                "$push": {"approval_history": _history_entry("unassigned", None, None, now, reason=exc.detail)},
+            })
+            logger.warning("Leave request %s has no valid approver: %s", request_id, exc.detail)
+        return "unassigned"
+    approver_id = str(approver["_id"])
+    if record.get("approver_id") == approver_id and record.get("approval_stage") == stage and record.get("status") == "pending":
+        if record.get("routing_problem"):
+            leave_requests_collection.update_one(match, {"$unset": {"routing_problem": ""}})
+        return "unchanged"
+    result = leave_requests_collection.update_one(match, {
+        "$set": {"status": "pending", "approval_stage": stage, "approver_id": approver_id, "updated_at": now},
+        "$unset": {"routing_problem": ""},
+        "$push": {"approval_history": _history_entry(
+            "reassigned" if record.get("approver_id") else "assigned", stage, approver, now,
+            previous_approver_id=record.get("approver_id"),
+        )},
+    })
+    if result.matched_count:
+        name = employee.get("name", "Employee")
+        _notify(
+            approver_id,
+            "Leave Request Assigned for Approval",
+            f"{name}'s {float(record.get('days', 0)):g} day(s) leave request from {record.get('from_date')} is now assigned to you for {APPROVAL_STAGES[stage][2]} approval.",
+            request_id=request_id,
+        )
+        return "reassigned"
+    return "conflict"
+
+
+def reroute_pending_leave_requests(user_ids: list[str] | set[str]) -> int:
+    """Re-evaluate pending leave of these applicants and of requests they approve.
+
+    Called when HR Admin changes reporting assignments, roles or account status.
+    Completed requests are never touched.
+    """
+    ids = sorted({str(value) for value in user_ids if value})
+    if not ids:
+        return 0
+    changed = 0
+    for record in list(leave_requests_collection.find({
+        "status": {"$in": list(PENDING_STATUSES)},
+        "$or": [{"user_id": {"$in": ids}}, {"approver_id": {"$in": ids}}],
+    })):
+        changed += _reroute_pending_request(record) == "reassigned"
+    return changed
+
+
+def _reconcile_pending_leave_routing() -> None:
+    """Startup migration: give every legacy pending request a single valid approver."""
+    for record in list(leave_requests_collection.find({
+        "status": {"$in": list(PENDING_STATUSES)},
+        "approver_id": {"$exists": False},
+    })):
+        _reroute_pending_request(record)
 
 
 def _notify_approvers_of_cancellation(
@@ -419,50 +555,23 @@ def _notify_approvers_of_cancellation(
         f"Employee {display_employee_id} - {employee_name} cancelled their "
         f"{days:g} day(s) leave request for {record.get('from_date', 'the selected dates')}."
     )
-    notified_user_ids: set[str] = set()
-
-    if old_status in {"pending", "pending_hr_admin", "approved"}:
-        manager_id = record.get("reporting_manager_id")
-        if not manager_id and employee:
-            manager_id = _get_reporting_manager_id(
-                {"_id": ObjectId(employee_id), **employee}
-            )
-        manager_id = str(manager_id) if manager_id else ""
-        if ObjectId.is_valid(manager_id):
-            manager = users_collection.find_one(
-                {"_id": ObjectId(manager_id), "is_active": True},
-                {"_id": 1},
-            )
-            if manager:
-                manager_user_id = str(manager["_id"])
-                _notify(
-                    manager_user_id,
-                    "Leave Request Cancelled",
-                    message,
-                    request_id=request_id,
-                )
-                notified_user_ids.add(manager_user_id)
-
-    if old_status == "pending_hr_admin" or (
-        old_status == "approved" and days >= 2
-    ):
-        hr_admins = users_collection.find(
-            {
-                "is_active": True,
-                "role": {"$regex": f"^{HR_ADMIN_ROLE}$", "$options": "i"},
-            },
-            {"_id": 1},
-        )
-        for approver in hr_admins:
-            approver_id = str(approver["_id"])
-            if approver_id not in notified_user_ids:
-                _notify(
-                    approver_id,
-                    "Leave Request Cancelled",
-                    message,
-                    request_id=request_id,
-                )
-                notified_user_ids.add(approver_id)
+    if old_status not in {"pending", "pending_hr_admin", "approved"}:
+        return
+    # Only the approver this request was assigned to (or who approved it).
+    if old_status == "approved":
+        approver_id = record.get("approved_by")
+    else:
+        approver_id = record.get("approver_id")
+    if not approver_id and "approver_id" not in record:
+        # Requests created before single-approver routing.
+        approver_id = record.get("reporting_manager_id")
+        if not approver_id and employee:
+            approver_id = _get_reporting_manager_id({"_id": ObjectId(employee_id), **employee})
+    approver_id = str(approver_id) if approver_id else ""
+    if ObjectId.is_valid(approver_id) and approver_id != employee_id:
+        approver = users_collection.find_one({"_id": ObjectId(approver_id), "is_active": True}, {"_id": 1})
+        if approver:
+            _notify(str(approver["_id"]), "Leave Request Cancelled", message, request_id=request_id)
 
 
 def _get_leave_type(leave_type_id: str, active_only: bool = True) -> dict[str, Any]:
@@ -485,21 +594,7 @@ def _employee_id_for_user(user: dict[str, Any]) -> str | None:
 
 
 def _joining_date(user: dict[str, Any]) -> date | None:
-    value = user.get("date_of_joining")
-    if value is None:
-        details = employee_details_collection.find_one(
-            {"user_id": str(user["_id"])},
-            {"date_of_joining": 1},
-        )
-        value = details.get("date_of_joining") if details else None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    try:
-        return date.fromisoformat(str(value)[:10]) if value else None
-    except ValueError:
-        return None
+    return employee_joining_date(user)
 
 
 def _add_months(value: date, months: int) -> date:
@@ -668,6 +763,12 @@ def _request_response(record: dict[str, Any], viewer: dict[str, Any] | None = No
     result["employee_name"] = user.get("name") if user else None
     result["employee_id"] = user.get("employee_id") if user else None
     result["day_part_label"] = {"full_day": "Full Day", "first_half": "First Half", "second_half": "Second Half"}.get(result.get("day_part"), "Full Day")
+    approver_id = str(record.get("approver_id") or "")
+    assigned = users_collection.find_one({"_id": ObjectId(approver_id)}, {"name": 1}) if ObjectId.is_valid(approver_id) else None
+    result["assigned_approver_name"] = assigned.get("name") if assigned else None
+    stage = record.get("approved_stage") if record.get("approval_stage") == "completed" else record.get("approval_stage")
+    result["approval_level"] = APPROVAL_STAGES.get(stage or "", (None, None, None))[2]
+    result.pop("approval_history", None)
     result["can_cancel"] = _can_cancel(record, viewer)
     result["cancel_deadline"] = leave_cancel_deadline(record["from_date"]).isoformat() if record.get("from_date") else None
     return result
@@ -799,101 +900,10 @@ def _notify(
     )
 
 
-def _notify_reporting_manager(employee: dict[str, Any], title: str, message: str, request_id: str | None = None) -> None:
-    manager_id = _get_reporting_manager_id(employee)
-    if not manager_id or not ObjectId.is_valid(manager_id):
-        return
-    manager = users_collection.find_one({"_id": ObjectId(manager_id), "is_active": True})
-    if manager:
-        _notify(str(manager["_id"]), title, message, request_id=request_id)
-
-
-def _notify_approvers(title: str, message: str, request_id: str | None = None) -> None:
-    for approver in users_collection.find({"is_active": True}):
-        if str(approver.get("role", "")).strip().lower() in APPROVER_ROLES:
-            _notify(str(approver["_id"]), title, message, request_id=request_id)
-
-
-def _route_legacy_requests_to_reporting_manager() -> None:
-    legacy_requests = leave_requests_collection.find(
-        {
-            "status": "pending_hr_admin",
-            "approval_stage": "hr_admin",
-            "$or": [
-                {"reporting_manager_approved_by": {"$exists": False}},
-                {"reporting_manager_approved_by": None},
-            ],
-        }
-    )
-    for record in legacy_requests:
-        request_id = str(record.get("_id", ""))
-        employee_id = str(record.get("user_id", ""))
-        if not ObjectId.is_valid(employee_id):
-            logger.warning(
-                "Cannot reroute legacy leave request %s: employee ID is invalid.",
-                request_id,
-            )
-            continue
-        employee = users_collection.find_one(
-            {"_id": ObjectId(employee_id), "is_active": True}
-        )
-        if not employee:
-            logger.warning(
-                "Cannot reroute legacy leave request %s: employee is inactive or missing.",
-                request_id,
-            )
-            continue
-
-        manager_id = _get_reporting_manager_id(employee)
-        manager = (
-            users_collection.find_one(
-                {"_id": ObjectId(manager_id), "is_active": True}
-            )
-            if manager_id and ObjectId.is_valid(manager_id)
-            else None
-        )
-        update: dict[str, dict[str, Any]] = {
-            "$set": {
-                "status": "pending",
-                "approval_stage": "reporting_manager",
-                "updated_at": datetime.now(timezone.utc),
-            }
-        }
-        if manager:
-            update["$set"]["reporting_manager_id"] = str(manager["_id"])
-        else:
-            update["$unset"] = {"reporting_manager_id": ""}
-
-        result = leave_requests_collection.update_one(
-            {
-                "_id": record["_id"],
-                "status": "pending_hr_admin",
-                "approval_stage": "hr_admin",
-                "$or": [
-                    {"reporting_manager_approved_by": {"$exists": False}},
-                    {"reporting_manager_approved_by": None},
-                ],
-            },
-            update,
-        )
-        if result.matched_count and manager:
-            _notify(
-                str(manager["_id"]),
-                "Leave Request Requires Reporting Manager Approval",
-                f"{employee.get('name', 'Employee')} has a pending leave request that needs your approval before HR Admin review.",
-                request_id=request_id,
-            )
-        elif result.matched_count:
-            logger.warning(
-                "Legacy leave request %s is waiting for an active Reporting Manager assignment.",
-                request_id,
-            )
-
-
 @router.on_event("startup")
 def startup_leave_module():
     ensure_leave_indexes()
-    _route_legacy_requests_to_reporting_manager()
+    _reconcile_pending_leave_routing()
 
 
 @router.get("/types")
@@ -915,12 +925,53 @@ def get_leave_balance(authorization: str | None = Header(default=None), year: in
     return response_data
 
 
+# Permission can be applied for today and the next 14 days.
+PERMISSION_FORWARD_DAYS = 14
+
+
+def _validate_leave_window(from_date: date, to_date: date) -> None:
+    """Leave dates must fall between today and the 90th day (today + 89)."""
+    today = company_now().date()
+    last_day = today + timedelta(days=CALENDAR_FORWARD_DAYS)
+    if from_date < today:
+        raise HTTPException(status_code=400, detail="Leave cannot be applied for a past date. Choose today or a later date.")
+    if to_date > last_day:
+        raise HTTPException(status_code=400, detail=f"Leave can be applied only up to {last_day.isoformat()} (90 days including today).")
+
+
+@router.get("/approval-preview")
+def leave_approval_preview(
+    from_date: date,
+    to_date: date,
+    day_part: str = Query(default="full_day", pattern="^(full_day|first_half|second_half)$"),
+    authorization: str | None = Header(default=None),
+):
+    """Duration and approver the backend would use; informational only."""
+    user = _current_user(authorization)
+    if day_part != "full_day" and from_date != to_date:
+        raise HTTPException(status_code=400, detail="Half-day leave can be applied for a single date only")
+    try:
+        _validate_leave_window(from_date, to_date)
+    except HTTPException as exc:
+        return {"days": 0, "approval_stage": None, "approval_level": None, "approver_name": None, "problem": exc.detail}
+    working_dates = _working_dates(user, from_date, to_date)
+    days = float(len(working_dates)) if day_part == "full_day" else (0.5 if working_dates else 0.0)
+    if not days:
+        return {"days": 0, "approval_stage": None, "approval_level": None, "approver_name": None, "problem": "Selected dates contain no working days"}
+    try:
+        stage, approver = resolve_leave_approver(user, days)
+    except HTTPException as exc:
+        return {"days": days, "approval_stage": None, "approval_level": None, "approver_name": None, "problem": exc.detail}
+    return {"days": days, "approval_stage": stage, "approval_level": APPROVAL_STAGES[stage][2], "approver_name": approver.get("name"), "problem": None}
+
+
 @router.post("/apply", status_code=status.HTTP_201_CREATED)
 def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Header(default=None)):
     user = _current_user(authorization)
     leave_type = _get_leave_type(payload.leave_type_id)
     if payload.from_date.year != payload.to_date.year:
         raise HTTPException(status_code=400, detail="Leave application cannot cross calendar years. Submit separate applications.")
+    _validate_leave_window(payload.from_date, payload.to_date)
     if payload.day_part != "full_day":
         if not leave_type.get("allow_half_day", True):
             raise HTTPException(status_code=400, detail="Half-day leave is not allowed for this leave type")
@@ -1000,14 +1051,10 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     if leave_type.get("is_paid", True) and days > available:
         raise HTTPException(status_code=400, detail=f"Insufficient {leave_type.get('name', 'leave')} balance. Available: {available:g} day(s).")
     now = datetime.now(timezone.utc)
+    # Single approver from the applicant's role, assignments and working-day count.
+    approval_stage, approver = resolve_leave_approver(user, days)
+    approver_id = str(approver["_id"])
     manager_id = _get_reporting_manager_id(user)
-    if not manager_id or not ObjectId.is_valid(manager_id):
-        raise HTTPException(status_code=400, detail="A valid Reporting Manager is not assigned. Please ask HR Admin to assign an active Reporting Manager before applying for leave.")
-    manager = users_collection.find_one({"_id": ObjectId(manager_id), "is_active": True}, {"_id": 1})
-    if not manager or manager_id == user_id:
-        raise HTTPException(status_code=400, detail="The assigned Reporting Manager is inactive or invalid. Please ask HR Admin to assign an active Reporting Manager.")
-
-    approval_stage = "reporting_manager"
     initial_status = "pending"
     if requires_medical_certificate:
         _email_medical_certificate(user, leave_type, payload, attachment_bytes)
@@ -1019,7 +1066,9 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
         "leave_dates": [d.isoformat() for d in working_dates],
         "reason": payload.reason.strip(), "attachment_name": payload.attachment_name,
         "status": initial_status, "approval_stage": approval_stage,
+        "approver_id": approver_id,
         "reporting_manager_id": manager_id,
+        "approval_history": [_history_entry("assigned", approval_stage, approver, now)],
         "created_at": now, "updated_at": now,
     }
     if attachment_bytes is not None:
@@ -1028,8 +1077,8 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     result = leave_requests_collection.insert_one(record)
     record["_id"] = result.inserted_id
     _update_balance(user_id, payload.leave_type_id, payload.from_date.year, pending_delta=days)
-    _notify_reporting_manager(user, "New Leave Request", f"{user.get('name', 'Employee')} submitted {days:g} day(s) of {leave_type.get('name')} for your approval.", str(result.inserted_id))
-    _audit(user, "LEAVE_APPLIED", str(result.inserted_id), {"days": days, "leave_type": leave_type.get("code")})
+    _notify(approver_id, "New Leave Request", f"{user.get('name', 'Employee')} submitted {days:g} day(s) of {leave_type.get('name')} for your {APPROVAL_STAGES[approval_stage][2]} approval.", request_id=str(result.inserted_id))
+    _audit(user, "LEAVE_APPLIED", str(result.inserted_id), {"days": days, "leave_type": leave_type.get("code"), "approval_stage": approval_stage, "approver_id": approver_id})
     return _request_response(record, user)
 
 
@@ -1046,7 +1095,7 @@ def get_leave_request(request_id: str, authorization: str | None = Header(defaul
     record = leave_requests_collection.find_one({"_id": _parse_object_id(request_id, "leave request")})
     if not record:
         raise HTTPException(status_code=404, detail="Leave request not found")
-    if record["user_id"] != str(user["_id"]) and not _is_admin_or_hr(user):
+    if record["user_id"] != str(user["_id"]) and not _is_admin_or_hr(user) and record.get("approver_id") != str(user["_id"]):
         raise HTTPException(status_code=403, detail="Access denied")
     return _request_response(record, user)
 
@@ -1084,42 +1133,41 @@ def download_leave_attachment(
 
 @router.get("/pending")
 def pending_leave_requests(authorization: str | None = Header(default=None)):
+    """Pending requests assigned to the current user as the single approver."""
     user = _current_user(authorization)
     user_id = str(user["_id"])
-    direct_report_ids = _direct_report_ids(user_id)
-    pending_query: dict[str, Any] = {
-        "status": "pending",
-        "approval_stage": {"$in": ["reporting_manager", None]},
-        "$or": [{"reporting_manager_id": {"$in": [user_id, user["_id"]]}}],
-    }
-    if direct_report_ids:
-        pending_query["$or"].append({"user_id": {"$in": list(direct_report_ids)}})
-
-    is_hr_admin = _is_hr_admin(user)
-    if is_hr_admin:
-        query = {
-            "$or": [
-                {"status": "pending_hr_admin", "approval_stage": "hr_admin"},
-                pending_query,
-            ]
-        }
+    records = list(leave_requests_collection.find({
+        "status": {"$in": list(PENDING_STATUSES)},
+        "approver_id": user_id,
+        "user_id": {"$ne": user_id},
+    }).sort("created_at", 1))
+    role = str(user.get("role", "")).strip().lower()
+    if _is_hr_admin(user):
+        approval_role = "hr_admin"
+    elif role == HOD_ROLE:
+        approval_role = "hod"
+    elif records or _direct_report_ids(user_id):
+        approval_role = "reporting_manager"
     else:
-        query = pending_query
-
-    records = list(leave_requests_collection.find(query).sort("created_at", 1))
-    if is_hr_admin:
-        return {
-            "can_approve": True,
-            "approval_role": "hr_admin",
-            "requests": [_request_response(record, user) for record in records],
-        }
-    if not records and not direct_report_ids:
-        return {"can_approve": False, "approval_role": None, "requests": []}
+        approval_role = None
     return {
-        "can_approve": bool(direct_report_ids or records),
-        "approval_role": "reporting_manager" if direct_report_ids or records else None,
+        "can_approve": bool(records or approval_role),
+        "approval_role": approval_role,
         "requests": [_request_response(record, user) for record in records],
     }
+
+
+def _assert_assigned_approver(record: dict[str, Any], approver: dict[str, Any], action: str) -> None:
+    """Only the request's assigned approver may decide, never the applicant."""
+    if record.get("status") not in PENDING_STATUSES:
+        raise HTTPException(status_code=409, detail=f"This leave request is already {record.get('status')} and cannot be {action}.")
+    approver_id = str(approver["_id"])
+    if str(record.get("user_id")) == approver_id:
+        raise HTTPException(status_code=403, detail="You cannot approve or reject your own leave request.")
+    if not record.get("approver_id"):
+        raise HTTPException(status_code=409, detail=record.get("routing_problem") or "This leave request has no valid approver yet. HR Admin must assign one in the employee details.")
+    if str(record.get("approver_id")) != approver_id:
+        raise HTTPException(status_code=403, detail="This leave request is assigned to another approver.")
 
 
 @router.put("/requests/{request_id}/approve")
@@ -1129,61 +1177,27 @@ def approve_leave(request_id: str, payload: LeaveDecisionPayload, authorization:
     record = leave_requests_collection.find_one({"_id": object_id})
     if not record:
         raise HTTPException(status_code=404, detail="Leave request not found")
-
-    is_manager_approval = (
-        record.get("status") == "pending"
-        and record.get("approval_stage", "reporting_manager") == "reporting_manager"
-        and _is_reporting_manager_for(record, approver)
-    )
-    is_hr_final_approval = (
-        _is_hr_admin(approver)
-        and record.get("status") == "pending_hr_admin"
-        and record.get("approval_stage") == "hr_admin"
-    )
-
-    if not is_manager_approval and not is_hr_final_approval:
-        raise HTTPException(status_code=403, detail="You are not authorized to approve this leave request at its current approval stage")
+    _assert_assigned_approver(record, approver, "approved")
 
     if _overlap_exists(record["user_id"], date.fromisoformat(record["from_date"]), date.fromisoformat(record["to_date"]), request_id):
         raise HTTPException(status_code=409, detail="Another pending or approved leave overlaps this request")
 
     now = datetime.now(timezone.utc)
     days = float(record["days"])
-
-    if (
-        is_manager_approval
-        and days >= 2
-    ):
-        updated = leave_requests_collection.update_one(
-            {"_id": object_id, "status": "pending", "approval_stage": "reporting_manager"},
-            {"$set": {
-                "status": "pending_hr_admin",
-                "approval_stage": "hr_admin",
-                "reporting_manager_approved_by": str(approver["_id"]),
-                "reporting_manager_name": approver.get("name"),
-                "reporting_manager_remarks": payload.remarks,
-                "reporting_manager_decided_at": now,
-                "updated_at": now,
-            }},
-        )
-        if updated.matched_count == 0:
-            raise HTTPException(status_code=409, detail="Leave request was already processed")
-        _notify_user_role(HR_ADMIN_ROLE, "Leave Awaiting HR Approval", f"{record.get('days', 0):g} day(s) leave request from employee {record.get('user_id')} has been approved by the Reporting Manager and requires final HR Admin approval.", request_id)
-        _audit(approver, "LEAVE_MANAGER_APPROVED", request_id, {"employee_user_id": record["user_id"], "days": days})
-        pending_record = leave_requests_collection.find_one({"_id": object_id})
-        return _request_response(pending_record, approver)
-
+    stage = record.get("approval_stage")
     updated = leave_requests_collection.update_one(
-        {"_id": object_id, "status": record.get("status"), "approval_stage": record.get("approval_stage")},
+        # Atomic: still pending and still assigned to this approver.
+        {"_id": object_id, "status": record.get("status"), "approver_id": str(approver["_id"])},
         {"$set": {
             "status": "approved",
             "approval_stage": "completed",
+            "approved_stage": stage,
             "approved_by": str(approver["_id"]),
             "approver_name": approver.get("name"),
             "remarks": payload.remarks,
             "decided_at": now,
             "updated_at": now,
-        }},
+        }, "$push": {"approval_history": _history_entry("approved", stage, approver, now, remarks=payload.remarks)}},
     )
     if updated.matched_count == 0:
         raise HTTPException(status_code=409, detail="Leave request was already processed")
@@ -1192,8 +1206,8 @@ def approve_leave(request_id: str, payload: LeaveDecisionPayload, authorization:
     _update_balance(record["user_id"], record["leave_type_id"], year, used_delta=days, pending_delta=-days)
     approved_record = leave_requests_collection.find_one({"_id": object_id})
     sync_leave_for_today(approved_record)
-    _notify(record["user_id"], "Leave Approved", f"Your {days:g} day(s) leave request has been fully approved.", request_id=request_id)
-    _audit(approver, "LEAVE_APPROVED", request_id, {"employee_user_id": record["user_id"], "days": days})
+    _notify(record["user_id"], "Leave Approved", f"Your {days:g} day(s) leave request has been approved by {approver.get('name', 'your approver')}.", request_id=request_id)
+    _audit(approver, "LEAVE_APPROVED", request_id, {"employee_user_id": record["user_id"], "days": days, "stage": stage})
     return _request_response(approved_record, approver)
 
 
@@ -1204,39 +1218,29 @@ def reject_leave(request_id: str, payload: LeaveDecisionPayload, authorization: 
     record = leave_requests_collection.find_one({"_id": object_id})
     if not record:
         raise HTTPException(status_code=404, detail="Leave request not found")
-
-    is_manager_rejection = (
-        record.get("status") == "pending"
-        and record.get("approval_stage", "reporting_manager") == "reporting_manager"
-        and _is_reporting_manager_for(record, approver)
-    )
-    is_hr_rejection = (
-        _is_hr_admin(approver)
-        and record.get("status") == "pending_hr_admin"
-        and record.get("approval_stage") == "hr_admin"
-    )
-    if not is_manager_rejection and not is_hr_rejection:
-        raise HTTPException(status_code=403, detail="You are not authorized to reject this leave request at its current approval stage")
+    _assert_assigned_approver(record, approver, "rejected")
 
     now = datetime.now(timezone.utc)
+    stage = record.get("approval_stage")
     updated = leave_requests_collection.update_one(
-        {"_id": object_id, "status": record.get("status"), "approval_stage": record.get("approval_stage")},
+        {"_id": object_id, "status": record.get("status"), "approver_id": str(approver["_id"])},
         {"$set": {
             "status": "rejected",
             "approval_stage": "completed",
+            "approved_stage": stage,
             "approved_by": str(approver["_id"]),
             "approver_name": approver.get("name"),
             "remarks": payload.remarks,
             "decided_at": now,
             "updated_at": now,
-        }},
+        }, "$push": {"approval_history": _history_entry("rejected", stage, approver, now, remarks=payload.remarks)}},
     )
     if updated.matched_count == 0:
         raise HTTPException(status_code=409, detail="Leave request was already processed")
     year = int(record["from_date"][:4])
     _update_balance(record["user_id"], record["leave_type_id"], year, pending_delta=-float(record["days"]))
     _notify(record["user_id"], "Leave Rejected", f"Your leave request was rejected. {payload.remarks or ''}".strip(), request_id=request_id)
-    _audit(approver, "LEAVE_REJECTED", request_id, {"employee_user_id": record["user_id"], "days": record["days"], "stage": "reporting_manager" if is_manager_rejection else "hr_admin"})
+    _audit(approver, "LEAVE_REJECTED", request_id, {"employee_user_id": record["user_id"], "days": record["days"], "stage": stage})
     return _request_response(leave_requests_collection.find_one({"_id": object_id}), approver)
 
 
@@ -1530,8 +1534,16 @@ def apply_permission(payload: PermissionApplicationCreate, authorization: str | 
     manager_id = _get_reporting_manager_id(user)
     if not manager_id or not ObjectId.is_valid(manager_id):
         raise HTTPException(status_code=422, detail="A reporting manager must be assigned before applying for permission.")
-    if payload.permission_date < company_now().date():
+    today = company_now().date()
+    if payload.permission_date < today:
         raise HTTPException(status_code=422, detail="Permission cannot be applied for a past date.")
+    if payload.permission_date > today + timedelta(days=PERMISSION_FORWARD_DAYS):
+        raise HTTPException(status_code=422, detail=f"Permission can be applied only from today to {(today + timedelta(days=PERMISSION_FORWARD_DAYS)).isoformat()} (the next {PERMISSION_FORWARD_DAYS} days).")
+    if manager_id == str(user["_id"]):
+        raise HTTPException(status_code=422, detail="Your assigned reporting manager is invalid. Please ask HR Admin to assign a valid reporting manager.")
+    manager = users_collection.find_one({"_id": ObjectId(manager_id), "is_active": True})
+    if not manager:
+        raise HTTPException(status_code=422, detail="Your reporting manager is inactive. Please ask HR Admin to assign an active reporting manager before applying for permission.")
     overlapping = permission_requests_collection.find_one({
         "user_id": str(user["_id"]), "permission_date": payload.permission_date.isoformat(),
         "status": {"$in": ["pending", "approved"]},
@@ -1564,13 +1576,12 @@ def my_permission_requests(authorization: str | None = Header(default=None)):
 
 @router.get("/permissions/pending")
 def pending_permission_requests(authorization: str | None = Header(default=None)):
+    """Permission requests are approved only by the assigned Reporting Manager."""
     user = _current_user(authorization)
-    role = str(user.get("role", "")).strip().casefold()
-    query: dict[str, Any] = {"status": "pending", "reporting_manager_id": str(user["_id"])}
-    if role in APPROVER_ROLES:
-        query = {"status": "pending"}
-    records = permission_requests_collection.find(query).sort("created_at", 1)
-    return {"can_approve": bool(role in APPROVER_ROLES or permission_requests_collection.count_documents(query)), "requests": [_permission_response(record) for record in records]}
+    user_id = str(user["_id"])
+    query: dict[str, Any] = {"status": "pending", "reporting_manager_id": user_id, "user_id": {"$ne": user_id}}
+    records = list(permission_requests_collection.find(query).sort("created_at", 1))
+    return {"can_approve": bool(records or _direct_report_ids(user_id)), "requests": [_permission_response(record) for record in records]}
 
 
 def _decide_permission(request_id: str, approved: bool, approver: dict[str, Any], remarks: str | None) -> dict[str, Any]:
@@ -1579,9 +1590,10 @@ def _decide_permission(request_id: str, approved: bool, approver: dict[str, Any]
         raise HTTPException(status_code=404, detail="Permission request not found")
     if record.get("status") != "pending":
         raise HTTPException(status_code=409, detail="This permission request has already been decided.")
-    role = str(approver.get("role", "")).strip().casefold()
-    if str(record.get("reporting_manager_id")) != str(approver["_id"]) and role not in APPROVER_ROLES:
-        raise HTTPException(status_code=403, detail="Only the assigned reporting manager or authorized HR role can decide this request.")
+    if str(record.get("user_id")) == str(approver["_id"]):
+        raise HTTPException(status_code=403, detail="You cannot approve or reject your own permission request.")
+    if str(record.get("reporting_manager_id")) != str(approver["_id"]):
+        raise HTTPException(status_code=403, detail="Only the assigned Reporting Manager can approve or reject this permission request.")
     now = datetime.now(timezone.utc)
     new_status = "approved" if approved else "rejected"
     result = permission_requests_collection.update_one(

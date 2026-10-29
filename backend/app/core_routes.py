@@ -25,7 +25,7 @@ from app.activation import build_activation_url, hash_activation_token, send_act
 from app.password_reset import router as password_reset_router
 from app.employee_details import router as employee_details_router
 from app.reporting_manager import router as reporting_manager_router
-from app.leave import router as leave_router
+from app.leave import router as leave_router, reroute_pending_leave_requests
 from app.payroll import router as payroll_router, ensure_payroll_collections
 from app.session import active_sessions
 from app.religion_holidays import (
@@ -33,12 +33,13 @@ from app.religion_holidays import (
     employee_religions,
     flag_draft_payroll_for_holiday_change,
     published_religion_holidays,
+    calendar_applies_to,
+    calendar_user_ids,
     religion_key,
-    religion_user_ids,
 )
 
 #Attendance
-from app.attendance import router as attendance_router, ensure_attendance_indexes
+from app.attendance import router as attendance_router, ensure_attendance_indexes, employee_joining_date
 from app.essl import router as essl_attendance_router, ensure_essl_indexes
 
 # Notification
@@ -427,9 +428,13 @@ class UserPayload(BaseModel):
     @field_validator("role")
     @classmethod
     def validate_role(cls, value: str) -> str:
+        # "HOD" is the display name of the stored "HR Manager" role; keep one
+        # stored identifier so permissions and role_id never split in two.
+        if value.casefold() == "hod":
+            value = "HR Manager"
         allowed_roles = {"HR Admin", "Administrator", "HR Manager", "Employee"}
         if value not in allowed_roles:
-            raise ValueError("role must be one of HR Admin, Administrator, HR Manager, or Employee")
+            raise ValueError("role must be one of HR Admin, Administrator, HOD, or Employee")
         return value
 
     @field_validator("country", "country_code")
@@ -500,6 +505,8 @@ class UserResponse(UserPayload):
     last_login: datetime | None = None
     login_count: int = 0
     active_login_count: int = 0
+    # Authoritative joining date; returned by /api/auth/me for the attendance calendar.
+    joining_date: date | None = None
 
 
 class UserStatusPayload(BaseModel):
@@ -631,6 +638,12 @@ class DesignationResponse(DesignationPayload):
     is_active: bool | None = None
 
 
+class HolidayCalendarAssignment(BaseModel):
+    """One organizational assignment: a branch record (company/legal entity + branch) and its location."""
+    company_id: str = Field(min_length=1)
+    location: str = Field(min_length=1)
+
+
 class HolidayCalendarPayload(BaseModel):
     company_id: str = Field(min_length=1)
     location: str = Field(min_length=1)
@@ -641,6 +654,8 @@ class HolidayCalendarPayload(BaseModel):
     description: str | None = None
     # Required for new calendars; legacy company-wide calendars have none.
     religion: str | None = Field(default=None, max_length=80)
+    # Company/legal entity -> branch -> location assignments (validated on the server).
+    assignments: list[HolidayCalendarAssignment] = Field(default_factory=list, max_length=200)
 
     @field_validator("company_id", "location", "calendar_name")
     @classmethod
@@ -664,6 +679,16 @@ class HolidayCalendarResponse(HolidayCalendarPayload):
     published_at: datetime | None = None
     religion_key: str = ""
     updated_at: datetime | None = None
+    assignments: list[dict] = Field(default_factory=list)
+    holiday_count: int | None = None
+
+    @field_validator("published_at", "updated_at")
+    @classmethod
+    def mark_naive_as_utc(cls, value: datetime | None) -> datetime | None:
+        # MongoDB returns naive UTC datetimes; tag them so the API emits an explicit offset.
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
 
 
 class HolidayPayload(BaseModel):
@@ -1489,8 +1514,25 @@ def list_users(
             raise HTTPException(status_code=400, detail="Status must be active, inactive, or all")
         if status_filter.lower() != "all":
             query["is_active"] = status_filter.lower() == "active"
-    users = users_collection.find(query).sort("created_at", -1)
-    return [serialize_user(user) for user in users]
+    users = list(users_collection.find(query).sort("created_at", -1))
+    # Joining dates for the manual-attendance screen: user record first, then
+    # employee details (same precedence as the attendance module), in one query.
+    missing = [str(user["_id"]) for user in users if user.get("date_of_joining") is None]
+    detail_dates = {
+        item["user_id"]: item.get("date_of_joining")
+        for item in db["employee_details"].find({"user_id": {"$in": missing}}, {"user_id": 1, "date_of_joining": 1})
+    } if missing else {}
+    return [
+        {
+            **serialize_user(user),
+            "joining_date": employee_joining_date({
+                "date_of_joining": user.get("date_of_joining")
+                if user.get("date_of_joining") is not None
+                else detail_dates.get(str(user["_id"])),
+            }),
+        }
+        for user in users
+    ]
 
 
 @router.get("/api/users/{user_id}", response_model=UserResponse)
@@ -1525,6 +1567,8 @@ def update_user(user_id: str, payload: UserPayload):
         ) from exc
     if result.matched_count == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    # A role change can change who approves this user's (or their reports') leave.
+    reroute_pending_leave_requests({user_id})
     user = users_collection.find_one({"_id": object_id})
     return serialize_user(user)
 
@@ -1550,6 +1594,8 @@ def update_user_status(user_id: str, payload: UserActivationPayload):
     result = users_collection.update_one({"_id": object_id}, update)
     if result.matched_count == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    # Pending leave assigned to a deactivated approver must move to a valid one.
+    reroute_pending_leave_requests({user_id})
     user = users_collection.find_one({"_id": object_id})
     log_event(f"User status changed: user_id={user_id}, is_active={payload.is_active}")
     return serialize_user(user)
@@ -1616,6 +1662,9 @@ def get_current_user(authorization: str | None = Header(default=None), x_user_id
     user["active_login_count"] = sum(
         active_session_user_id == session_user_id
         for active_session_user_id in active_sessions.values()
+    )
+    user["joining_date"] = employee_joining_date(
+        {"_id": ObjectId(session_user_id), "date_of_joining": user.get("date_of_joining")}
     )
     return user
 
@@ -1964,9 +2013,9 @@ def deactivate_designation(designation_id: str):
     status_code=status.HTTP_201_CREATED,
 )
 def create_holiday_calendar(payload: HolidayCalendarPayload, user: dict = Depends(_organization_admin)):
-    validate_calendar_location(payload.company_id, payload.location)
     if not payload.religion:
         raise HTTPException(status_code=422, detail="Select the religion this holiday calendar belongs to.")
+    assignments = _validate_assignments(payload.assignments, required=True)
     religion = _resolve_employee_religion(payload.religion)
     _validate_calendar_year(payload.calendar_year)
     key = religion_key(religion)
@@ -1977,7 +2026,8 @@ def create_holiday_calendar(payload: HolidayCalendarPayload, user: dict = Depend
         )
     now = datetime.now(timezone.utc)
     calendar = {
-        **payload.model_dump(),
+        **payload.model_dump(exclude={"assignments"}),
+        **_assignment_fields(assignments),
         "religion": religion,
         "religion_key": key,
         "status": "Draft",
@@ -1995,9 +2045,52 @@ def create_holiday_calendar(payload: HolidayCalendarPayload, user: dict = Depend
     calendar["_id"] = result.inserted_id
     _record_organization_audit(
         "holiday_calendar_created", str(result.inserted_id), calendar["calendar_year"],
-        {"calendar_id": str(result.inserted_id), "religion": religion, "actor_id": str(user["_id"])},
+        {"calendar_id": str(result.inserted_id), "religion": religion, "assignments": assignments, "actor_id": str(user["_id"])},
     )
     return serialize_holiday_calendar(calendar)
+
+
+def _validate_assignments(raw: list, required: bool) -> list[dict]:
+    """Validate company/legal entity -> branch -> location assignments against branch records.
+
+    Each assignment names a branch record in ``companies`` (which carries the
+    company and legal entity) and the location that belongs to that branch.
+    """
+    if required and not raw:
+        raise HTTPException(status_code=422, detail="Select at least one company, branch and location for this calendar.")
+    normalized: dict[str, dict] = {}
+    problems = []
+    for item in raw:
+        if not ObjectId.is_valid(item.company_id):
+            problems.append(f"Invalid branch selection '{item.company_id}'.")
+            continue
+        branch = companies_collection.find_one({"_id": ObjectId(item.company_id), "is_active": {"$ne": False}})
+        if branch is None:
+            problems.append("A selected branch no longer exists.")
+            continue
+        if " ".join(item.location.split()).casefold() != " ".join(str(branch.get("location") or "").split()).casefold():
+            problems.append(f"Location '{item.location}' does not belong to branch {branch.get('branch')} of {branch.get('legal_entity') or branch.get('company')}.")
+            continue
+        normalized[str(branch["_id"])] = {
+            "company_id": str(branch["_id"]),
+            "company": branch.get("company"),
+            "legal_entity": branch.get("legal_entity"),
+            "branch": branch.get("branch"),
+            "branch_code": branch.get("branch_code") or "",
+            "location": branch.get("location"),
+        }
+    if problems:
+        raise HTTPException(status_code=422, detail=" ".join(problems))
+    return list(normalized.values())
+
+
+def _assignment_fields(assignments: list[dict]) -> dict:
+    """Stored assignments plus the legacy single company/location (first assignment)."""
+    fields: dict = {"assignments": assignments}
+    if assignments:
+        fields["company_id"] = assignments[0]["company_id"]
+        fields["location"] = assignments[0]["location"]
+    return fields
 
 
 def _allowed_calendar_years() -> list[int]:
@@ -2039,8 +2132,9 @@ def _can_view_calendar(user: dict | None, calendar: dict) -> bool:
         return True
     if calendar.get("status") != "Published":
         return False
-    key = calendar.get("religion_key") or ""
-    return not key or (isinstance(user, dict) and religion_key(employee_religion(user)) == key)
+    if not calendar.get("religion_key"):
+        return True
+    return isinstance(user, dict) and calendar_applies_to(calendar, user)
 
 
 def _holiday_day(value) -> date:
@@ -2051,28 +2145,42 @@ def _ist_stamp() -> str:
     return datetime.now(ORGANIZATION_TIMEZONE).strftime("%d %b %Y, %I:%M %p IST")
 
 
-def _notify_calendar_employees(calendar: dict, title: str, message: str, event_key: str, days: int = 14) -> None:
+def _notify_calendar_employees(calendar: dict, title: str, message: str, event_key: str, days: int = 14, user_ids: list[str] | None = None) -> None:
     """Notify the employees a calendar applies to; never fails the saved change."""
     key = calendar.get("religion_key") or ""
+    if user_ids is None and key:
+        # Religion calendars reach only that religion within the assigned branches.
+        user_ids = calendar_user_ids(calendar)
     try:
         create_system_notification(
             title=title,
             message=message + " View it in My Profile → Holiday Calendar.",
             validity=timedelta(days=days),
             event_key=event_key,
-            # Religion calendars reach only that religion; legacy calendars keep all users.
-            user_ids=religion_user_ids(key) if key else None,
+            # Legacy company-wide calendars keep notifying all users (user_ids None).
+            user_ids=user_ids,
         )
     except Exception:
         logger.exception("Holiday calendar notification failed for %s", event_key)
 
 
-def _reconcile_payroll(calendar: dict, holiday_dates: list[date], reason: str) -> None:
+def _reconcile_payroll(calendar: dict, holiday_dates: list[date], reason: str, user_ids: list[str] | None = None) -> None:
     if calendar.get("religion_key") and calendar.get("status") == "Published":
         try:
-            flag_draft_payroll_for_holiday_change(calendar["religion_key"], holiday_dates, reason)
+            flag_draft_payroll_for_holiday_change(
+                calendar_user_ids(calendar) if user_ids is None else user_ids, holiday_dates, reason
+            )
         except Exception:
             logger.exception("Unable to flag draft payroll for holiday change on calendar %s", calendar.get("_id"))
+
+
+def _live_holiday_dates(calendar_id: str) -> list[date]:
+    return [
+        _holiday_day(item["holiday_date"])
+        for item in holidays_collection.find(
+            {"calendar_id": calendar_id, "is_active": True, "status": {"$ne": "Cancelled"}}, {"holiday_date": 1}
+        )
+    ]
 
 
 def _calendar_label(calendar: dict) -> str:
@@ -2091,11 +2199,25 @@ def holiday_calendar_options(_user: dict = Depends(_organization_admin)):
             {"religion": 1, "calendar_year": 1, "status": 1},
         )
     ]
+    # Branch records carry company, legal entity, branch and location: the
+    # Company/Legal Entity -> Branch -> Location hierarchy used for assignments.
+    organization = [
+        {
+            "id": str(item["_id"]),
+            "company": item.get("company"),
+            "legal_entity": item.get("legal_entity"),
+            "branch": item.get("branch"),
+            "branch_code": item.get("branch_code") or "",
+            "location": item.get("location"),
+        }
+        for item in companies_collection.find({"is_active": {"$ne": False}}).sort([("legal_entity", 1), ("branch", 1)])
+    ]
     return {
         "religions": employee_religions(),
         "allowed_years": allowed_years,
         "current_year": allowed_years[0],
         "existing_calendars": existing,
+        "organization": organization,
     }
 
 
@@ -2112,8 +2234,14 @@ def get_my_religion_holidays(year: int | None = None, user: dict = Depends(_prof
         raise HTTPException(status_code=400, detail=f"Holiday calendars are available up to {allowed_years[-1]}.")
     religion = employee_religion(user)
     key = religion_key(religion)
-    calendar = holiday_calendars_collection.find_one(
-        {"calendar_year": target_year, "religion_key": key, "status": "Published", "is_active": True}
+    calendar = next(
+        (
+            item for item in holiday_calendars_collection.find(
+                {"calendar_year": target_year, "religion_key": key, "status": "Published", "is_active": True}
+            )
+            if calendar_applies_to(item, user)
+        ),
+        None,
     ) if key else None
     holidays = []
     if calendar:
@@ -2137,6 +2265,10 @@ def get_my_religion_holidays(year: int | None = None, user: dict = Depends(_prof
             "religion": calendar.get("religion"),
             "published_at": calendar.get("published_at"),
             "updated_at": calendar.get("updated_at"),
+            "assignments": [
+                {key_name: item.get(key_name) for key_name in ("legal_entity", "company", "branch", "location")}
+                for item in calendar.get("assignments") or []
+            ],
         } if calendar else None,
         "holidays": holidays,
     }
@@ -2147,8 +2279,15 @@ def list_holiday_calendars(user: dict = Depends(_organization_reader)):
     query = {"is_active": True}
     if str(user.get("role", "")).casefold() not in {"hr admin", "administrator"}:
         query["status"] = "Published"
-    records = holiday_calendars_collection.find(query).sort("_id", -1)
-    return [serialize_holiday_calendar(record) for record in records if _can_view_calendar(user, record)]
+    records = [record for record in holiday_calendars_collection.find(query).sort("_id", -1) if _can_view_calendar(user, record)]
+    counts = {
+        item["_id"]: item["count"]
+        for item in holidays_collection.aggregate([
+            {"$match": {"calendar_id": {"$in": [str(record["_id"]) for record in records]}, "is_active": True, "status": {"$ne": "Cancelled"}}},
+            {"$group": {"_id": "$calendar_id", "count": {"$sum": 1}}},
+        ])
+    }
+    return [serialize_holiday_calendar({**record, "holiday_count": counts.get(str(record["_id"]), 0)}) for record in records]
 
 
 @router.get("/api/holiday-calendars/{calendar_id}", response_model=HolidayCalendarResponse)
@@ -2167,10 +2306,13 @@ def get_holiday_calendar(
     response_model=HolidayCalendarResponse,
 )
 def update_holiday_calendar(calendar_id: str, payload: HolidayCalendarPayload, user: dict = Depends(_organization_admin)):
-    validate_calendar_location(payload.company_id, payload.location)
     object_id = parse_object_id(calendar_id, "holiday calendar")
     existing = get_holiday_calendar_reference(calendar_id)
     old_key = existing.get("religion_key") or ""
+    # Religion calendars must keep at least one valid organizational assignment.
+    assignments = _validate_assignments(payload.assignments, required=bool(old_key or payload.religion))
+    if not assignments:
+        validate_calendar_location(payload.company_id, payload.location)
     if old_key or payload.religion:
         religion = _resolve_employee_religion(payload.religion) if payload.religion else None
         if not religion:
@@ -2189,7 +2331,15 @@ def update_holiday_calendar(calendar_id: str, payload: HolidayCalendarPayload, u
         _validate_calendar_year(payload.calendar_year)
     if _active_calendar_for(payload.calendar_year, new_key, exclude_id=object_id):
         raise HTTPException(status_code=409, detail="A calendar already exists for this religion and year.")
-    changes = {**payload.model_dump(), "religion": religion, "religion_key": new_key, "updated_at": datetime.now(timezone.utc)}
+    changes = {
+        **payload.model_dump(exclude={"assignments"}),
+        **(_assignment_fields(assignments) if assignments else {}),
+        "religion": religion,
+        "religion_key": new_key,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    was_published_religion = existing.get("status") == "Published" and bool(old_key)
+    before_users = set(calendar_user_ids(existing)) if was_published_religion else set()
     try:
         result = holiday_calendars_collection.update_one({"_id": object_id, "is_active": True}, {"$set": changes})
     except DuplicateKeyError as exc:
@@ -2200,25 +2350,102 @@ def update_holiday_calendar(calendar_id: str, payload: HolidayCalendarPayload, u
         "holiday_calendar_updated", calendar_id, payload.calendar_year,
         {"calendar_id": calendar_id, "before": existing, "after": changes, "actor_id": str(user["_id"])},
     )
-    return serialize_holiday_calendar(get_holiday_calendar_reference(calendar_id))
+    updated = get_holiday_calendar_reference(calendar_id)
+    if was_published_religion:
+        # Assignment changes alter who the calendar applies to: tell only the
+        # employees who gained or lost it, and flag their draft payroll.
+        after_users = set(calendar_user_ids(updated))
+        gained, lost = sorted(after_users - before_users), sorted(before_users - after_users)
+        stamp = updated.get("updated_at") or datetime.now(timezone.utc)
+        if gained:
+            _notify_calendar_employees(
+                updated, f"{_calendar_label(updated)} now applies to you",
+                f"The {_calendar_label(updated)} now applies to your branch. Updated {_ist_stamp()}.",
+                f"religion-calendar-gained:{calendar_id}:{stamp.isoformat()}", user_ids=gained,
+            )
+        if lost:
+            _notify_calendar_employees(
+                updated, f"{_calendar_label(updated)} no longer applies to you",
+                f"The {_calendar_label(updated)} no longer applies to your branch; its holidays are removed from your calendar. Updated {_ist_stamp()}.",
+                f"religion-calendar-lost:{calendar_id}:{stamp.isoformat()}", user_ids=lost,
+            )
+        if gained or lost:
+            _reconcile_payroll(updated, _live_holiday_dates(calendar_id), f"{_calendar_label(updated)} assignments changed.", user_ids=gained + lost)
+    return serialize_holiday_calendar(updated)
 
 
 @router.delete("/api/holiday-calendars/{calendar_id}")
-def deactivate_holiday_calendar(calendar_id: str):
+def deactivate_holiday_calendar(
+    calendar_id: str,
+    confirm: str | None = Query(default=None, max_length=64),
+    user: dict = Depends(_organization_admin),
+):
+    """Delete a calendar with its holiday entries and employee assignments.
+
+    Records are deactivated (kept for audit), never erased. A published
+    calendar requires ``confirm`` to equal its id (the second confirmation step)
+    and keeps counting for attendance dates before today, so past attendance
+    and payroll are unchanged; it disappears from every holiday-calendar list.
+    """
     calendar = get_holiday_calendar_reference(calendar_id)
-    if calendar.get("status") == "Published":
-        raise HTTPException(
-            status_code=409,
-            detail="Published calendars are retained for historical reporting and cannot be deleted.",
+    was_published = calendar.get("status") == "Published"
+    if was_published and confirm != calendar_id:
+        raise HTTPException(status_code=422, detail="Confirm the deletion of this published calendar to continue.")
+    affected_users = calendar_user_ids(calendar) if was_published and calendar.get("religion_key") else []
+    today = datetime.now(ORGANIZATION_TIMEZONE).date()
+    future_dates = [day for day in _live_holiday_dates(calendar_id) if day >= today]
+    now = datetime.now(timezone.utc)
+    # Atomic claim: only one request can delete the calendar.
+    claimed = holiday_calendars_collection.update_one(
+        {"_id": calendar["_id"], "is_active": True, "status": calendar.get("status")},
+        {"$set": {
+            "is_active": False,
+            "status": "Deleted",
+            "previous_status": calendar.get("status"),
+            "was_published": was_published,
+            "deleted_at": now,
+            "deleted_on": today.isoformat(),
+            "deleted_by": str(user["_id"]),
+        }},
+    )
+    if claimed.matched_count == 0:
+        raise HTTPException(status_code=409, detail="This calendar was changed or already deleted. Refresh the list.")
+    try:
+        holidays_result = holidays_collection.update_many(
+            {"calendar_id": calendar_id, "is_active": True, "status": {"$in": ["Draft", "Published"]}},
+            {"$set": {"status": "Deleted", "is_active": False, "deleted_at": now}},
         )
-    holiday_calendars_collection.update_one(
-        {"_id": calendar["_id"], "is_active": True},
-        {"$set": {"is_active": False, "status": "Cancelled"}},
-    )
+        assignments_result = employee_holiday_calendars_collection.update_many(
+            {"calendar_id": calendar_id, "is_active": True},
+            {"$set": {"is_active": False, "unassigned_at": now, "unassigned_reason": "calendar deleted"}},
+        )
+    except Exception:
+        # The calendar is already inactive, so its entries are unreachable; log for follow-up.
+        logger.exception("Holiday calendar %s deleted but related records were not fully deactivated", calendar_id)
+        holidays_result = assignments_result = None
     _record_organization_audit(
-        "holiday_calendar_cancelled", calendar_id, calendar["calendar_year"], None
+        "holiday_calendar_deleted", calendar_id, calendar["calendar_year"],
+        {
+            "calendar_id": calendar_id, "calendar": calendar, "actor_id": str(user["_id"]),
+            "holidays_deactivated": getattr(holidays_result, "modified_count", None),
+            "assignments_deactivated": getattr(assignments_result, "modified_count", None),
+        },
     )
-    return {"id": calendar_id, "message": "Draft calendar cancelled and retained for audit."}
+    if affected_users:
+        _notify_calendar_employees(
+            {**calendar, "status": "Published"},
+            f"{_calendar_label(calendar)} removed",
+            f"The {_calendar_label(calendar)} was removed by HR Admin. Its upcoming holidays no longer apply; past attendance is unchanged. Removed {_ist_stamp()}.",
+            f"religion-calendar-deleted:{calendar_id}",
+            user_ids=affected_users,
+        )
+        _reconcile_payroll({**calendar, "status": "Published"}, future_dates, f"{_calendar_label(calendar)} was deleted.", user_ids=affected_users)
+    return {
+        "id": calendar_id,
+        "message": f"{calendar.get('calendar_name')} was deleted.",
+        "holidays_deactivated": getattr(holidays_result, "modified_count", 0),
+        "assignments_deactivated": getattr(assignments_result, "modified_count", 0),
+    }
 
 
 def _record_organization_audit(action: str, target_id: str, year: int | None, details: dict | None):

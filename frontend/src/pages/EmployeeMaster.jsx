@@ -1,5 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useMemo, useState } from "react";
+import { roleLabel } from "../services/roleLabels";
 
 const API_URL = HRONE_API_BASE + "/api/users";
 
@@ -412,7 +413,7 @@ function EmployeeMaster({
                       key={role}
                       value={role}
                     >
-                      {role}
+                      {roleLabel(role)}
                     </option>
                   ),
                 )}
@@ -533,7 +534,7 @@ function EmployeeMaster({
                         </td>
 
                         <td>
-                          {employee.role ||
+                          {roleLabel(employee.role) ||
                             "-"}
                         </td>
 

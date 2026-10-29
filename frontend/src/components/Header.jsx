@@ -2,6 +2,7 @@ import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useRef, useState } from "react";
 import { logout } from "../logout";
 import NotificationBell from "./NotificationBell";
+import { roleLabel } from "../services/roleLabels";
 
 const REPORTING_MANAGER_API =
   HRONE_API_BASE + "/api/reporting-manager";
@@ -230,7 +231,7 @@ function Header({
               </strong>
 
               <small>
-                {user.role || "Unassigned"}
+                {roleLabel(user.role) || "Unassigned"}
               </small>
             </span>
 

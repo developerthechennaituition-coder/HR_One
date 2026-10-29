@@ -171,9 +171,394 @@
   border-bottom: 1px solid #e5e7eb;
 }
 
+/* Natural page scrolling on small screens; a bounded, scrollable list on wide layouts. */
 .holiday-calendar-list {
-  max-height: 610px;
+  overscroll-behavior: contain;
+}
+
+@media (min-width: 1200px) {
+  .holiday-calendar-list {
+    max-height: calc(100vh - 290px);
+    min-height: 240px;
+    overflow-y: auto;
+  }
+}
+
+.holiday-calendar-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.holiday-calendar-title strong {
+  min-width: 0;
+}
+
+.holiday-calendar-copy .holiday-calendar-name {
+  color: #374151;
+  font-size: 12px;
+}
+
+.holiday-assignment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.holiday-assignment-chips li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 10px;
+  color: #1e3a8a;
+  font-size: 12px;
+  background: #eff6ff;
+  border: 1px solid #dbeafe;
+  border-radius: 999px;
+}
+
+.holiday-assignment-chips li span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.holiday-assignment-chips .btn-close {
+  width: 0.5em;
+  height: 0.5em;
+  flex: 0 0 auto;
+}
+
+.holiday-org-fieldset {
+  padding: 14px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
+
+.holiday-org-fieldset legend {
+  float: none;
+  width: auto;
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.holiday-multiselect {
+  position: relative;
+}
+
+.holiday-multiselect-toggle {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.holiday-multiselect-menu {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  margin-top: 4px;
   overflow-y: auto;
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.16);
+}
+
+.holiday-multiselect-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 44px;
+  margin: 0;
+  padding: 10px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.holiday-multiselect-option:hover {
+  background: #f8fbff;
+}
+
+.holiday-multiselect-option .form-check-input {
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+
+.holiday-multiselect-option span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.holiday-multiselect-option small,
+.holiday-multiselect-empty {
+  display: block;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.holiday-multiselect-empty {
+  padding: 12px;
+}
+
+.holiday-modal {
+  background: rgba(15, 23, 42, 0.45);
+  overflow-y: auto;
+}
+
+.holiday-delete-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+  margin-bottom: 12px;
+}
+
+.holiday-delete-summary dt {
+  color: #6b7280;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.holiday-delete-summary dd {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 768px) {
+  .holiday-entries-scroll {
+    max-height: 520px;
+    overflow-y: auto;
+  }
+
+  .holiday-entries-scroll thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .holiday-delete-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- Employee Profile: holiday calendar ---------- */
+.my-holiday-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.my-holiday-eyebrow {
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.my-holiday-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.my-holiday-orgs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.my-holiday-orgs li {
+  max-width: 100%;
+  padding: 3px 10px;
+  color: #1e3a8a;
+  font-size: 12px;
+  background: #eff6ff;
+  border-radius: 999px;
+  overflow-wrap: anywhere;
+}
+
+.my-holiday-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.my-holiday-stats > div {
+  min-width: 0;
+  padding: 12px 14px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
+
+.my-holiday-stats span,
+.my-holiday-stats small {
+  display: block;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.my-holiday-stats strong {
+  display: block;
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+.my-holiday-next strong {
+  font-size: 15px;
+}
+
+.my-holiday-list {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  overscroll-behavior: contain;
+}
+
+@media (min-width: 768px) {
+  .my-holiday-list {
+    max-height: 460px;
+    overflow-y: auto;
+  }
+}
+
+.my-holiday-month h6 {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 8px 16px;
+  color: #475467;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: #f8fafc;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.my-holiday-month ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.my-holiday-month li {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.my-holiday-month li.is-past {
+  opacity: 0.65;
+}
+
+.my-holiday-date {
+  display: flex;
+  flex: 0 0 56px;
+  flex-direction: column;
+  align-items: center;
+  padding: 6px 0;
+  color: #1d4ed8;
+  line-height: 1.1;
+  background: #eff6ff;
+  border-radius: 10px;
+}
+
+.my-holiday-date strong {
+  font-size: 20px;
+}
+
+.my-holiday-date small {
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.my-holiday-copy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.my-holiday-copy strong {
+  overflow-wrap: anywhere;
+}
+
+.my-holiday-copy small {
+  color: #6b7280;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.my-holiday-state {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+}
+
+.my-holiday-state-upcoming { color: #067647; background: #ecfdf3; }
+.my-holiday-state-today { color: #ffffff; background: #2563eb; }
+.my-holiday-state-past { color: #475467; background: #f2f4f7; }
+
+.my-holiday-empty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px;
+  color: #475467;
+  background: #f8fafc;
+  border: 1px dashed #d0d5dd;
+  border-radius: 10px;
+}
+
+@media (max-width: 575.98px) {
+  .my-holiday-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .my-holiday-next {
+    grid-column: 1 / -1;
+  }
+
+  .my-holiday-month li {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 12px;
+  }
+
+  /* Text takes the row beside the date badge; the status pill wraps below. */
+  .my-holiday-copy {
+    flex: 1 1 calc(100% - 76px);
+  }
+
+  .my-holiday-state {
+    margin-left: 66px;
+  }
 }
 
 .holiday-calendar-item {
@@ -225,7 +610,7 @@
   flex: 1;
 }
 
-.holiday-calendar-copy strong,
+.holiday-calendar-copy > strong,
 .holiday-calendar-copy small {
   display: block;
 

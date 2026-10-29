@@ -9,7 +9,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app.db.mongodb import db
 
-from app.payslip_pdf import _payslip_pdf_response
+from app.payslip_pdf import _payslip_pdf_response, payslip_view_data
 
 router = APIRouter(prefix="/api/payroll", tags=["Payroll"])
 users_collection = db["users"]
@@ -874,6 +874,19 @@ def list_payslips(month: int | None = None, year: int | None = None,
         rows.append({"id": str(slip["_id"]), "employee_id": record["employee_id"], "employee_name": record["employee_name"], "department": record.get("department", ""), "designation": record.get("designation", ""), "period": record["period"], "net_salary": record["net_salary"], "gross_earnings": record.get("gross_earnings", 0), "total_deductions": record.get("total_deductions", 0), "currency": record.get("currency", "INR"), "paid_days": record.get("paid_days", 0), "lop_days": record.get("lop_days", 0), "present_days": record.get("present_days", 0), "paid_leave_days": record.get("paid_leave_days", 0), "unpaid_leave_days": record.get("unpaid_leave_days", 0), "absent_days": record.get("absent_days", 0), "status": record.get("status", "Paid"), "payslip_status": slip.get("status", "Available"), "payroll_record_id": str(record["_id"])})
     return rows
 
+@router.get("/payslips/{record_id}")
+def get_payslip(record_id: str, authorization: str | None = Header(default=None),
+                x_user_id: str | None = Header(default=None)):
+    """HR Admin: on-screen payslip for a finalized (Paid) payroll record."""
+    authenticated_user(authorization, x_user_id)
+    if not ObjectId.is_valid(record_id):
+        raise HTTPException(status_code=404, detail="Payslip not found")
+    row = payroll_collection.find_one({"_id": ObjectId(record_id), "status": "Paid"})
+    if not row:
+        raise HTTPException(status_code=404, detail="Finalized payslip not found")
+    return payslip_view_data(row)
+
+
 @router.get("/payslips/{record_id}/pdf")
 def download_payslip(record_id: str, inline: bool = False,
                      authorization: str | None = Header(default=None),
@@ -935,7 +948,8 @@ def get_my_payslip(record_id: str, authorization: str | None = Header(default=No
     result["id"] = str(row["_id"])
     for key, value in list(result.items()):
         if isinstance(value, datetime): result[key] = value.isoformat()
-    return result
+    # Same on-screen view model as the HR endpoint, scoped to the caller's own Paid record.
+    return {**result, **payslip_view_data(row)}
 
 
 @router.get("/my-payslips/{record_id}/pdf")

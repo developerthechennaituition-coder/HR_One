@@ -1,5 +1,16 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useState } from "react";
+import AuthLayout, { AuthAlert } from "../components/AuthLayout";
+
+// Only the 8-character minimum is enforced; the other checks guide a stronger choice.
+const PASSWORD_CHECKS = [
+  { label: "At least 8 characters", test: (value) => value.length >= 8 },
+  { label: "Upper & lowercase letters", test: (value) => /[a-z]/.test(value) && /[A-Z]/.test(value) },
+  { label: "A number", test: (value) => /\d/.test(value) },
+  { label: "A special character", test: (value) => /[^A-Za-z0-9]/.test(value) },
+];
+
+const STRENGTH_LEVELS = ["Too weak", "Weak", "Fair", "Good", "Strong"];
 
 
 function ResetPassword() {
@@ -18,6 +29,9 @@ function ResetPassword() {
 
   const [message, setMessage] =
     useState("");
+
+  const [showPassword, setShowPassword] =
+    useState(false);
 
 
   // ---------------------------------------------------------
@@ -199,179 +213,135 @@ function ResetPassword() {
   };
 
 
+  const passedChecks = PASSWORD_CHECKS.filter((check) => check.test(newPassword));
+  const strength = newPassword ? passedChecks.length : 0;
+  const passwordsMatch = confirmPassword && newPassword === confirmPassword;
+
+  const leaveReset = () => {
+    sessionStorage.removeItem(
+      "password_reset_token"
+    );
+
+    sessionStorage.removeItem(
+      "password_reset_id"
+    );
+
+    window.location.href =
+      "/login";
+  };
+
   return (
-    <div className="container-fluid min-vh-100 d-flex align-items-center justify-content-center bg-light">
+    <AuthLayout
+      icon="bi-shield-check"
+      step={3}
+      title="Create a new password"
+      subtitle="Choose a strong password you haven't used before for your HRMS account."
+      footer={
+        <button
+          type="button"
+          className="auth-link"
+          onClick={leaveReset}
+        >
+          <i className="bi bi-arrow-left" /> Back to Login
+        </button>
+      }
+    >
+      <AuthAlert type="error">{error}</AuthAlert>
+      <AuthAlert type="success">{message}</AuthAlert>
 
-      <div
-        className="card shadow-sm border-0"
-        style={{
-          width: "100%",
-          maxWidth: "450px",
-        }}
-      >
-
-        <div className="card-body p-4">
-
-
-          {/* ------------------------------------------------
-              Heading
-          ------------------------------------------------ */}
-          <div className="text-center mb-4">
-
-            <h3 className="fw-bold">
-              Reset Password
-            </h3>
-
-            <p className="text-muted mb-0">
-              Create a new password for your HRMS account.
-            </p>
-
-          </div>
-
-
-          {/* ------------------------------------------------
-              Error
-          ------------------------------------------------ */}
-          {error && (
-            <div
-              className="alert alert-danger"
-              role="alert"
-            >
-              {error}
-            </div>
-          )}
-
-
-          {/* ------------------------------------------------
-              Success
-          ------------------------------------------------ */}
-          {message && (
-            <div
-              className="alert alert-success"
-              role="alert"
-            >
-              {message}
-            </div>
-          )}
-
-
-          {/* ------------------------------------------------
-              Form
-          ------------------------------------------------ */}
-          <form onSubmit={handleSubmit}>
-
-
-            {/* New Password */}
-            <div className="mb-3">
-
-              <label
-                htmlFor="newPassword"
-                className="form-label fw-semibold"
-              >
-                New Password
-              </label>
-
-              <input
-                id="newPassword"
-                type="password"
-                className="form-control"
-                placeholder="Enter new password"
-                value={newPassword}
-                onChange={(event) =>
-                  setNewPassword(event.target.value)
-                }
-                disabled={loading}
-                autoComplete="new-password"
-                autoFocus
-              />
-
-            </div>
-
-
-            {/* Confirm Password */}
-            <div className="mb-3">
-
-              <label
-                htmlFor="confirmPassword"
-                className="form-label fw-semibold"
-              >
-                Confirm Password
-              </label>
-
-              <input
-                id="confirmPassword"
-                type="password"
-                className="form-control"
-                placeholder="Confirm new password"
-                value={confirmPassword}
-                onChange={(event) =>
-                  setConfirmPassword(event.target.value)
-                }
-                disabled={loading}
-                autoComplete="new-password"
-              />
-
-            </div>
-
-
-            {/* Password requirement */}
-            <div className="small text-muted mb-3">
-
-              Password must contain at least
-              8 characters.
-
-            </div>
-
-
-            {/* Submit */}
-            <button
-              type="submit"
-              className="btn btn-primary w-100"
+      <form className="auth-form" onSubmit={handleSubmit}>
+        {/* New Password */}
+        <div className="auth-field">
+          <label htmlFor="newPassword">New Password</label>
+          <div className="auth-input">
+            <i className="bi bi-lock auth-input-icon" />
+            <input
+              id="newPassword"
+              type={showPassword ? "text" : "password"}
+              placeholder="Enter new password"
+              value={newPassword}
+              onChange={(event) =>
+                setNewPassword(event.target.value)
+              }
               disabled={loading}
-            >
-              {loading
-                ? "Resetting Password..."
-                : "Reset Password"}
-            </button>
-
-
-          </form>
-
-
-          {/* ------------------------------------------------
-              Back to Login
-          ------------------------------------------------ */}
-          <div className="text-center mt-3">
-
+              autoComplete="new-password"
+              autoFocus
+            />
             <button
               type="button"
-              className="btn btn-link text-decoration-none"
-              onClick={() => {
-
-                sessionStorage.removeItem(
-                  "password_reset_token"
-                );
-
-                sessionStorage.removeItem(
-                  "password_reset_id"
-                );
-
-                window.location.href =
-                  "/login";
-
-              }}
+              className="auth-eye"
+              onClick={() => setShowPassword(!showPassword)}
+              aria-label={showPassword ? "Hide passwords" : "Show passwords"}
             >
-              Back to Login
+              <i className={`bi ${showPassword ? "bi-eye-slash" : "bi-eye"}`} />
             </button>
-
           </div>
 
+          {/* Password strength */}
+          <div className={`auth-strength level-${strength}`} aria-live="polite">
+            <div className="auth-strength-bars">
+              {[1, 2, 3, 4].map((bar) => <span key={bar} className={bar <= strength ? "on" : ""} />)}
+            </div>
+            <small>{newPassword ? STRENGTH_LEVELS[strength] : "Password strength"}</small>
+          </div>
 
+          <ul className="auth-checklist">
+            {PASSWORD_CHECKS.map((check) => {
+              const passed = check.test(newPassword);
+              return (
+                <li key={check.label} className={passed ? "passed" : ""}>
+                  <i className={`bi ${passed ? "bi-check-circle-fill" : "bi-circle"}`} />
+                  {check.label}
+                </li>
+              );
+            })}
+          </ul>
         </div>
 
-      </div>
+        {/* Confirm Password */}
+        <div className="auth-field">
+          <label htmlFor="confirmPassword">Confirm Password</label>
+          <div className={`auth-input ${confirmPassword ? (passwordsMatch ? "is-valid" : "is-invalid") : ""}`}>
+            <i className="bi bi-lock-fill auth-input-icon" />
+            <input
+              id="confirmPassword"
+              type={showPassword ? "text" : "password"}
+              placeholder="Confirm new password"
+              value={confirmPassword}
+              onChange={(event) =>
+                setConfirmPassword(event.target.value)
+              }
+              disabled={loading}
+              autoComplete="new-password"
+            />
+          </div>
+          {confirmPassword && (
+            <small className={`auth-hint ${passwordsMatch ? "auth-hint-ok" : "auth-hint-warn"}`}>
+              <i className={`bi ${passwordsMatch ? "bi-check2" : "bi-x"}`} />
+              {passwordsMatch ? "Passwords match" : "Passwords do not match yet"}
+            </small>
+          )}
+        </div>
 
-    </div>
+        {/* Submit */}
+        <button
+          type="submit"
+          className="auth-submit"
+          disabled={loading}
+        >
+          {loading ? (
+            <>
+              <span className="spinner-border spinner-border-sm" aria-hidden="true" />
+              Resetting Password...
+            </>
+          ) : (
+            <>
+              Reset Password <i className="bi bi-check2-circle" />
+            </>
+          )}
+        </button>
+      </form>
+    </AuthLayout>
   );
 }
 

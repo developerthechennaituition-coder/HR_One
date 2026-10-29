@@ -10,43 +10,65 @@ function NotificationBell({ onNavigate }) {
   const audioUnlockedRef = useRef(false);
 
   useEffect(() => {
-    const audio = new Audio(notificationSound);
-    audio.preload = "auto";
-    audio.volume = 1;
-    audioRef.current = audio;
+    let cancelled = false;
+    let objectUrl = null;
+
+    // Load the sound as one in-memory Blob. Streaming it straight into
+    // <audio> uses HTTP range requests, which fail in some cache setups
+    // (net::ERR_CACHE_OPERATION_NOT_SUPPORTED) and leave no playable source.
+    fetch(notificationSound)
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        const audio = new Audio(objectUrl);
+        audio.preload = "auto";
+        audio.volume = 1;
+        audioRef.current = audio;
+      })
+      .catch((error) => {
+        if (!cancelled) console.warn("Notification sound could not be loaded:", error);
+      });
 
     return () => {
-      audio.pause();
-      audio.currentTime = 0;
+      cancelled = true;
+      audioRef.current?.pause();
       audioRef.current = null;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, []);
 
   useEffect(() => {
-    const unlockAudio = () => {
+    const events = ["click", "keydown", "touchstart"];
+    const removeListeners = () => {
+      events.forEach((name) => window.removeEventListener(name, unlockAudio));
+    };
+
+    // Browsers allow audio only after a user gesture. Retry on each gesture
+    // until it succeeds (the sound may still be loading on the first one).
+    function unlockAudio() {
       const audio = audioRef.current;
       if (!audio || audioUnlockedRef.current) return;
 
+      audio.muted = true;
       audio.play()
         .then(() => {
           audio.pause();
           audio.currentTime = 0;
+          audio.muted = false;
           audioUnlockedRef.current = true;
+          removeListeners();
         })
-        .catch((error) => {
-          console.warn("Notification sound could not be unlocked:", error);
+        .catch(() => {
+          audio.muted = false;
         });
-    };
+    }
 
-    window.addEventListener("click", unlockAudio, { once: true });
-    window.addEventListener("keydown", unlockAudio, { once: true });
-    window.addEventListener("touchstart", unlockAudio, { once: true });
-
-    return () => {
-      window.removeEventListener("click", unlockAudio);
-      window.removeEventListener("keydown", unlockAudio);
-      window.removeEventListener("touchstart", unlockAudio);
-    };
+    events.forEach((name) => window.addEventListener(name, unlockAudio));
+    return removeListeners;
   }, []);
 
   useEffect(() => {

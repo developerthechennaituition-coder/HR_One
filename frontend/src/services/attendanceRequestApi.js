@@ -41,6 +41,10 @@ async function request(path = "", options = {}, fallback = "Unable to complete t
 export const getAttendanceCalendar = (year, month) =>
   request(`/calendar?year=${year}&month=${month}`, {}, "Unable to load the attendance calendar.");
 
+// HR Admin: the same calendar for a selected employee (read-only).
+export const getEmployeeAttendanceCalendar = (userId, year, month) =>
+  request(`/calendar/user/${encodeURIComponent(userId)}?year=${year}&month=${month}`, {}, "Unable to load the attendance calendar.");
+
 export const createAttendanceRequest = (dates, remarks) =>
   request("", { method: "POST", body: JSON.stringify({ dates, remarks: remarks || null }) }, "Unable to submit the attendance request.");
 

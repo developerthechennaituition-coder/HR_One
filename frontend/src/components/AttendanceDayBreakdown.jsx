@@ -29,7 +29,7 @@ function formatClock(value) {
   }).format(date);
 }
 
-function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", date, onDateChange, showStatus = false, calendarDay = null, refreshKey = 0 }) {
+function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", date, minDate, onDateChange, showStatus = false, calendarDay = null, refreshKey = 0 }) {
   // Optionally controlled by a parent (e.g. the My Attendance calendar).
   const [internalDate, setInternalDate] = useState(indiaToday);
   const selectedDate = date || internalDate;
@@ -83,6 +83,7 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
                 type="date"
                 className="form-control form-control-sm"
                 value={selectedDate}
+                min={minDate}
                 max={indiaToday()}
                 onChange={(event) => setSelectedDate(event.target.value)}
               />
@@ -104,6 +105,9 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
                 <div><span className="text-muted">Check-in / Check-out</span><div className="fw-semibold fs-6">{calendarDay?.attendance_date === selectedDate && calendarDay.has_record ? `${calendarDay.check_in_time || "Not recorded"} / ${calendarDay.check_out_time || "Not recorded"}` : "—"}</div></div>
                 <div><span className="text-muted">Attendance category</span><div className="fw-semibold fs-6">{data.attendance_type === "WFH" || data.attendance_source === "WFH_FACE_GPS" ? "Work From Home" : data.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(data.attendance_source) ? "Office" : "—"}</div></div>
                 <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" ? "Attendance request (no punch recorded)" : data.attendance_source || "—"}</div></div>
+                {calendarDay?.attendance_date === selectedDate && calendarDay.permissions?.length > 0 && (
+                  <div><span className="text-muted">Permission</span><div className="fw-semibold fs-6">{calendarDay.permissions.map((item) => `${item.start_time}–${item.end_time} (${item.status === "approved" ? "Approved" : "Pending"})`).join(", ")}</div></div>
+                )}
                 {calendarDay?.attendance_date === selectedDate && calendarDay.request && (
                   <div><span className="text-muted">Attendance request</span><div className="fw-semibold fs-6">{calendarDay.request.request_number} · {calendarDay.request.status} ({calendarDay.request.requested_status})</div></div>
                 )}

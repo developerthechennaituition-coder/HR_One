@@ -1,5 +1,8 @@
 import { HRONE_API_BASE } from "../config/api.js";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import AuthLayout, { AuthAlert } from "../components/AuthLayout";
+
+const OTP_LENGTH = 6;
 
 function VerifyResetOTP() {
 
@@ -12,6 +15,14 @@ function VerifyResetOTP() {
   const [message, setMessage] = useState("");
 
   const [remainingSeconds, setRemainingSeconds] = useState(null);
+
+  const otpInputs = useRef([]);
+
+  // First countdown value; the progress ring drains from here.
+  const totalSeconds = useRef(null);
+  if (totalSeconds.current === null && remainingSeconds > 0) {
+    totalSeconds.current = remainingSeconds;
+  }
 
 
   // ---------------------------------------------------------
@@ -327,6 +338,55 @@ function VerifyResetOTP() {
 
 
   // ---------------------------------------------------------
+  // OTP digit boxes
+  // ---------------------------------------------------------
+  const focusDigit = (index) => {
+    otpInputs.current[Math.max(0, Math.min(index, OTP_LENGTH - 1))]?.focus();
+  };
+
+  const handleDigitChange = (index, rawValue) => {
+    const digits = rawValue.replace(/\D/g, "");
+    if (!digits) return;
+    // Typing fills one box; autofill or paste may deliver several digits at once.
+    const chars = otp.padEnd(OTP_LENGTH, " ").split("");
+    digits.slice(0, OTP_LENGTH - index).split("").forEach((digit, offset) => {
+      chars[index + offset] = digit;
+    });
+    setOtp(chars.join("").replace(/\s+$/, ""));
+    focusDigit(index + digits.length);
+  };
+
+  const handleDigitKeyDown = (index, event) => {
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      const chars = otp.padEnd(OTP_LENGTH, " ").split("");
+      const target = chars[index].trim() ? index : index - 1;
+      if (target < 0) return;
+      chars[target] = " ";
+      setOtp(chars.join("").replace(/\s+$/, ""));
+      focusDigit(target);
+    } else if (event.key === "ArrowLeft") {
+      focusDigit(index - 1);
+    } else if (event.key === "ArrowRight") {
+      focusDigit(index + 1);
+    }
+  };
+
+  const handleDigitPaste = (event) => {
+    event.preventDefault();
+    const digits = event.clipboardData.getData("text").replace(/\D/g, "").slice(0, OTP_LENGTH);
+    if (!digits) return;
+    setOtp(digits);
+    focusDigit(digits.length);
+  };
+
+  const ringProgress =
+    remainingSeconds && totalSeconds.current
+      ? remainingSeconds / totalSeconds.current
+      : 0;
+
+
+  // ---------------------------------------------------------
   // Start again
   // ---------------------------------------------------------
   const handleStartAgain = () => {
@@ -350,168 +410,101 @@ function VerifyResetOTP() {
   };
 
 
+  const expired = remainingSeconds === 0;
+  const urgent = remainingSeconds !== null && remainingSeconds <= 60;
+  const ringCircumference = 2 * Math.PI * 26;
+
   return (
-    <div className="container-fluid min-vh-100 d-flex align-items-center justify-content-center bg-light">
-
-      <div
-        className="card shadow-sm border-0"
-        style={{
-          width: "100%",
-          maxWidth: "450px",
-        }}
-      >
-
-        <div className="card-body p-4">
-
-
-          {/* ------------------------------------------------
-              Heading
-          ------------------------------------------------ */}
-          <div className="text-center mb-4">
-
-            <h3 className="fw-bold">
-              Verify OTP
-            </h3>
-
-            <p className="text-muted mb-2">
-              Enter the 6-digit OTP sent to your
-              registered email address.
-            </p>
-
-
-            {/* ------------------------------------------------
-                OTP Countdown
-            ------------------------------------------------ */}
-            {remainingSeconds !== null && (
-              <div
-                className={
-                  remainingSeconds <= 60
-                    ? "text-danger fw-semibold"
-                    : "text-primary fw-semibold"
-                }
-              >
-                OTP expires in{" "}
-                <span>
-                  {formatTime(
-                    remainingSeconds
-                  )}
-                </span>
-              </div>
-            )}
-
+    <AuthLayout
+      icon="bi-shield-lock"
+      step={2}
+      title="Check your inbox"
+      subtitle="Enter the 6-digit OTP sent to your registered email address."
+      footer={
+        <button
+          type="button"
+          className="auth-link"
+          onClick={handleStartAgain}
+        >
+          <i className="bi bi-arrow-counterclockwise" /> Didn't get it? Start Again
+        </button>
+      }
+    >
+      {/* ------------------------------------------------
+          OTP Countdown
+      ------------------------------------------------ */}
+      {remainingSeconds !== null && (
+        <div className={`auth-timer ${expired ? "expired" : urgent ? "urgent" : ""}`}>
+          <svg viewBox="0 0 60 60" aria-hidden="true">
+            <circle className="auth-timer-track" cx="30" cy="30" r="26" />
+            <circle
+              className="auth-timer-progress"
+              cx="30"
+              cy="30"
+              r="26"
+              strokeDasharray={ringCircumference}
+              strokeDashoffset={ringCircumference * (1 - ringProgress)}
+            />
+          </svg>
+          <div>
+            <strong>{expired ? "OTP expired" : formatTime(remainingSeconds)}</strong>
+            <small>{expired ? "Request a new OTP to continue" : "until your OTP expires"}</small>
           </div>
-
-
-          {/* ------------------------------------------------
-              Error
-          ------------------------------------------------ */}
-          {error && (
-            <div
-              className="alert alert-danger"
-              role="alert"
-            >
-              {error}
-            </div>
-          )}
-
-
-          {/* ------------------------------------------------
-              Success
-          ------------------------------------------------ */}
-          {message && (
-            <div
-              className="alert alert-success"
-              role="alert"
-            >
-              {message}
-            </div>
-          )}
-
-
-          {/* ------------------------------------------------
-              Form
-          ------------------------------------------------ */}
-          <form onSubmit={handleSubmit}>
-
-            <div className="mb-3">
-
-              <label
-                htmlFor="otp"
-                className="form-label fw-semibold"
-              >
-                OTP
-              </label>
-
-              <input
-                id="otp"
-                type="text"
-                className="form-control text-center"
-                placeholder="Enter 6-digit OTP"
-                value={otp}
-                onChange={(event) => {
-
-                  const value =
-                    event.target.value
-                      .replace(/\D/g, "")
-                      .slice(0, 6);
-
-                  setOtp(value);
-
-                }}
-                maxLength={6}
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                disabled={
-                  loading ||
-                  remainingSeconds === 0
-                }
-                autoFocus
-              />
-
-            </div>
-
-
-            <button
-              type="submit"
-              className="btn btn-primary w-100"
-              disabled={
-                loading ||
-                remainingSeconds === 0
-              }
-            >
-
-              {loading
-                ? "Verifying..."
-                : remainingSeconds === 0
-                ? "OTP Expired"
-                : "Verify OTP"}
-
-            </button>
-
-          </form>
-
-
-          {/* ------------------------------------------------
-              Back
-          ------------------------------------------------ */}
-          <div className="text-center mt-3">
-
-            <button
-              type="button"
-              className="btn btn-link text-decoration-none"
-              onClick={handleStartAgain}
-            >
-              Start Again
-            </button>
-
-          </div>
-
-
         </div>
+      )}
 
-      </div>
+      <AuthAlert type="error">{error}</AuthAlert>
+      <AuthAlert type="success">{message}</AuthAlert>
 
-    </div>
+      <form className="auth-form" onSubmit={handleSubmit}>
+        <fieldset className="auth-field">
+          <legend className="visually-hidden">One-time password</legend>
+          <div className="auth-otp" onPaste={handleDigitPaste}>
+            {Array.from({ length: OTP_LENGTH }, (_, index) => {
+              const digit = (otp[index] || "").trim();
+              return (
+                <input
+                  key={index}
+                  ref={(element) => {
+                    otpInputs.current[index] = element;
+                  }}
+                  type="text"
+                  className={digit ? "filled" : ""}
+                  value={digit}
+                  onChange={(event) => handleDigitChange(index, event.target.value)}
+                  onKeyDown={(event) => handleDigitKeyDown(index, event)}
+                  onFocus={(event) => event.target.select()}
+                  inputMode="numeric"
+                  autoComplete={index === 0 ? "one-time-code" : "off"}
+                  aria-label={`Digit ${index + 1} of ${OTP_LENGTH}`}
+                  disabled={loading || expired}
+                  autoFocus={index === 0}
+                />
+              );
+            })}
+          </div>
+        </fieldset>
+
+        <button
+          type="submit"
+          className="auth-submit"
+          disabled={loading || expired}
+        >
+          {loading ? (
+            <>
+              <span className="spinner-border spinner-border-sm" aria-hidden="true" />
+              Verifying...
+            </>
+          ) : expired ? (
+            "OTP Expired"
+          ) : (
+            <>
+              Verify OTP <i className="bi bi-patch-check" />
+            </>
+          )}
+        </button>
+      </form>
+    </AuthLayout>
   );
 }
 

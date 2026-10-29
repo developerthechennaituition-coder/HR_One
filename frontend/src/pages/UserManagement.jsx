@@ -4,6 +4,7 @@ import { parsePhoneNumberFromString } from "libphonenumber-js/max";
 // Purpose: Read libphonenumber-js numbering-plan metadata so the allowed
 // phone-number lengths are detected dynamically for each selected country.
 import { Metadata } from "libphonenumber-js";
+import { roleLabel } from "../services/roleLabels";
 
 // HR administrators create, activate, edit and filter application users here.
 const API_URL = HRONE_API_BASE + "/api/users";
@@ -491,7 +492,7 @@ function UserManagement() {
                   <div className="col-md-6">
                     <label className="form-label fw-semibold">Role</label>
                     <div className="form-control bg-light">
-                      {viewingUser.role || "-"}
+                      {roleLabel(viewingUser.role) || "-"}
                     </div>
                   </div>
 
@@ -730,7 +731,7 @@ function UserManagement() {
                     <option value="">Select a role</option>
                     {ROLE_OPTIONS.map((role) => (
                       <option key={role} value={role}>
-                        {role}
+                        {roleLabel(role)}
                       </option>
                     ))}
                   </select>
@@ -804,7 +805,7 @@ function UserManagement() {
                 <option value="all">All Role</option>
                 <option value="Super Admin">Super Admin</option>
                 <option value="HR Admin">HR Admin</option>
-                <option value="HR Manager">HR Manager</option>
+                <option value="HR Manager">HOD</option>
                 <option value="Employee">Employee</option>
               </select>
             </div>
@@ -851,7 +852,7 @@ function UserManagement() {
                       <td>{user.name}</td>
                       <td>{user.work_email}</td>
                       <td>{user.country_code ? `${user.country_code} ${user.mobile}` : user.mobile}</td>
-                      <td>{user.role}</td>
+                      <td>{roleLabel(user.role)}</td>
                       <td>
                         <span
                           className={`badge ${user.is_active ? "text-bg-success" : "text-bg-secondary"}`}

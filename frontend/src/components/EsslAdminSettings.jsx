@@ -1,5 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useState } from "react";
+import { roleLabel } from "../services/roleLabels";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
@@ -542,7 +543,7 @@ function EsslAdminSettings({ session }) {
                   <tr key={employee.user_id}>
                     <td>{employee.name || "—"}{!employee.is_active && <span className="badge text-bg-secondary ms-2">Inactive</span>}</td>
                     <td>{employee.employee_id || "—"}</td>
-                    <td>{employee.role || "—"}</td>
+                    <td>{roleLabel(employee.role) || "—"}</td>
                     <td>{employee.department || "Unassigned"}</td>
                     <td style={{ minWidth: "180px" }}>
                       <input className="form-control form-control-sm" value={employee.essl_employee_id || ""}
@@ -678,6 +679,7 @@ Only employees with saved ESSL mappings will be imported. You can import mapped 
                     <div className="col-md-4">Attendance created: {importSummary.attendance_records_created}</div>
                     <div className="col-md-4">Attendance updated: {importSummary.attendance_records_updated}</div>
                     <div className="col-md-4">Protected existing records: {importSummary.attendance_records_protected}</div>
+                    <div className="col-md-4">Skipped (before joining date): {importSummary.punches_skipped_before_joining ?? 0}</div>
                   </div>
                   {importSummary.unmatched_employee_ids?.length > 0 && <div className="mt-2"><strong>Unmapped ESSL IDs:</strong> {importSummary.unmatched_employee_ids.join(", ")}</div>}
                 </div>
@@ -722,6 +724,7 @@ Only employees with saved ESSL mappings will be imported. You can import mapped 
                 <div className="col-md-4">Attendance updated: {syncSummary.attendance_records_updated}</div>
                 <div className="col-md-4">Unmatched employees: {syncSummary.unmatched_employees}</div>
                 <div className="col-md-4">Invalid records: {syncSummary.invalid_records}</div>
+                <div className="col-md-4">Skipped (before joining date): {syncSummary.punches_skipped_before_joining ?? 0}</div>
               </div>
             </div>
           )}

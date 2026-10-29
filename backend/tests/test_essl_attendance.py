@@ -502,6 +502,44 @@ class EsslSyncAuthorizationAndSafetyTests(unittest.TestCase):
         day_one = next(group for group in saved_groups if group[0] == "2026-10-07")
         self.assertEqual([value.strftime("%H:%M") for value in day_one[1]], ["09:03", "18:12"])
 
+    def test_sync_skips_punches_before_each_employees_own_joining_date(self):
+        new_joiner = {"_id": ObjectId(), "employee_id": "26IT006", "essl_employee_id_normalized": "3006",
+                      "date_of_joining": datetime(2026, 10, 7)}
+        veteran = {"_id": ObjectId(), "employee_id": "26IT007", "essl_employee_id_normalized": "3007",
+                   "date_of_joining": "2025-01-01"}
+        records = [
+            {"emp": "3006", "at": "2026-10-06T09:00:00+05:30"},  # day before joining
+            {"emp": "3006", "at": "2026-10-07T09:05:00+05:30"},  # joining day
+            {"emp": "3007", "at": "2026-10-06T09:10:00+05:30"},
+        ]
+        config = {"records_path": "records", "employee_id_path": "emp", "timestamp_path": "at", "method": "GET"}
+        saved, issues = [], []
+        with (
+            patch.object(essl, "_require_essl_admin", return_value={"_id": ObjectId()}),
+            patch.object(essl, "_load_config", return_value=config),
+            patch.object(essl, "_decrypt_credentials", return_value={}),
+            patch.object(essl, "_request_json", return_value={"records": records}),
+            patch.object(essl, "_save_daily_attendance",
+                         side_effect=lambda user, day, *_: saved.append((user["employee_id"], day)) or "created"),
+            patch.object(essl, "_save_raw_punch"),
+            patch.object(essl, "_load_daily_raw_punches", return_value=[]),
+            patch.object(essl, "_store_issue", side_effect=lambda *args: issues.append(args)),
+            patch.object(essl.users_collection, "find", return_value=[new_joiner, veteran]),
+            patch.object(essl.essl_sync_history_collection, "insert_one"),
+            patch.object(essl.essl_sync_history_collection, "update_one"),
+            patch.object(essl, "company_today", return_value=date(2026, 10, 7)),
+            patch.object(essl, "company_now", return_value=datetime(2026, 10, 7, 20, 0, tzinfo=ZoneInfo("Asia/Kolkata"))),
+        ):
+            result = essl.synchronize_essl_attendance(
+                EsslSyncPayload(from_date="2026-10-06", to_date="2026-10-07"), "token",
+            )
+
+        self.assertEqual(result["punches_skipped_before_joining"], 1)
+        self.assertEqual(result["processed_punches"], 2)
+        self.assertEqual(sorted(saved), [("26IT006", "2026-10-07"), ("26IT007", "2026-10-06")])
+        self.assertEqual(len(issues), 1)
+        self.assertIn("before the employee's joining date (2026-10-07)", issues[0][5])
+
 
 if __name__ == "__main__":
     unittest.main()

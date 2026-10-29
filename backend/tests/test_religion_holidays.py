@@ -82,9 +82,10 @@ class ReligionHolidayCalendarTests(unittest.TestCase):
         user["auth"] = f"Bearer {token}"
         return user
 
-    def calendar_payload(self, religion="Hindu", year=THIS_YEAR, name="Hindu holidays"):
+    def calendar_payload(self, religion="Hindu", year=THIS_YEAR, name="Hindu holidays", assignments=None):
+        assignments = [{"company_id": self.company_id, "location": "Chennai"}] if assignments is None else assignments
         return cr.HolidayCalendarPayload(company_id=self.company_id, location="Chennai", calendar_name=name,
-                                         calendar_year=year, religion=religion)
+                                         calendar_year=year, religion=religion, assignments=assignments)
 
     def holiday_payload(self, calendar_id, iso, name, **extra):
         return cr.HolidayPayload(calendar_id=calendar_id, holiday_date=date.fromisoformat(iso), holiday_name=name, **extra)
@@ -226,6 +227,81 @@ class ReligionHolidayCalendarTests(unittest.TestCase):
         summary = payroll._attendance_summary_for_employee("E-1", 12, THIS_YEAR)
         self.assertEqual((summary["holiday_days"], summary["present_days"]), (1, 1))
         self.assertEqual(payroll._attendance_summary_for_employee("E-3", 12, THIS_YEAR)["holiday_days"], 0)
+
+    # -- Company / branch / location assignments ----------------------------
+
+    def two_branches(self):
+        """Branch A (existing HQ) holds Asha; branch B of another entity holds Bala."""
+        db["companies"].update_one({"_id": ObjectId(self.company_id)}, {"$set": {"employee_ids": [str(self.hindu["_id"])]}})
+        branch_b = str(db["companies"].insert_one({
+            "company": "Beta", "legal_entity": "Beta LLP", "branch": "Madurai", "location": "Madurai",
+            "is_active": True, "employee_ids": [str(self.hindu_two["_id"])],
+        }).inserted_id)
+        return branch_b
+
+    def test_assignments_are_validated_and_scope_visibility(self):
+        branch_b = self.two_branches()
+        options = cr.holiday_calendar_options(_user=self.hr)
+        self.assertEqual({item["branch"] for item in options["organization"]}, {"HQ", "Madurai"})
+        self.assertIn("at least one company", self.assert_http(422, cr.create_holiday_calendar, self.calendar_payload(assignments=[]), user=self.hr))
+        # A location from another branch is an invalid combination.
+        bad = [{"company_id": self.company_id, "location": "Madurai"}]
+        self.assertIn("does not belong", self.assert_http(422, cr.create_holiday_calendar, self.calendar_payload(assignments=bad), user=self.hr))
+        self.assert_http(422, cr.create_holiday_calendar, self.calendar_payload(assignments=[{"company_id": "not-an-id", "location": "x"}]), user=self.hr)
+
+        calendar = cr.create_holiday_calendar(self.calendar_payload(), user=self.hr)  # branch A only
+        self.assertEqual([item["branch"] for item in calendar["assignments"]], ["HQ"])
+        cr.create_holiday(calendar["id"], self.holiday_payload(calendar["id"], f"{THIS_YEAR}-12-24", "Festival Eve"), user=self.hr)
+        cr.publish_holiday_calendar(calendar["id"], user=self.hr)
+        self.assertEqual(self.recipients("published"), {str(self.hindu["_id"])})  # Bala is in branch B
+        self.assertEqual(len(cr.get_my_religion_holidays(year=THIS_YEAR, user=self.hindu)["holidays"]), 1)
+        self.assertEqual(cr.get_my_religion_holidays(year=THIS_YEAR, user=self.hindu_two)["holidays"], [])
+        self.assert_http(404, cr.get_holiday_calendar, calendar["id"], user=self.hindu_two)
+
+        # Editing: add branch B, then remove branch A; only gained/lost employees are told.
+        both = [{"company_id": self.company_id, "location": "Chennai"}, {"company_id": branch_b, "location": "Madurai"}]
+        cr.update_holiday_calendar(calendar["id"], self.calendar_payload(assignments=both), user=self.hr)
+        self.assertEqual(self.recipients("now applies to you"), {str(self.hindu_two["_id"])})
+        self.assertEqual(len(cr.get_my_religion_holidays(year=THIS_YEAR, user=self.hindu_two)["holidays"]), 1)
+        cr.update_holiday_calendar(calendar["id"], self.calendar_payload(assignments=both[1:]), user=self.hr)
+        self.assertEqual(self.recipients("no longer applies"), {str(self.hindu["_id"])})
+        self.assertEqual(cr.get_my_religion_holidays(year=THIS_YEAR, user=self.hindu)["holidays"], [])
+        self.assertEqual(db["holidays"].count_documents({"calendar_id": calendar["id"], "is_active": True}), 1)  # entries untouched
+
+    def test_published_calendar_deletion_is_confirmed_scoped_and_keeps_history(self):
+        calendar = self.published_calendar()
+        other = cr.create_holiday_calendar(self.calendar_payload(religion="Christian", name="Christian holidays"), user=self.hr)
+        cr.create_holiday(other["id"], self.holiday_payload(other["id"], f"{THIS_YEAR}-12-24", "Festival Eve"), user=self.hr)  # same date/name
+        # A past holiday of the published calendar (dates in the past cannot be added through the API).
+        past = date.today().replace(day=1)
+        db["holidays"].insert_one({"calendar_id": calendar["id"], "holiday_date": datetime(past.year, past.month, 1, tzinfo=timezone.utc),
+                                   "holiday_name": "Past Festival", "holiday_type": "Public", "is_active": True, "status": "Published"})
+        db["employee_holiday_calendars"].insert_one({"employee_id": "x", "calendar_id": calendar["id"], "is_active": True})
+        db["monthly_payroll_records"].insert_one({"employee_id": "E-1", "period": f"{THIS_YEAR}-12", "status": "Calculated"})
+
+        self.assertIn("Confirm", self.assert_http(422, cr.deactivate_holiday_calendar, calendar["id"], confirm=None, user=self.hr))
+        self.assert_http(422, cr.deactivate_holiday_calendar, calendar["id"], confirm=other["id"], user=self.hr)
+        self.assertEqual(db["holiday_calendars"].count_documents({"_id": ObjectId(calendar["id"]), "is_active": True}), 1)  # nothing changed
+
+        result = cr.deactivate_holiday_calendar(calendar["id"], confirm=calendar["id"], user=self.hr)
+        self.assertEqual((result["holidays_deactivated"], result["assignments_deactivated"]), (3, 1))
+        self.assert_http(404, cr.deactivate_holiday_calendar, calendar["id"], confirm=calendar["id"], user=self.hr)  # repeat
+        stored = db["holiday_calendars"].find_one({"_id": ObjectId(calendar["id"])})
+        self.assertEqual((stored["status"], stored["is_active"], stored["was_published"]), ("Deleted", False, True))
+        # Gone from every list; the other calendar and its same-named holiday are untouched.
+        self.assertEqual([item["id"] for item in cr.list_holiday_calendars(user=self.hr)], [other["id"]])
+        self.assertEqual(cr.get_my_religion_holidays(year=THIS_YEAR, user=self.hindu)["holidays"], [])
+        self.assertEqual(db["holidays"].count_documents({"calendar_id": other["id"], "is_active": True, "status": "Draft"}), 1)
+        # History: the past holiday still counts; upcoming ones do not.
+        lookup = cr.published_religion_holidays(self.hindu, date(past.year, past.month, 1), date(THIS_YEAR, 12, 31))
+        self.assertEqual([holiday["holiday_name"] for holiday in lookup.values()], ["Past Festival"])
+        self.assertEqual(self.recipients("removed"), {str(self.hindu["_id"]), str(self.hindu_two["_id"])})
+        self.assertTrue(db["monthly_payroll_records"].find_one({"employee_id": "E-1"})["attendance_outdated"])
+        # A new calendar for the same religion/year can be created afterwards.
+        cr.create_holiday_calendar(self.calendar_payload(), user=self.hr)
+        # Drafts need no confirmation and notify nobody.
+        cr.deactivate_holiday_calendar(other["id"], confirm=None, user=self.hr)
+        self.assertEqual(db["notifications"].count_documents({"title": {"$regex": "Christian"}}), 0)
 
     def test_religion_calendars_are_not_assigned_and_legacy_lookup_is_company_wide(self):
         calendar = self.published_calendar()

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { HRONE_API_BASE } from "../config/api.js";
+import { roleLabel } from "../services/roleLabels";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE).replace(/\/+$/, "");
 const todayIso = () => {
@@ -176,7 +177,7 @@ function WfhAdminSettings({ session }) {
                 const locationRegistered = employee.home_latitude != null && employee.home_longitude != null;
                 const busy = busyAction.startsWith(`${employee.user_id}:`);
                 return <tr key={employee.user_id}>
-                  <td><div className="fw-semibold">{employee.name || "Unnamed account"}</div><small className="text-muted d-block">{employee.employee_id || "No employee ID"} · {employee.role || "Employee"}{!employee.is_active && " · Inactive"}</small></td>
+                  <td><div className="fw-semibold">{employee.name || "Unnamed account"}</div><small className="text-muted d-block">{employee.employee_id || "No employee ID"} · {roleLabel(employee.role) || "Employee"}{!employee.is_active && " · Inactive"}</small></td>
                   <td><div className="form-check form-switch"><input className="form-check-input" type="checkbox" role="switch" id={`wfh-enabled-${employee.user_id}`} checked={Boolean(employee.is_wfh_enabled)} onChange={(event) => updateEmployee(employee.user_id, "is_wfh_enabled", event.target.checked)} aria-label={`Enable WFH for ${employee.name}`} /></div></td>
                   <td><input className="form-control form-control-sm" type="date" min={todayIso()} value={employee.wfh_permitted_from || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_from", event.target.value)} aria-label={`WFH permit start date for ${employee.name}`} /></td>
                   <td><input className="form-control form-control-sm" type="date" min={employee.wfh_permitted_from || todayIso()} value={employee.wfh_permitted_to || ""} onChange={(event) => updateEmployee(employee.user_id, "wfh_permitted_to", event.target.value)} aria-label={`WFH permit end date for ${employee.name}`} /></td>
@@ -257,7 +258,7 @@ function WfhAdminSettings({ session }) {
                         <dt className="col-sm-5">Employee ID</dt>
                         <dd className="col-sm-7">{faceDetails.employee?.employee_id || "—"}</dd>
                         <dt className="col-sm-5">Role</dt>
-                        <dd className="col-sm-7">{faceDetails.employee?.role || "—"}</dd>
+                        <dd className="col-sm-7">{roleLabel(faceDetails.employee?.role) || "—"}</dd>
                         <dt className="col-sm-5">Registered at</dt>
                         <dd className="col-sm-7">
                           {faceDetails.registered_at

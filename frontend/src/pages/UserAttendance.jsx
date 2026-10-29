@@ -1,41 +1,22 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
+import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
+import { getEmployeeAttendanceCalendar } from "../services/attendanceRequestApi";
+import {
+  MONTH_NAMES, buildCalendarRange, clampMonth, companyToday, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions,
+} from "../services/attendanceCalendarRange";
+import { roleLabel } from "../services/roleLabels";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
 
-const MONTH_NAMES = [
-  "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December",
-];
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-// Same colours as Profile -> Attendance so both views look alike.
+// Summary card colours (same as Profile -> Attendance).
 const STATUS_COLORS = {
-  present: { background: "#198754", text: "#ffffff", label: "Present" },
-  absent: { background: "#dc3545", text: "#ffffff", label: "Absent" },
-  leave: { background: "#6f42c1", text: "#ffffff", label: "Leave" },
-  holiday: { background: "#ADD8E6", text: "#0b3d4a", label: "Holiday" },
-  notmarked: { background: "#F0E0C8", text: "#7a5a2f", label: "Not Marked" },
-};
-
-const companyToday = () => {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const value = Object.fromEntries(parts.map(({ type, value: v }) => [type, v]));
-  return { year: Number(value.year), month: Number(value.month), day: Number(value.day) };
-};
-
-const formatTime = (time) => {
-  if (!time) return "Not marked";
-  const [hourText, minute] = String(time).split(":");
-  const hour = Number(hourText);
-  return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
+  present: { background: "#198754", label: "Present" },
+  absent: { background: "#dc3545", label: "Absent" },
+  leave: { background: "#6f42c1", label: "Leave" },
+  holiday: { background: "#ADD8E6", label: "Holiday" },
 };
 
 const formatLocalDateTime = (value) => {
@@ -50,19 +31,6 @@ const formatLocalDateTime = (value) => {
   }).format(parsed);
 };
 
-const sourceLabel = (record) => {
-  if (!record) return "—";
-  if (record.attendance_source === "ESSL") return "ESSL biometric";
-  if (record.attendance_source === "MANUAL") return "Manual (HR)";
-  if (record.attendance_source === "WFH_FACE_GPS") return "WFH · Face + GPS";
-  return record.attendance_source || "—";
-};
-
-const statusKey = (record) => {
-  const status = String(record?.status || "").trim().toLowerCase();
-  return STATUS_COLORS[status] ? status : "notmarked";
-};
-
 const readError = async (response, fallback) => {
   try {
     const data = await response.json();
@@ -74,7 +42,8 @@ const readError = async (response, fallback) => {
 
 function UserAttendance({ session }) {
   const token = session?.token;
-  const today = useMemo(companyToday, []);
+  const todayIso = useMemo(companyToday, []);
+  const today = { year: Number(todayIso.slice(0, 4)), month: Number(todayIso.slice(5, 7)) };
 
   const [employees, setEmployees] = useState([]);
   const [employeesLoading, setEmployeesLoading] = useState(true);
@@ -82,10 +51,12 @@ function UserAttendance({ session }) {
   const [selectedUserId, setSelectedUserId] = useState("");
   const [year, setYear] = useState(today.year);
   const [month, setMonth] = useState(today.month);
-  const [records, setRecords] = useState([]);
+  // Same Monthly Attendance Calendar data as My Attendance, for the chosen employee.
+  const [calendar, setCalendar] = useState(null);
+  const [joiningDate, setJoiningDate] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [selectedDate, setSelectedDate] = useState(null);
+  const [selectedDate, setSelectedDate] = useState(todayIso);
   const [monthlyDetails, setMonthlyDetails] = useState(null);
   const [monthlyDetailsLoading, setMonthlyDetailsLoading] = useState(false);
   const [monthlyDetailsError, setMonthlyDetailsError] = useState("");
@@ -121,30 +92,59 @@ function UserAttendance({ session }) {
 
   const selectedEmployee = employees.find((e) => e.user_id === selectedUserId) || null;
 
-  // ---- attendance of the chosen employee ----------------------------------
+  // ---- calendar of the chosen employee ------------------------------------
+  // Joining date of the selected employee through today + 89 days.
+  const calendarRange = useMemo(() => buildCalendarRange(joiningDate, todayIso), [joiningDate, todayIso]);
+  const reportAvailable = year < today.year || (year === today.year && month <= today.month);
+
   const loadAttendance = useCallback(async () => {
     if (!selectedUserId) {
-      setRecords([]);
+      setCalendar(null);
       return;
     }
     setLoading(true);
     setError("");
-    setSelectedDate(null);
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/attendance/user/${selectedUserId}?year=${year}&month=${month}`,
-        { headers },
-      );
-      if (!response.ok) throw new Error(await readError(response, "Unable to load attendance."));
-      const data = await response.json();
-      setRecords(Array.isArray(data) ? data : []);
+      const data = await getEmployeeAttendanceCalendar(selectedUserId, year, month);
+      setCalendar(data);
+      setJoiningDate(data?.joining_date || null);
     } catch (e) {
-      setRecords([]);
+      setCalendar(null);
       setError(e.message || "Unable to load attendance.");
     } finally {
       setLoading(false);
     }
-  }, [selectedUserId, year, month, headers]);
+  }, [selectedUserId, year, month]);
+
+  // A different employee has a different joining date.
+  useEffect(() => {
+    setJoiningDate(null);
+    setSelectedDate(todayIso);
+  }, [selectedUserId, todayIso]);
+
+  // Keep the month and selected date inside the employee's calendar range.
+  useEffect(() => {
+    if (!isMonthInRange(calendarRange, year, month)) {
+      const target = clampMonth(calendarRange, year, month);
+      setYear(target.year);
+      setMonth(target.month);
+    }
+    setSelectedDate((current) => (isSelectableDate(calendarRange, current) ? current : todayIso));
+  }, [calendarRange, year, month, todayIso]);
+
+  const changeMonth = (nextYear, nextMonth) => {
+    const target = clampMonth(calendarRange, nextYear, nextMonth);
+    setYear(target.year);
+    setMonth(target.month);
+  };
+
+  // Past and today's dates only; upcoming dates open details inside the calendar.
+  const selectDate = (iso) => {
+    if (!isSelectableDate(calendarRange, iso)) return;
+    setSelectedDate(iso);
+    const [selectedYear, selectedMonth] = iso.split("-").map(Number);
+    if (selectedYear !== year || selectedMonth !== month) changeMonth(selectedYear, selectedMonth);
+  };
 
   const loadMonthlyDetails = useCallback(async () => {
     if (!selectedUserId) {
@@ -205,35 +205,19 @@ function UserAttendance({ session }) {
   useEffect(() => { loadAttendance(); }, [loadAttendance]);
   useEffect(() => { setMonthlyDetails(null); setMonthlyDetailsError(""); }, [selectedUserId, year, month]);
 
-  const recordByDate = useMemo(() => {
-    const map = {};
-    records.forEach((r) => { map[String(r.attendance_date).slice(0, 10)] = r; });
-    return map;
-  }, [records]);
-
-  const daysInMonth = new Date(year, month, 0).getDate();
-  const firstWeekday = new Date(year, month - 1, 1).getDay();
-  const dateKey = (day) => `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const isFuture = (day) => dateKey(day) > `${today.year}-${String(today.month).padStart(2, "0")}-${String(today.day).padStart(2, "0")}`;
-
+  // Recorded attendance only (as before); upcoming holidays/leave are not counted.
   const counts = useMemo(() => {
     const result = { present: 0, absent: 0, leave: 0, holiday: 0 };
-    records.forEach((r) => {
-      const key = String(r.status || "").toLowerCase();
-      if (key in result) result[key] += 1;
+    (calendar?.days || []).forEach((day) => {
+      const key = String(day.status || "").toLowerCase();
+      if (day.has_record && key in result) result[key] += 1;
     });
     return result;
-  }, [records]);
+  }, [calendar]);
   const marked = counts.present + counts.absent + counts.leave;
   const percent = (value) => (marked ? ((value / marked) * 100).toFixed(1) : "0.0");
 
-  const cells = [];
-  for (let i = 0; i < firstWeekday; i += 1) cells.push(null);
-  for (let day = 1; day <= daysInMonth; day += 1) cells.push(day);
-  while (cells.length % 7) cells.push(null);
-
-  const years = [today.year, today.year - 1, today.year - 2];
-  const selectedRecord = selectedDate ? recordByDate[selectedDate] : null;
+  const selectedCalendarDay = calendar?.days?.find((day) => day.attendance_date === selectedDate) || null;
 
   return (
     <div className="container-fluid">
@@ -276,11 +260,9 @@ function UserAttendance({ session }) {
             </div>
             <div className="col-lg-3 col-md-6">
               <label className="form-label fw-semibold" htmlFor="ua-month">Month</label>
-              <select id="ua-month" className="form-select" value={month} onChange={(e) => setMonth(Number(e.target.value))}>
-                {MONTH_NAMES.map((name, index) => (
-                  <option key={name} value={index + 1} disabled={year === today.year && index + 1 > today.month}>
-                    {name}
-                  </option>
+              <select id="ua-month" className="form-select" value={month} onChange={(e) => changeMonth(year, Number(e.target.value))}>
+                {monthOptions(calendarRange, year).map((item) => (
+                  <option key={item.value} value={item.value}>{item.label}</option>
                 ))}
               </select>
             </div>
@@ -290,13 +272,9 @@ function UserAttendance({ session }) {
                 id="ua-year"
                 className="form-select"
                 value={year}
-                onChange={(e) => {
-                  const next = Number(e.target.value);
-                  setYear(next);
-                  if (next === today.year && month > today.month) setMonth(today.month);
-                }}
+                onChange={(e) => changeMonth(Number(e.target.value), month)}
               >
-                {years.map((y) => <option key={y} value={y}>{y}</option>)}
+                {yearOptions(calendarRange).map((y) => <option key={y} value={y}>{y}</option>)}
               </select>
             </div>
           </div>
@@ -319,7 +297,7 @@ function UserAttendance({ session }) {
               <div>
                 <h5 className="mb-1">{selectedEmployee.name}</h5>
                 <p className="text-muted mb-0">
-                  {selectedEmployee.employee_id} · {selectedEmployee.role}
+                  {selectedEmployee.employee_id} · {roleLabel(selectedEmployee.role)}
                 </p>
               </div>
               <div className="d-flex flex-wrap gap-2">
@@ -327,7 +305,8 @@ function UserAttendance({ session }) {
                   type="button"
                   className="btn btn-primary btn-sm"
                   onClick={loadMonthlyDetails}
-                  disabled={loading || monthlyDetailsLoading}
+                  disabled={loading || monthlyDetailsLoading || !reportAvailable}
+                  title={reportAvailable ? undefined : "Available for the current and past months"}
                 >
                   <i className="bi bi-eye me-1"></i>
                   {monthlyDetailsLoading ? "Loading..." : "View Attendance"}
@@ -336,7 +315,8 @@ function UserAttendance({ session }) {
                   type="button"
                   className="btn btn-success btn-sm"
                   onClick={downloadMonthlyExcel}
-                  disabled={loading || exportLoading}
+                  disabled={loading || exportLoading || !reportAvailable}
+                  title={reportAvailable ? undefined : "Available for the current and past months"}
                 >
                   <i className="bi bi-file-earmark-excel me-1"></i>
                   {exportLoading ? "Preparing Excel..." : "Download Excel"}
@@ -364,76 +344,16 @@ function UserAttendance({ session }) {
               ))}
             </div>
 
-            <div className="d-flex flex-wrap gap-3 mb-3">
-              {Object.entries(STATUS_COLORS).map(([key, c]) => (
-                <div className="d-flex align-items-center gap-2" key={key}>
-                  <span style={{ width: 20, height: 20, borderRadius: 4, backgroundColor: c.background, border: "1px solid rgba(0,0,0,0.15)", display: "inline-block" }}></span>
-                  <span className="text-muted">{c.label === "Not Marked" ? "Not Marked Yet" : c.label}</span>
-                </div>
-              ))}
-            </div>
-
-            {loading ? (
-              <div className="text-center py-5">
-                <div className="spinner-border text-primary" role="status"></div>
-                <p className="text-muted mt-2 mb-0">Loading attendance...</p>
-              </div>
-            ) : (
-              <div className="border rounded p-3">
-                <div className="fw-semibold mb-3" style={{ fontSize: 16 }}>{MONTH_NAMES[month - 1]} {year}</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 8, marginBottom: 8 }}>
-                  {WEEKDAYS.map((d) => (
-                    <div key={d} className="text-center text-muted fw-semibold" style={{ fontSize: 12, padding: "4px 0" }}>{d}</div>
-                  ))}
-                </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 8 }}>
-                  {cells.map((day, index) => {
-                    if (!day) return <div key={`blank-${index}`} />;
-                    const key = dateKey(day);
-                    const record = recordByDate[key];
-                    const colors = STATUS_COLORS[isFuture(day) && !record ? "notmarked" : statusKey(record)];
-                    const selected = selectedDate === key;
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => setSelectedDate(key)}
-                        title={record ? `${colors.label}${record.check_in_time ? ` · In ${formatTime(record.check_in_time)}` : ""}` : "Not marked"}
-                        style={{
-                          minHeight: 64,
-                          border: selected ? "2px solid #0d6efd" : "1px solid rgba(0,0,0,0.12)",
-                          borderRadius: 8,
-                          backgroundColor: colors.background,
-                          color: colors.text,
-                          opacity: isFuture(day) && !record ? 0.55 : 1,
-                          textAlign: "left",
-                          padding: "6px 8px",
-                          cursor: "pointer",
-                        }}
-                      >
-                        <div className="fw-semibold">{day}</div>
-                        <div style={{ fontSize: 11 }}>{isFuture(day) && !record ? "—" : colors.label}</div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {selectedDate && !loading && (
-              <div className="border rounded p-3 mt-3 bg-light">
-                <h6 className="mb-3">{new Date(`${selectedDate}T00:00:00`).toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</h6>
-                <div className="row g-2">
-                  <div className="col-md-3"><div className="text-muted small">Status</div><div className="fw-semibold">{STATUS_COLORS[statusKey(selectedRecord)].label}</div></div>
-                  <div className="col-md-3"><div className="text-muted small">Check-in</div><div className="fw-semibold">{formatTime(selectedRecord?.check_in_time)}</div></div>
-                  <div className="col-md-3"><div className="text-muted small">Check-out</div><div className="fw-semibold">{formatTime(selectedRecord?.check_out_time)}</div></div>
-                  <div className="col-md-3"><div className="text-muted small">Source</div><div className="fw-semibold">{sourceLabel(selectedRecord)}</div></div>
-                  {selectedRecord?.leave_type_code && (
-                    <div className="col-md-3"><div className="text-muted small">Leave type</div><div className="fw-semibold">{selectedRecord.leave_type_code}{selectedRecord.leave_day_part && selectedRecord.leave_day_part !== "full_day" ? ` (${selectedRecord.leave_day_part.replace("_", " ")})` : ""}</div></div>
-                  )}
-                </div>
-              </div>
-            )}
+            <MyAttendanceCalendar
+              year={year}
+              month={month}
+              range={calendarRange}
+              calendar={calendar}
+              loading={loading}
+              selectedDate={selectedDate}
+              onSelectDate={selectDate}
+              onMonthChange={changeMonth}
+            />
             {monthlyDetailsError && <div className="alert alert-danger mt-3 mb-0" role="alert">{monthlyDetailsError}</div>}
 
             {monthlyDetails && (
@@ -511,7 +431,15 @@ function UserAttendance({ session }) {
             )}
 
             {selectedUserId && (
-              <AttendanceDayBreakdown userId={selectedUserId} title="Selected employee · working time and breaks" />
+              <AttendanceDayBreakdown
+                userId={selectedUserId}
+                title="Selected employee · working time and breaks"
+                date={selectedDate}
+                minDate={minSelectableDate(calendarRange)}
+                onDateChange={selectDate}
+                showStatus
+                calendarDay={selectedCalendarDay}
+              />
             )}
           </div>
         </div>

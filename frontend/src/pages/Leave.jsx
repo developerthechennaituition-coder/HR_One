@@ -6,8 +6,11 @@ import {
   starLeaveNotification,
   unstarLeaveNotification,
 } from "../services/notificationApi";
+import { CALENDAR_FORWARD_DAYS, addDays, companyToday } from "../services/attendanceCalendarRange";
 
 const API_URL = HRONE_API_BASE + "/api/leave";
+// Permission can be applied for today and the next 14 days (checked by the backend too).
+const PERMISSION_FORWARD_DAYS = 14;
 
 async function fileToBase64(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -74,6 +77,16 @@ function badgeClass(status) {
   if (value === "cancelled") return "badge bg-secondary";
   if (value === "pending_hr_admin") return "badge bg-info text-dark";
   return "badge bg-warning text-dark";
+}
+
+// Status text for a leave request under single-approver routing.
+function requestStatusLabel(request) {
+  if (request.status === "approved") return "Approved";
+  if (request.status === "rejected") return "Rejected";
+  if (request.status === "cancelled") return "Cancelled";
+  if (request.routing_problem && !request.approver_id) return "Awaiting Approver Assignment";
+  if (request.approval_level) return `Pending ${request.approval_level} Approval`;
+  return request.status === "pending_hr_admin" ? "Pending HR Admin Approval" : "Pending Approval";
 }
 
 function policyFromApi(policy, id) {
@@ -298,6 +311,26 @@ function Leave({ user, onNavigate }) {
   const requiresMedicalCertificate = Boolean(companyPolicy.medical_certificate_required && isMedicalLeaveType);
   const unreadLeaveNotificationCount = notifications.filter((item) => !item.is_read).length;
 
+  // Leave: today .. day 90 (today + 89). Permission: today .. today + 14. India time.
+  const todayIso = companyToday();
+  const leaveMaxDate = addDays(todayIso, CALENDAR_FORWARD_DAYS);
+  const permissionMaxDate = addDays(todayIso, PERMISSION_FORWARD_DAYS);
+
+  // Leave days and approver as the backend will route them (it re-checks on submit).
+  const [approvalPreview, setApprovalPreview] = useState(null);
+  useEffect(() => {
+    if (!fromDate || !toDate || toDate < fromDate) {
+      setApprovalPreview(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const query = new URLSearchParams({ from_date: fromDate, to_date: toDate, day_part: dayPart });
+    apiRequest(`/approval-preview?${query}`)
+      .then((data) => { if (!cancelled) setApprovalPreview(data || null); })
+      .catch(() => { if (!cancelled) setApprovalPreview(null); });
+    return () => { cancelled = true; };
+  }, [fromDate, toDate, dayPart]);
+
   const handleFromDateChange = (value) => {
     setFromDate(value);
     // Half-day leave is always a single date.
@@ -313,6 +346,8 @@ function Leave({ user, onNavigate }) {
     event.preventDefault(); setError(""); setSuccess("");
     if (!leaveTypeId || !fromDate || !toDate || !reason.trim()) return setError("Please fill all required leave application fields.");
     if (toDate < fromDate) return setError("To date must be on or after From date.");
+    if (fromDate < todayIso) return setError("Leave cannot be applied for a past date. Choose today or a later date.");
+    if (toDate > leaveMaxDate) return setError(`Leave can be applied only up to ${formatDate(leaveMaxDate)} (90 days including today).`);
     if (dayPart !== "full_day" && !selectedType?.allow_half_day) return setError("Half-day leave is not allowed for this leave type.");
     if (dayPart !== "full_day" && fromDate !== toDate) return setError("Half-day leave can be applied for a single date only.");
     if (selectedType?.requires_attachment && !attachmentName.trim()) return setError("Attachment reference is required for this leave type.");
@@ -333,6 +368,7 @@ function Leave({ user, onNavigate }) {
     setError(""); setSuccess("");
     if (!permissionDate || !permissionReason.trim()) { setError("Select a permission date and enter a reason."); return; }
     if (permissionEnd <= permissionStart) { setError("End time must be later than start time."); return; }
+    if (permissionDate < todayIso || permissionDate > permissionMaxDate) { setError(`Permission can be applied only from today to ${formatDate(permissionMaxDate)}.`); return; }
     setSubmitting(true);
     try {
       await apiRequest("/permissions", { method: "POST", body: JSON.stringify({ permission_date: permissionDate, start_time: permissionStart, end_time: permissionEnd, reason: permissionReason.trim() }) });
@@ -517,16 +553,19 @@ function Leave({ user, onNavigate }) {
             <td>{request.reason}{request.attachment_name && <div><button type="button" className="btn btn-link btn-sm p-0" onClick={() => downloadAttachment(request)}><i className="bi bi-paperclip me-1" />{request.attachment_name}</button></div>}</td>
             <td>
               <span className={badgeClass(request.status)}>
-                {request.status === "pending_hr_admin" ? "Pending HR Admin Approval" : request.status === "approved" ? "Approved" : request.status === "rejected" ? "Rejected" : request.status === "cancelled" ? "Cancelled" : "Pending Reporting Manager Approval"}
+                {requestStatusLabel(request)}
               </span>
-              {approval && request.approval_stage === "reporting_manager" && (
-                <div className="small text-muted mt-1">Reporting Manager Approval</div>
+              {approval && request.approval_level && (
+                <div className="small text-muted mt-1">You are the {request.approval_level} approver</div>
               )}
-              {approval && request.approval_stage === "hr_admin" && (
-                <div className="small text-muted mt-1">Final HR Admin Approval</div>
+              {!approval && ["pending", "pending_hr_admin"].includes(request.status) && request.assigned_approver_name && (
+                <div className="small text-muted mt-1">Approver: {request.assigned_approver_name}</div>
               )}
-              {!approval && request.status === "pending_hr_admin" && (
-                <div className="small text-muted mt-1">Reporting Manager approved. Awaiting HR Admin.</div>
+              {!approval && ["pending", "pending_hr_admin"].includes(request.status) && request.routing_problem && !request.approver_id && (
+                <div className="small text-danger mt-1">{request.routing_problem}</div>
+              )}
+              {["approved", "rejected"].includes(request.status) && request.approver_name && (
+                <div className="small text-muted mt-1">By {request.approver_name}{request.approval_level ? ` (${request.approval_level})` : ""}</div>
               )}
               {!approval && request.can_cancel && request.cancel_deadline && (
                 <div className="small text-muted mt-1">Cancel until {formatDateTime(request.cancel_deadline)}</div>
@@ -577,21 +616,26 @@ function Leave({ user, onNavigate }) {
         <>
           <div className="card border-0 shadow-sm mb-4"><div className="card-header bg-white"><h5 className="mb-0">Apply Leave</h5></div><div className="card-body"><form onSubmit={handleApply}><div className="row g-3">
             <div className="col-md-4"><label className="form-label">Leave Type</label><select className="form-select" value={leaveTypeId} onChange={(e) => { setLeaveTypeId(e.target.value); setDayPart("full_day"); setAttachmentFile(null); setAttachmentName(""); }} required><option value="">Select leave type</option>{leaveTypes.map((type) => <option key={type.id} value={type.id}>{type.code} - {type.name}</option>)}</select></div>
-            <div className="col-md-4"><label className="form-label">From Date</label><input type="date" className="form-control" value={fromDate} onChange={(e) => handleFromDateChange(e.target.value)} required /></div>
-            <div className="col-md-4"><label className="form-label">To Date</label><input type="date" className="form-control" value={toDate} min={fromDate || undefined} disabled={dayPart !== "full_day"} onChange={(e) => setToDate(e.target.value)} required /></div>
+            <div className="col-md-4"><label className="form-label">From Date</label><input type="date" className="form-control" value={fromDate} min={todayIso} max={leaveMaxDate} onChange={(e) => handleFromDateChange(e.target.value)} required /></div>
+            <div className="col-md-4"><label className="form-label">To Date</label><input type="date" className="form-control" value={toDate} min={fromDate || todayIso} max={leaveMaxDate} disabled={dayPart !== "full_day"} onChange={(e) => setToDate(e.target.value)} required /><small className="text-muted">Today up to {formatDate(leaveMaxDate)} (90 days).</small></div>
             <div className="col-md-4"><label className="form-label">Day Type</label><select className="form-select" value={dayPart} onChange={(e) => handleDayPartChange(e.target.value)} disabled={!selectedType?.allow_half_day}><option value="full_day">Full Day</option><option value="first_half">First Half</option><option value="second_half">Second Half</option></select></div>
             {requiresMedicalCertificate && <div className="col-md-4"><label className="form-label">Medical Certificate</label><input type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" className="form-control" onChange={(e) => { const file = e.target.files?.[0] || null; setAttachmentFile(file); setAttachmentName(file?.name || ""); }} required /><small className="text-muted">PDF, PNG or JPEG, maximum 5 MB.</small></div>}
             {selectedType?.requires_attachment && !requiresMedicalCertificate && <div className="col-md-4"><label className="form-label">Attachment Reference</label><input className="form-control" value={attachmentName} onChange={(e) => setAttachmentName(e.target.value)} placeholder="File name / reference" required /></div>}
             <div className="col-12"><label className="form-label">Reason</label><textarea className="form-control" rows="3" maxLength="1000" value={reason} onChange={(e) => setReason(e.target.value)} required /></div>
             {selectedBalance && <div className="col-12"><div className="alert alert-light border mb-0"><strong>{selectedBalance.name}:</strong> {Number(selectedBalance.available).toFixed(1)} day(s) available. Carry forward: {Number(selectedBalance.carry_forward).toFixed(1)}.</div></div>}
-            <div className="col-12"><div className="small text-muted">One-day requests need Reporting Manager approval. Requests for two or more days need Reporting Manager approval followed by HR Admin approval. Approved leave appears in Attendance and your Profile on the leave day itself.</div></div>
-          </div><div className="mt-3"><button className="btn btn-primary" disabled={submitting}>{submitting ? "Submitting..." : "Submit Leave Request"}</button></div></form></div></div>
+            {approvalPreview && <div className="col-12"><div className={`alert ${approvalPreview.problem ? "alert-danger" : "alert-info"} mb-0`} role="status">
+              {approvalPreview.problem
+                ? <><i className="bi bi-exclamation-triangle me-2" />{approvalPreview.problem}</>
+                : <><i className="bi bi-person-check me-2" /><strong>{Number(approvalPreview.days).toFixed(1)} leave day(s)</strong> · approved by your {approvalPreview.approval_level}{approvalPreview.approver_name ? ` (${approvalPreview.approver_name})` : ""}</>}
+            </div></div>}
+            <div className="col-12"><div className="small text-muted">Leave days exclude weekly offs and holidays. Employees: 1 day → Reporting Manager, 2 days → HOD, more than 2 days → HR Admin. Reporting Managers: 1 day → HOD, 2 or more days → HR Admin. HR Admins: their assigned HR Admin. Approved leave appears in Attendance and your Profile on the leave day itself.</div></div>
+          </div><div className="mt-3"><button className="btn btn-primary" disabled={submitting || Boolean(approvalPreview?.problem)}>{submitting ? "Submitting..." : "Submit Leave Request"}</button></div></form></div></div>
           <div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">My Leave Requests</h5></div><div className="card-body p-0">{renderRequestsTable(requests, false)}</div></div>
         </>
       ) : activeTab === "permissions" ? (
         <>
           <div className="card border-0 shadow-sm mb-4"><div className="card-header bg-white"><h5 className="mb-0">Apply Permission</h5><small className="text-muted">Choose the date and exact time interval. Your reporting manager will be notified.</small></div><div className="card-body"><form onSubmit={submitPermission}><div className="row g-3">
-            <div className="col-md-3"><label className="form-label">Permission Date</label><input type="date" className="form-control" min={new Date().toISOString().slice(0,10)} value={permissionDate} onChange={(e) => setPermissionDate(e.target.value)} required /></div>
+            <div className="col-md-3"><label className="form-label">Permission Date</label><input type="date" className="form-control" min={todayIso} max={permissionMaxDate} value={permissionDate} onChange={(e) => setPermissionDate(e.target.value)} required /><small className="text-muted">Today up to {formatDate(permissionMaxDate)}.</small></div>
             <div className="col-md-3"><label className="form-label">Start Time</label><input type="time" className="form-control" value={permissionStart} onChange={(e) => setPermissionStart(e.target.value)} required /></div>
             <div className="col-md-3"><label className="form-label">End Time</label><input type="time" className="form-control" value={permissionEnd} onChange={(e) => setPermissionEnd(e.target.value)} required /></div>
             <div className="col-md-12"><label className="form-label">Reason</label><textarea className="form-control" rows="2" maxLength="1000" value={permissionReason} onChange={(e) => setPermissionReason(e.target.value)} required /></div>
@@ -612,8 +656,8 @@ function Leave({ user, onNavigate }) {
             <div className="col-md-9"><span className="form-label d-block">Weekly Off Days</span><div className="d-flex flex-wrap gap-3">{["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].map((day) => <div className="form-check" key={day}><input className="form-check-input" type="checkbox" id={`weekly-off-${day}`} checked={(companyPolicy.weekly_off_weekdays || []).includes(day)} onChange={(e) => setCompanyPolicy({ ...companyPolicy, weekly_off_weekdays: e.target.checked ? [...(companyPolicy.weekly_off_weekdays || []), day] : (companyPolicy.weekly_off_weekdays || []).filter((item) => item !== day) })} disabled={!isHrAdmin || savingSetup || (!(companyPolicy.weekly_off_weekdays || []).includes(day) && (companyPolicy.weekly_off_weekdays || []).length >= 6)} /><label className="form-check-label" htmlFor={`weekly-off-${day}`}>{day[0].toUpperCase() + day.slice(1)}</label></div>)}</div>{!(companyPolicy.weekly_off_weekdays || []).length && <small className="text-warning-emphasis">No weekly off is configured. Select the company's weekly off day(s); they are used for leave day counts and the attendance calendar.</small>}</div>
             <div className="col-md-3"><label className="form-label">Probation (Months)</label><input type="number" min="0" max="24" className="form-control" value={companyPolicy.probation_period_months} onChange={(e) => setCompanyPolicy({ ...companyPolicy, probation_period_months: e.target.value })} disabled={!isHrAdmin || savingSetup} /></div>
             <div className="col-md-3"><label className="form-label">Medical Leave</label><div className="form-control bg-light">1 day per month, after {companyPolicy.weekly_offs_per_month} Weekly Offs</div></div>
-            <div className="col-md-6"><label className="form-label">One-Day Leave Approval</label><div className="form-control bg-light">Reporting Manager approval required</div></div>
-            <div className="col-md-6"><label className="form-label">Two or More Days Approval</label><div className="form-control bg-light">Reporting Manager, then HR Admin approval required</div></div>
+            <div className="col-md-6"><label className="form-label">Employee Leave Approval</label><div className="form-control bg-light h-auto">1 day: Reporting Manager · 2 days: HOD · more than 2 days: HR Admin</div></div>
+            <div className="col-md-6"><label className="form-label">Reporting Manager / HR Admin Leave</label><div className="form-control bg-light h-auto">Reporting Manager: 1 day HOD, 2+ days HR Admin · HR Admin: assigned HR Admin</div></div>
             <div className="col-md-6"><div className="form-check"><input id="sick-before-probation" type="checkbox" className="form-check-input" checked={companyPolicy.sick_leave_before_probation_allowed} onChange={(e) => setCompanyPolicy({ ...companyPolicy, sick_leave_before_probation_allowed: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="sick-before-probation">Allow Medical Leave before probation (HR exception)</label></div></div>
             <div className="col-md-6"><div className="form-check"><input id="medical-certificate" type="checkbox" className="form-check-input" checked={companyPolicy.medical_certificate_required} onChange={(e) => setCompanyPolicy({ ...companyPolicy, medical_certificate_required: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="medical-certificate">Require medical certificate for Medical Leave</label></div></div>
             <div className="col-md-6"><div className="form-check"><input id="religion-holidays" type="checkbox" className="form-check-input" checked={companyPolicy.religion_holidays_enabled} onChange={(e) => setCompanyPolicy({ ...companyPolicy, religion_holidays_enabled: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="religion-holidays">Enable religion-specific calendar holidays</label></div></div>

@@ -16,6 +16,7 @@ A full-stack HRMS application with a React/Vite frontend, a Python FastAPI backe
 - [Run locally on macOS or Linux](#run-locally-on-macos-or-linux)
 - [Database initialization and health checks](#database-initialization-and-health-checks)
 - [Frontend workflows](#frontend-workflows)
+- [Roles and approval hierarchy](#roles-and-approval-hierarchy)
 - [Backend API documentation](#backend-api-documentation)
 - [Attendance and ESSL device integration](#attendance-and-essl-device-integration)
 - [WFH attendance and biometrics](#wfh-attendance-and-biometrics)
@@ -32,31 +33,39 @@ A full-stack HRMS application with a React/Vite frontend, a Python FastAPI backe
 - User login, session-backed frontend state, current-user lookup, logout, and change password.
 - Account activation.
 - Password recovery with OTP verification and password reset (email delivery requires SMTP configuration).
+- Shared sign-in layout for Login, Forgot Password, Verify OTP and Reset Password: step indicator for the reset flow, six-box OTP entry with paste support and an expiry countdown, password strength meter, and Caps Lock warning.
 - Role-aware navigation and access-denied handling. Backend authorization remains the security boundary.
 
 ### Organization and employee administration
 - Company and organization structure, including business units, departments, teams, and designations.
-- Religion-based holiday calendars: HR Admin creates one calendar per religion per year (current or next year only), adds/edits/deletes holidays, and publishes. Published holidays apply automatically to employees of that religion, with targeted notifications and an audit trail. Legacy company-wide calendars and employee assignments still work.
+- Roles: HR Admin, Administrator, **HOD** (Head of Department) and Employee. HOD is the display name of the stored `HR Manager` role (see [Roles and approval hierarchy](#roles-and-approval-hierarchy)).
+- Religion-based holiday calendars: HR Admin creates one calendar per religion per year (current or next year only), adds/edits/deletes holidays, and publishes. Published holidays apply automatically to employees of that religion, with targeted notifications and an audit trail. Legacy company-wide calendars and employee assignments still work. Publish times are shown in India time.
 - Employee master and employee details.
 - User management, status updates, and account activation.
-- Reporting-manager assignments and team-member views.
+- Per-employee **Reporting Manager, HOD and HR Admin** assignments, set by HR Admin in Employee Details, and team-member views.
 
 ### Attendance
 - Attendance views, employee/day and monthly attendance details, remarks, and spreadsheet export.
-- Monthly attendance calendars (My Attendance, Profile, Team Member Details) with colour-coded Present, Absent, Holiday (with name), Leave (type code such as CL/ML), Weekly Off and Not Applicable days. Clicking a date shows that day's working time and breaks.
+- One Monthly Attendance Calendar used on My Attendance and on the HR Admin **Employee Attendance** page, with matching calendars on Profile and Team Member Details. Colour-coded Present, Absent, Holiday (with name), Leave (type code such as CL/ML), Weekly Off and Not Applicable days.
+- **Calendar range:** from the employee's joining date up to today + 89 days (90 days including today). The month containing the 90th day is shown in full, but holidays, leave and permissions are shown only up to the 90th day. Months before the joining month cannot be selected.
+- Today and past dates open that day's working time and breaks. Future dates cannot start attendance actions; upcoming holiday, leave and permission dates open a read-only details panel.
+- Permissions are shown on every calendar with their time (for example `P 10:00–11:00`).
 - Attendance requests: employees request a status change for past dates (Present with corrected times, Absent, Holiday, Weekly Off, Medical Leave). HR Admin approves or rejects each date and can adjust the final status/times or mark the date Not Applicable. Attendance changes only after approval.
+- **Joining date enforcement:** manual attendance, ESSL import/sync, WFH check-in/check-out, attendance-request approval and automatic leave sync never create attendance before the employee's joining date.
 - Work-from-home check-in/check-out, breaks, location registration/verification, and configurable WFH controls.
 - WFH late check-in: a late attempt notifies the reporting manager, who can approve a 2-hour extension or reject it.
-- ESSL attendance configuration, file import, connection test, synchronization, sync history, and issue review routes.
+- ESSL attendance configuration, file import, connection test, synchronization, sync history, and issue review routes. Import/sync summaries report punches skipped because they are dated before the mapped employee's joining date.
 
 ### Leave, permissions, notifications, and payroll
 - Leave types, policies, balances, requests, approvals/rejections/cancellations, reports, and CSV export.
+- Leave can be applied for today up to day 90 (today + 89) only.
+- Single-approver leave routing by role and working-day count (Reporting Manager, HOD or HR Admin); the Apply Leave form previews the day count and approver before submission.
 - Company weekly-off days configured by HR Admin (no default) and Weekly Offs per Month.
 - Medical Leave (code `ML`): 1 day per month per employee, available only after the month's 4 Weekly Offs are used; shared between Leave and Attendance Request.
-- Permission requests and approval workflows.
-- In-app notifications and notification management.
+- Permission requests for today up to today + 14, approved or rejected only by the employee's Reporting Manager.
+- In-app notifications (with a notification sound) and notification management.
 - Employee salary profiles, attendance summaries, payroll calculation and review actions, payroll records, and payslip PDF endpoints. Payable days include weekly offs, Medical Leave and published holidays; Not Applicable days are Loss of Pay.
-- Employee self-service payslip views and PDF downloads.
+- Employee self-service payslips: on-screen payslip view (PDF.js rendering on phones and tablets) and PDF downloads.
 
 The exact options available to a user depend on the role and backend authorization rules. Availability of a screen does not imply that a particular third-party device or external service is already connected.
 
@@ -83,7 +92,7 @@ Browser
 |---|---|
 | Frontend | React 19, React DOM, Vite 8 |
 | UI | Bootstrap 5, Bootstrap Icons |
-| Frontend utilities | `libphonenumber-js`, `qrcode.react` |
+| Frontend utilities | `libphonenumber-js`, `qrcode.react`, `pdfjs-dist` (payslip rendering on mobile) |
 | Linting | Oxlint |
 | Backend API | Python, FastAPI, Pydantic |
 | Database driver | PyMongo |
@@ -120,6 +129,7 @@ Expected combined repository layout:
 ```text
 HRMS-Project/
 ├── README.md
+├── certs/                           # optional local HTTPS certificate (not for production)
 ├── backend/
 │   ├── requirements.txt
 │   ├── requirements-wfh.txt
@@ -127,16 +137,16 @@ HRMS-Project/
 │   │   ├── main.py
 │   │   ├── core_routes.py
 │   │   ├── db/mongodb.py
-│   │   ├── attendance.py
+│   │   ├── attendance.py            # attendance, WFH, joining-date and calendar-window helpers
 │   │   ├── attendance_requests.py   # attendance request workflow + monthly calendar
 │   │   ├── religion_holidays.py     # religion holiday lookups for attendance/leave/payroll
 │   │   ├── wfh_biometrics.py
 │   │   ├── essl.py
-│   │   ├── leave.py
+│   │   ├── leave.py                 # leave, approval routing, permissions
 │   │   ├── payroll.py
 │   │   ├── notifications.py
 │   │   ├── employee_details.py
-│   │   ├── reporting_manager.py
+│   │   ├── reporting_manager.py     # Reporting Manager / HOD / HR Admin assignments, team views
 │   │   ├── activation.py
 │   │   ├── password_reset.py
 │   │   ├── security.py
@@ -182,6 +192,9 @@ Optional settings recognized by the source include:
 ```dotenv
 # Browser origins allowed to call the API; comma-separated list
 CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+# Optional origin regex. Leave it unset to keep the default, which allows
+# localhost and private LAN IPs on port 5173 (an empty value disables the default).
+# CORS_ALLOWED_ORIGIN_REGEX=https?://(localhost|127\.0\.0\.1):5173
 
 # Organization/business timezone
 ORG_TIMEZONE=Asia/Kolkata
@@ -339,15 +352,60 @@ The frontend contains pages and shared components for:
 - Authentication: login, activation, forgot password, OTP verification, password reset, and change password.
 - Home: dashboard, profile, header, sidebar, and role-aware layout.
 - Organization: company setup, organization setup, holiday calendar setup.
-- People: employee master, employee details, user management, reporting-manager team members, and member details.
-- Attendance: attendance views, monthly attendance calendar, attendance requests and the HR response inbox, employee attendance, user attendance, WFH attendance, WFH admin settings, ESSL setup, and ESSL admin settings.
-- Leave: leave and permission workflows, weekly-off and Medical Leave rules.
+- People: employee master, employee details (including Reporting Manager, HOD and HR Admin assignments), user management, reporting-manager team members, and member details.
+- Attendance: attendance views, monthly attendance calendar, attendance requests and the HR response inbox, My Attendance, the HR Admin Employee Attendance page, WFH attendance, WFH admin settings, ESSL setup, and ESSL admin settings.
+- Leave: leave and permission workflows with approval preview, approval queues, weekly-off and Medical Leave rules.
 - Holidays: HR holiday calendar management and the employee's own holiday calendar (Profile).
-- Payroll: employee salary setup, payroll workspace, employee payslips.
+- Payroll: employee salary setup, payroll workspace, employee payslips with on-screen viewer.
 - Notifications: notification bell/panel and notification management.
 - WFH email verification and access-denied handling.
 
 For component/page details, see [`frontend/README.md`](frontend/README.md).
+
+## Roles and approval hierarchy
+
+### Roles
+
+| Displayed role | Stored `users.role` value | Notes |
+|---|---|---|
+| HR Admin | `HR Admin` | Manages employees, assignments, attendance, leave setup, payroll. Several HR Admin accounts are supported. |
+| Administrator | `Administrator` | Existing administrative access. |
+| HOD | `HR Manager` | Head of Department. The stored value (and `role_id` `hr_manager`) is kept so existing permissions are unchanged; the UI shows "HOD" through `frontend/src/services/roleLabels.js`. The API also accepts `HOD` as input and stores it as `HR Manager`. |
+| Employee | `Employee` | Self-service access. |
+
+A **Reporting Manager** is not a separate role: any active user with at least one active direct report is treated as a Reporting Manager.
+
+### Employee assignments
+
+HR Admin sets, per employee, in **Employee Details → Reporting Manager / Leave Approvers** (API: `PUT /api/reporting-manager/{user_id}`):
+
+| Assignment | Stored on the user | Eligible accounts |
+|---|---|---|
+| Reporting Manager | `reporting_manager_id` (also mirrored in `employee_details`) | Any active user except the employee; circular reporting chains are rejected. |
+| HOD | `hod_id` | Active users with the HOD role, not the employee. |
+| HR Admin | `hr_admin_id` | Active HR Admin users, not the employee. |
+
+Only HR Admin can change assignments. Fields omitted from the request are left unchanged. IDs are stored, not names.
+
+### Leave approval routing
+
+Leave days are the existing working-day count (weekly offs and holidays excluded; a half day counts as one leave day). Every request has exactly one approver (`approver_id`):
+
+| Applicant | 1 day | 2 days | More than 2 days |
+|---|---|---|---|
+| Employee | Reporting Manager | HOD | HR Admin |
+| Reporting Manager | HOD | HR Admin | HR Admin |
+| HR Admin | Assigned HR Admin | Assigned HR Admin | Assigned HR Admin |
+
+- Role precedence: HR Admin, then Reporting Manager, then Employee.
+- If the required approver is missing, inactive, lacks the role, or is the applicant, submission is refused with a message asking HR Admin to assign one. Nothing is auto-approved or broadcast to all HR Admins.
+- Only the assigned approver can approve or reject; applicants cannot decide their own requests; closed requests cannot be decided again.
+- Pending requests are re-routed (and the new approver notified) when assignments, a user's role, or a user's active status change, and on backend startup for legacy pending requests. Requests without a valid approver stay pending with a `routing_problem` message. Completed requests are never changed. Each request keeps an `approval_history`.
+- Only the assigned approver is notified of new, reassigned and cancelled requests.
+
+### Permission approval
+
+Permission requests go to the employee's Reporting Manager, who is the only person able to approve or reject them. WFH late check-in requests follow the same rule.
 
 ## Backend API documentation
 
@@ -362,12 +420,12 @@ Important route groups visible in the source include:
 | Organization | `/api/organization/*`, `/api/companies*`, `/api/business-units*`, `/api/departments*`, `/api/teams*`, `/api/designations*` |
 | Employees | `/api/employees*`, `/api/employee-details/*` |
 | Attendance | `/api/attendance/*` |
-| Attendance requests | `/api/attendance-requests*` (calendar, eligible dates, submit, cancel, HR inbox, respond) |
+| Attendance requests | `/api/attendance-requests*` (calendar, HR Admin calendar of an employee `calendar/user/{user_id}`, eligible dates, submit, cancel, HR inbox, respond) |
 | Holiday calendars | `/api/holiday-calendars*`, `/api/holidays/*`, `/api/employee-holiday-calendars*`, `/api/my-holidays` |
 | ESSL attendance | `/api/attendance/essl/*` |
-| Reporting manager | `/api/reporting-manager/*` |
+| Reporting manager and approvers | `/api/reporting-manager/*` (assignments, options, team members and their attendance) |
 | Notifications | `/api/notifications/*` |
-| Leave and permissions | `/api/leave/*` |
+| Leave and permissions | `/api/leave/*` (including `approval-preview`, `pending`, `permissions/*`) |
 | Payroll and payslips | `/api/payroll/*` |
 | Password recovery | `/api/auth/*` (including recovery/OTP/reset routes) |
 
@@ -417,7 +475,12 @@ Payroll rules are organization-specific. Validate statutory deductions, rounding
 
 | Area | Rule |
 |---|---|
-| Attendance requests | Past dates only. Options depend on the date's current status. Nothing changes until HR approves; HR decides per date and may set Not Applicable. Dates in finalized payroll are locked. |
+| Attendance calendar | Joining date to today + 89 days; the 90th day's month is shown in full with details only up to the 90th day. Future dates are view-only. |
+| Joining date | No attendance is created before the joining date (manual, ESSL, WFH, request approval, leave sync). Existing pre-joining records are not deleted. |
+| Leave dates | Today up to today + 89 only; past dates are rejected. |
+| Leave approval | One approver per request by role and working-day count; see [Roles and approval hierarchy](#roles-and-approval-hierarchy). |
+| Permission | Today up to today + 14 only; approved only by the Reporting Manager. |
+| Attendance requests | Past dates only. Options depend on the date's current status. Nothing changes until HR approves; HR decides per date and may set Not Applicable. Dates in finalized payroll and dates before joining are not eligible. |
 | Weekly Off | Weekdays configured by HR Admin; Weekly Offs per Month (default 4) limits requests. |
 | Medical Leave (`ML`) | 1 day per month per employee, only after the month's 4 Weekly Offs are used; counted across Leave and Attendance Request. |
 | Not Applicable | Set only by HR when responding to a request; shown in calendars and counted as Loss of Pay. |
@@ -449,6 +512,8 @@ Payroll rules are organization-specific. Validate statutory deductions, rounding
 | Frontend cannot call API | Check backend is running on port `8000`, `VITE_API_BASE_URL`, browser network errors, and CORS origins. |
 | Port `5173` is occupied | Stop the process using it or intentionally update the Vite configuration and documentation together. |
 | Login works but a route returns 403 | Inspect the signed-in role and backend authorization logic; client navigation permissions are not authoritative. |
+| "No HOD / HR Admin is assigned" when applying for leave | HR Admin must assign a valid Reporting Manager, HOD and HR Admin in Employee Details → Leave Approvers. |
+| Calendar month cannot be selected | Months before the employee's joining month and after the month of the 90th day are not available by design. |
 | Activation/reset email is not received | Verify SMTP host/port/user/password/from address, provider TLS requirements, spam folder, and `FRONTEND_URL`. |
 | WFH camera/location fails | Use HTTPS with a valid certificate and grant browser permissions; verify device capabilities and configured accuracy limits. |
 | ESSL sync/import fails | Inspect ESSL configuration, network/vendor service availability, employee mapping, file format, sync history, and issues. Check `/docs` and backend logs. |
@@ -462,10 +527,19 @@ Backend tests use Python `unittest` under `backend/tests/`. Integration suites r
 ```powershell
 cd backend
 $env:MONGODB_DATABASE = "hrms_test"
-python -m unittest tests.test_attendance_requests tests.test_religion_holidays tests.test_wfh_late_check_in tests.test_essl_attendance tests.test_leave_approval_routing tests.test_employee_details_api tests.test_notification_scope
+python -m unittest tests.test_attendance_requests tests.test_leave_hierarchy_routing tests.test_leave_approval_routing tests.test_religion_holidays tests.test_wfh_late_check_in tests.test_essl_attendance tests.test_employee_details_api tests.test_notification_scope tests.test_payslip_view
 ```
 
-Known pre-existing issues: `test_holiday_api`, `test_holiday_models`, `test_holiday_workflow`, `test_organization_workflow`, `test_companies_api`, `test_users_api` and `test_step15_checklist` import names from `app.main` that now live in `app.core_routes`, so they fail to load; `test_wfh_attendance` has failures unrelated to recent work.
+| Suite | Covers |
+|---|---|
+| `test_attendance_requests` | Attendance requests, monthly calendar window, joining-date rules, upcoming holiday/leave/permission details, HR employee calendar, manual/WFH/leave-sync joining-date guards |
+| `test_leave_hierarchy_routing` | HOD/RM/HR Admin assignments, leave routing table, approval security, re-routing, legacy reconciliation, leave and permission date windows, Reporting-Manager-only permission approval |
+| `test_essl_attendance` | ESSL parsing, sync, and pre-joining punch skipping |
+| `test_payslip_view` | On-screen payslip data and access scope |
+
+The leave suite fixes "today" to 1 January 2027 so its date-window checks do not depend on the real date.
+
+Known pre-existing issues: `test_holiday_api`, `test_holiday_models`, `test_holiday_workflow`, `test_organization_workflow`, `test_companies_api`, `test_users_api` and `test_step15_checklist` import names from `app.main` that now live in `app.core_routes`, so they fail to load; `test_wfh_attendance` has 4 failures and 11 errors that predate the recent changes.
 
 ## Validation checklist
 
@@ -482,7 +556,7 @@ npm run lint
 npm run build
 ```
 
-The MongoDB smoke check requires a configured, reachable database. `compileall` checks Python syntax only; run the [automated tests](#automated-tests) and validate important workflows manually in a non-production environment.
+The MongoDB smoke check requires a configured, reachable database. `compileall` checks Python syntax only; run the [automated tests](#automated-tests) and validate important workflows manually in a non-production environment. `npm run lint` currently reports warnings (mostly React hook dependency hints) but no errors.
 
 Suggested end-to-end checks:
 - [ ] Backend health endpoint responds.
@@ -492,6 +566,9 @@ Suggested end-to-end checks:
 - [ ] Attendance data imports/synchronizes correctly and duplicate/error cases are reviewed.
 - [ ] WFH check-in/out and fallback flows are tested with approved devices and permissions.
 - [ ] Leave request, approval, rejection, and balance updates are verified.
+- [ ] Every employee has a Reporting Manager, HOD and HR Admin assigned, and leave routes to the expected approver.
+- [ ] Permission requests reach and are decided by the Reporting Manager only.
+- [ ] Calendars start at the joining month and stop at the month of the 90th day.
 - [ ] Attendance requests are approved/rejected per date and reflected in calendars and payroll.
 - [ ] A published religion holiday calendar appears only for employees of that religion.
 - [ ] Notifications appear for the intended recipients.

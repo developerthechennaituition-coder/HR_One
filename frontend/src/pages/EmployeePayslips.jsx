@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import { downloadMyPayslip, getMyPayslips, viewMyPayslip } from "../services/payrollApi";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import PayslipViewer from "../components/PayslipViewer";
+import { downloadMyPayslip, getMyPayslipDetail, getMyPayslips, viewMyPayslip } from "../services/payrollApi";
 
 const money = (value, currency = "INR") =>
   `${currency} ${Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -13,7 +14,6 @@ export default function EmployeePayslips({ session }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
-  const [viewUrl, setViewUrl] = useState("");
   const [selected, setSelected] = useState(null);
   const [busyId, setBusyId] = useState("");
 
@@ -26,23 +26,22 @@ export default function EmployeePayslips({ session }) {
     return () => { alive = false; };
   }, []);
 
-  useEffect(() => () => { if (viewUrl) URL.revokeObjectURL(viewUrl); }, [viewUrl]);
 
   const visibleRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rows.filter((row) => !q || `${row.period} ${row.status} ${row.employee_id}`.toLowerCase().includes(q));
   }, [rows, search]);
 
-  async function handleView(row) {
-    setBusyId(row.id); setError("");
-    try {
-      if (viewUrl) URL.revokeObjectURL(viewUrl);
-      const url = await viewMyPayslip(row.id);
-      setViewUrl(url); setSelected(row);
-    } catch (e) {
-      setError(e.message || "Unable to preview the payslip.");
-    } finally { setBusyId(""); }
+  function handleView(row) {
+    setError("");
+    setSelected(row);
   }
+
+  // Stable callbacks for the viewer; the backend returns only the caller's own payslip.
+  const selectedId = selected?.id;
+  const loadDetail = useCallback(() => getMyPayslipDetail(selectedId), [selectedId]);
+  const loadPdfUrl = useCallback(() => viewMyPayslip(selectedId), [selectedId]);
+  const closeViewer = useCallback(() => setSelected(null), []);
 
   async function handleDownload(row) {
     setBusyId(row.id); setError("");
@@ -90,12 +89,16 @@ export default function EmployeePayslips({ session }) {
           </table></div>}
       </section>
 
-      {viewUrl && selected && <div className="payroll-modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) { URL.revokeObjectURL(viewUrl); setViewUrl(""); setSelected(null); } }}>
-        <section className="payroll-payslip-modal" role="dialog" aria-modal="true" aria-label={`Payslip ${selected.period}`}>
-          <header><div><h2><Icon name="file-earmark-pdf" /> Payslip — {selected.period}</h2><p>{session?.user?.name || selected.employee_id}</p></div><button type="button" className="payroll-button payroll-button-outline" onClick={() => { URL.revokeObjectURL(viewUrl); setViewUrl(""); setSelected(null); }}><Icon name="x-lg" /> Close</button></header>
-          <iframe title={`Payslip PDF ${selected.period}`} src={viewUrl} />
-        </section>
-      </div>}
+      {selected && (
+        <PayslipViewer
+          period={selected.period}
+          subtitle={`${session?.user?.name || selected.employee_name || ""} · ${selected.employee_id}`}
+          loadDetail={loadDetail}
+          loadPdfUrl={loadPdfUrl}
+          onDownload={() => downloadMyPayslip(selected.id, selected.employee_name, selected.employee_id, selected.period)}
+          onClose={closeViewer}
+        />
+      )}
     </main>
   );
 }

@@ -114,6 +114,93 @@ def _amount_words_indian(amount: float) -> str:
     return result + " Only"
 
 
+def payslip_view_data(row: dict) -> dict:
+    """On-screen payslip content, using the same sources as the PDF.
+
+    Read-only: values come from the finalized payroll record; nothing is
+    recalculated except totals that the PDF also derives when missing.
+    """
+    from datetime import datetime
+
+    def first_value(*values):
+        for value in values:
+            if value is not None and str(value).strip():
+                return value
+        return ""
+
+    def total(items):
+        result = 0.0
+        for item in items or []:
+            try:
+                result += float(item.get("amount") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return result
+
+    company = _company_snapshot(row.get("employee_id")) or {}
+    saved_company = row.get("company_snapshot") or {}
+    if not (company.get("location") or company.get("branch")) and saved_company:
+        company = {**saved_company, **{key: value for key, value in company.items() if value not in (None, "")}}
+    snapshot = row.get("salary_snapshot") or {}
+    profile = {}
+    if not all((
+        row.get("bank_name") or snapshot.get("bank_name"),
+        row.get("bank_account_number") or snapshot.get("bank_account_number") or row.get("bank_account"),
+        row.get("pan_card_number") or snapshot.get("pan_card_number") or row.get("pan") or row.get("pan_number"),
+    )):
+        profile = db["employee_salary_profiles"].find_one(
+            {"employee_id": row.get("employee_id")},
+            {"bank_name": 1, "bank_account_number": 1, "pan_card_number": 1},
+        ) or {}
+    earnings = [{"name": item.get("name") or item.get("component") or "Earning", "amount": item.get("amount", 0)} for item in row.get("earnings") or []]
+    deductions = [{"name": item.get("name") or item.get("component") or "Deduction", "amount": item.get("amount", 0)} for item in row.get("deductions") or []]
+    gross = row.get("gross_earnings")
+    gross = total(row.get("earnings")) if gross is None else gross
+    total_deductions = row.get("total_deductions")
+    total_deductions = total(row.get("deductions")) if total_deductions is None else total_deductions
+    net = row.get("net_salary")
+    try:
+        net = float(net) if net is not None else float(gross or 0) - float(total_deductions or 0)
+    except (TypeError, ValueError):
+        net = 0.0
+    pay_date = first_value(row.get("pay_date"), row.get("payment_date"), row.get("updated_at"))
+    if isinstance(pay_date, datetime):
+        pay_date = pay_date.date().isoformat()
+    attendance_fields = (
+        "calendar_days", "working_days", "paid_days", "lop_days", "present_days", "paid_leave_days",
+        "unpaid_leave_days", "absent_days", "holiday_days", "weekly_off_days", "medical_leave_days", "not_applicable_days",
+    )
+    return {
+        "id": str(row.get("_id")),
+        "employee_id": row.get("employee_id"),
+        "employee_name": row.get("employee_name"),
+        "designation": row.get("designation") or "",
+        "department": row.get("department") or "",
+        "period": row.get("period"),
+        "month": row.get("month"),
+        "year": row.get("year"),
+        "currency": row.get("currency") or "INR",
+        "status": row.get("status"),
+        "pay_date": str(pay_date)[:10] if pay_date else "",
+        "company": {
+            "name": company.get("name") or company.get("company_name") or "",
+            "company_name": company.get("company_name") or "",
+            "address": str(company.get("location") or company.get("branch") or company.get("address") or "").strip(),
+        },
+        "bank_name": first_value(row.get("bank_name"), snapshot.get("bank_name"), profile.get("bank_name")),
+        "bank_account_number": first_value(row.get("bank_account_number"), snapshot.get("bank_account_number"), row.get("bank_account"), profile.get("bank_account_number")),
+        "pan_card_number": first_value(row.get("pan_card_number"), snapshot.get("pan_card_number"), row.get("pan"), row.get("pan_number"), profile.get("pan_card_number")),
+        "attendance": {field: row.get(field) for field in attendance_fields if row.get(field) is not None},
+        "earnings": earnings,
+        "deductions": deductions,
+        "gross_earnings": gross,
+        "total_deductions": total_deductions,
+        "net_salary": net,
+        "net_salary_in_words": _amount_words_indian(net),
+        "payment_reference": row.get("payment_reference") or "",
+    }
+
+
 def _payslip_pdf_response(row: dict, inline: bool = False):
     from io import BytesIO
     from pathlib import Path
