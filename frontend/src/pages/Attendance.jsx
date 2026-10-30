@@ -1,6 +1,7 @@
 import { HRONE_API_BASE } from "../config/api.js";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
+import HistoricalAttendanceModal from "../components/HistoricalAttendanceModal";
 import { roleLabel } from "../services/roleLabels";
 
 const USERS_API_URL = HRONE_API_BASE + "/api/users";
@@ -53,6 +54,10 @@ const EMPTY = {
   working_intervals: [],
   break_intervals: [],
   attendance_state: null,
+  permission_start_time: "",
+  permission_end_time: "",
+  permission_reason: "",
+  modification_reason: "",
 };
 
 const PART_LABEL = {
@@ -80,6 +85,12 @@ const toState = (record) => ({
   working_intervals: record?.working_intervals || [],
   break_intervals: record?.break_intervals || [],
   attendance_state: record?.attendance_state || null,
+  permission_start_time: record?.approved_permission?.start_time || record?.permission_start_time || "",
+  permission_end_time: record?.approved_permission?.end_time || record?.permission_end_time || "",
+  permission_reason: record?.approved_permission?.reason || "",
+  modification_reason: "",
+  has_permission: Boolean(record?.approved_permission),
+  remove_permission: false,
 });
 
 const formatAttendanceClock = (value) => {
@@ -115,6 +126,8 @@ const isLeaveLocked = (row) =>
 
 function Attendance({ session }) {
   const [users, setUsers] = useState([]);
+  const [departmentOptions, setDepartmentOptions] = useState([]);
+  const [showHistoricalAttendance, setShowHistoricalAttendance] = useState(false);
   const [selectedDate, setSelectedDate] = useState(getTodayDate());
 
   const [searchTerm, setSearchTerm] = useState("");
@@ -132,14 +145,14 @@ function Attendance({ session }) {
   const [successMessage, setSuccessMessage] = useState("");
 
   const isToday = selectedDate === getTodayDate();
-  const isEditableDate =
-    isToday || selectedDate === getYesterdayDate();
+  // HR Admin can correct any past/current attendance date unless payroll is finalized.
+  const isEditableDate = isToday;
 
   // joining_date comes from /api/users (authoritative employee joining date).
   const isBeforeJoining = (user) =>
     Boolean(user?.joining_date && selectedDate < String(user.joining_date).slice(0, 10));
 
-  const getHeaders = () => {
+  const getHeaders = useCallback(() => {
     const stored = sessionStorage.getItem("hrms_session");
 
     if (!stored) {
@@ -156,7 +169,7 @@ function Attendance({ session }) {
       Authorization: `Bearer ${session.token}`,
       "Content-Type": "application/json",
     };
-  };
+  }, []);
 
   const request = async (url, fallback) => {
     const response = await fetch(url, {
@@ -204,7 +217,7 @@ function Attendance({ session }) {
         setIsLoading(true);
         setError("");
 
-        const [userData, attendanceData, employeeData] = await Promise.all([
+        const [userData, attendanceData, employeeData, payrollData, departmentData] = await Promise.all([
           request(
             `${USERS_API_URL}?status=active`,
             "Unable to load users."
@@ -214,7 +227,10 @@ function Attendance({ session }) {
             "Unable to load attendance."
           ),
           request(EMPLOYEES_API_URL, "Unable to load employee departments."),
+          request(`${ATTENDANCE_API_URL}/payroll-locks?month=${Number(selectedDate.slice(5, 7))}&year=${Number(selectedDate.slice(0, 4))}`, "Unable to load payroll lock status."),
+          request(`${HRONE_API_BASE}/api/departments`, "Unable to load departments."),
         ]);
+        setDepartmentOptions(Array.isArray(departmentData) ? departmentData : []);
 
         const departmentsByEmployeeId = new Map(
           employeeData.map((employee) => [
@@ -222,8 +238,10 @@ function Attendance({ session }) {
             employee.department,
           ]),
         );
+        const payrollByEmployee = new Map((payrollData || []).map((row) => [String(row.employee_id), row.status]));
         const usersWithDepartments = userData.map((user) => ({
           ...user,
+          payroll_status: payrollByEmployee.get(String(user.employee_id)) || null,
           department:
             user.department ||
             departmentsByEmployeeId.get(user.employee_id) ||
@@ -548,6 +566,11 @@ function Attendance({ session }) {
           current.status === "Leave"
             ? current.leave_type_code
             : null,
+        permission_start_time: current.permission_start_time || null,
+        permission_end_time: current.permission_end_time || null,
+        permission_reason: current.permission_reason || null,
+        modification_reason: current.modification_reason || null,
+        remove_permission: Boolean(current.remove_permission),
       };
 
       const response = await fetch(
@@ -663,11 +686,10 @@ function Attendance({ session }) {
     departmentFilter,
   ]);
 
-  const departments = useMemo(
-    () =>
-      [...new Set(users.map((user) => user.department).filter(Boolean))].sort(),
-    [users],
-  );
+  const departments = useMemo(() => {
+    const configured = departmentOptions.map((item) => item.department_name).filter(Boolean);
+    return configured.length ? [...new Set(configured)].sort() : [...new Set(users.map((user) => user.department).filter(Boolean))].sort();
+  }, [departmentOptions, users]);
 
   const count = (status) =>
     users.filter(
@@ -753,6 +775,9 @@ function Attendance({ session }) {
             Manage employee daily attendance
           </p>
         </div>
+        <button type="button" className="btn btn-outline-primary" onClick={() => setShowHistoricalAttendance(true)}>
+          <i className="bi bi-pencil-square me-2" />Modify Historical Attendance
+        </button>
       </div>
 
       {error && (
@@ -818,13 +843,11 @@ function Attendance({ session }) {
                 className="form-control"
                 value={selectedDate}
                 max={getTodayDate()}
-                onChange={(e) =>
-                  setSelectedDate(e.target.value)
-                }
+                disabled
               />
 
               <small className="text-muted">
-                Historical attendance is view-only. Manual changes remain limited to today and yesterday.
+Daily Attendance manages today's records. Use Historical Attendance Modification for eligible previous three completed months.
               </small>
             </div>
 
@@ -960,9 +983,9 @@ function Attendance({ session }) {
 
       <div className="card border-0 shadow-sm">
         <div className="card-body p-0">
-          <div className="table-responsive">
+          <div className="table-responsive" style={{ maxHeight: "68vh", overflowY: "auto", overflowX: "auto" }}>
             <table className="table table-hover align-middle mb-0">
-              <thead className="table-light">
+              <thead className="table-light" style={{ position: "sticky", top: 0, zIndex: 2 }}>
                 <tr>
                   <th>Employee</th>
                   <th>Employee ID</th>
@@ -975,6 +998,7 @@ function Attendance({ session }) {
                   <th>Check-in</th>
                   <th>Check-out</th>
                   <th>Working / Break</th>
+                  <th>Permission</th>
                   <th>Source</th>
                   <th className="text-center">
                     Action
@@ -986,7 +1010,7 @@ function Attendance({ session }) {
                 {filteredUsers.length === 0 ? (
                   <tr>
                     <td
-                      colSpan="11"
+                      colSpan="12"
                       className="text-center py-5 text-muted"
                     >
                       No employees found.
@@ -1002,7 +1026,7 @@ function Attendance({ session }) {
                       isSaving[user.id];
 
                     const locked =
-                      isLeaveLocked(current);
+                      isLeaveLocked(current) || ["Approved", "Processed", "Paid"].includes(user.payroll_status);
 
                     const onLeave =
                       current.status === "Leave";
@@ -1226,6 +1250,16 @@ function Attendance({ session }) {
                           {current.attendance_state === "In Progress" && <span className="badge text-bg-success mt-1">In Progress</span>}
                         </td>
 
+                        <td style={{ minWidth: 190 }}>
+                          <div className="d-flex gap-1 align-items-center">
+                            <input aria-label={`Permission start for ${user.name}`} type="time" className="form-control form-control-sm" value={current.permission_start_time || ""} disabled={locked || beforeJoining} onChange={(e) => setAttendanceState((prev) => ({ ...prev, [user.id]: { ...prev[user.id], permission_start_time: e.target.value, has_permission: true } }))} />
+                            <input aria-label={`Permission end for ${user.name}`} type="time" className="form-control form-control-sm" value={current.permission_end_time || ""} disabled={locked || beforeJoining} onChange={(e) => setAttendanceState((prev) => ({ ...prev, [user.id]: { ...prev[user.id], permission_end_time: e.target.value, has_permission: true } }))} />
+                          </div>
+                          <input aria-label={`Permission reason for ${user.name}`} type="text" className="form-control form-control-sm mt-1" placeholder="Permission reason" value={current.permission_reason || ""} disabled={locked || beforeJoining} onChange={(e) => setAttendanceState((prev) => ({ ...prev, [user.id]: { ...prev[user.id], permission_reason: e.target.value, has_permission: true } }))} />
+                          <input aria-label={`Attendance modification reason for ${user.name}`} type="text" className="form-control form-control-sm mt-1" placeholder="Attendance edit reason" value={current.modification_reason || ""} disabled={locked || beforeJoining} onChange={(e) => setAttendanceState((prev) => ({ ...prev, [user.id]: { ...prev[user.id], modification_reason: e.target.value } }))} />
+                          {(current.permission_start_time || current.permission_end_time) && <button type="button" className="btn btn-link btn-sm text-danger p-0 mt-1" disabled={locked || beforeJoining} onClick={() => setAttendanceState((prev) => ({ ...prev, [user.id]: { ...prev[user.id], permission_start_time: "", permission_end_time: "", permission_reason: "", remove_permission: true, has_permission: false } }))}>Remove Permission</button>}
+                        </td>
+
                         <td>
                           {getAttendanceSourceLabel(
                             current.attendance_source,
@@ -1242,10 +1276,12 @@ function Attendance({ session }) {
                             title={
                               locked
                                 ? "Approved full-day leave - cancel the leave to change attendance"
+                                : ["Approved", "Processed", "Paid"].includes(user.payroll_status)
+                                ? `Payroll is ${user.payroll_status}; attendance is locked for this month.`
                                 : beforeJoining
                                 ? `This date is before the employee's joining date (${user.joining_date})`
                                 : !isEditableDate
-                                ? "Manual attendance changes are limited to today and yesterday"
+                                ? "Future attendance cannot be modified"
                                 : undefined
                             }
                             onClick={() =>
@@ -1282,6 +1318,14 @@ function Attendance({ session }) {
         </div>
       </div>
 
+      {showHistoricalAttendance && (
+        <HistoricalAttendanceModal
+          users={users}
+          departments={departmentOptions}
+          getHeaders={getHeaders}
+          onClose={() => setShowHistoricalAttendance(false)}
+        />
+      )}
       <AttendanceRequestInbox />
     </div>
   );

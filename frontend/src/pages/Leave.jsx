@@ -89,6 +89,13 @@ function requestStatusLabel(request) {
   return request.status === "pending_hr_admin" ? "Pending HR Admin Approval" : "Pending Approval";
 }
 
+const APPROVAL_GUIDANCE = {
+  employee: "Leave days exclude weekly offs and holidays. Employees: 1 day → Reporting Manager, 2 days → HOD, more than 2 days → HR Admin. Approved leave appears in Attendance and your Profile on the leave day itself.",
+  reporting_manager: "Leave days exclude weekly offs and holidays. Reporting Managers: 1 day → HOD, 2 or more days → HR Admin. Permissions go to HOD. Approved leave appears in Attendance and your Profile on the leave day itself.",
+  hod: "Leave days exclude weekly offs and holidays. HODs: all leave requests go to HR Admin. Permissions go to HR Admin. Approved leave appears in Attendance and your Profile on the leave day itself.",
+  hr_admin: "Leave days exclude weekly offs and holidays. HR Admins: all leave and permission requests go to your assigned HR Admin. Approved leave appears in Attendance and your Profile on the leave day itself.",
+};
+
 function policyFromApi(policy, id) {
   return {
     leave_type_id: policy.leave_type_id || id,
@@ -145,6 +152,10 @@ function Leave({ user, onNavigate }) {
   const [pendingRequests, setPendingRequests] = useState([]);
   const [permissionRequests, setPermissionRequests] = useState([]);
   const [pendingPermissions, setPendingPermissions] = useState([]);
+  // Cancellation requests of approved leave/permission waiting for this user (original approver).
+  const [leaveCancellations, setLeaveCancellations] = useState([]);
+  const [permissionCancellations, setPermissionCancellations] = useState([]);
+  const [approvalCategory, setApprovalCategory] = useState("");
   const [permissionDate, setPermissionDate] = useState("");
   const [permissionStart, setPermissionStart] = useState("09:00");
   const [permissionEnd, setPermissionEnd] = useState("10:00");
@@ -215,6 +226,9 @@ function Leave({ user, onNavigate }) {
       setDashboard(dashboardData || null);
       setNotifications(Array.isArray(notificationData) ? notificationData : notificationData?.notifications || []);
       setCompanyPolicy((current) => ({ ...current, ...companyPolicyData }));
+      apiRequest("/my-approval-role")
+        .then((data) => setApprovalCategory(data?.category || ""))
+        .catch(() => setApprovalCategory(""));
       try {
         const [myPermissions, managerPermissions] = await Promise.all([
           apiRequest("/permissions/my-requests"),
@@ -222,9 +236,11 @@ function Leave({ user, onNavigate }) {
         ]);
         setPermissionRequests(Array.isArray(myPermissions) ? myPermissions : []);
         setPendingPermissions(managerPermissions?.requests || []);
+        setPermissionCancellations(managerPermissions?.cancellation_requests || []);
       } catch {
         setPermissionRequests([]);
         setPendingPermissions([]);
+        setPermissionCancellations([]);
       }
 
       if (types?.length) {
@@ -247,11 +263,13 @@ function Leave({ user, onNavigate }) {
           setApprovalRole(isAdminApprover ? "admin" : "");
         } else {
           setPendingRequests(pendingData?.requests || []);
+          setLeaveCancellations(pendingData?.cancellation_requests || []);
           setCanViewApprovalQueue(Boolean(pendingData?.can_approve));
           setApprovalRole(pendingData?.approval_role || "");
         }
       } catch (pendingError) {
         setPendingRequests([]);
+        setLeaveCancellations([]);
         setCanViewApprovalQueue(false);
         setApprovalRole("");
         throw pendingError;
@@ -285,6 +303,7 @@ function Leave({ user, onNavigate }) {
         if (!cancelled) {
           setNotifications(Array.isArray(notificationData) ? notificationData : notificationData?.notifications || []);
           setPendingRequests(pendingData?.requests || []);
+          setLeaveCancellations(pendingData?.cancellation_requests || []);
           setCanViewApprovalQueue(Boolean(pendingData?.can_approve));
           setApprovalRole(pendingData?.approval_role || "");
         }
@@ -356,9 +375,9 @@ function Leave({ user, onNavigate }) {
     setSubmitting(true);
     try {
       const attachmentContent = attachmentFile ? await fileToBase64(attachmentFile) : null;
-      await apiRequest("/apply", { method: "POST", body: JSON.stringify({ leave_type_id: leaveTypeId, from_date: fromDate, to_date: toDate, day_part: dayPart, reason: reason.trim(), attachment_name: attachmentFile?.name || attachmentName.trim() || null, attachment_content_base64: attachmentContent, attachment_content_type: attachmentFile?.type || null }) });
+      const saved = await apiRequest("/apply", { method: "POST", body: JSON.stringify({ leave_type_id: leaveTypeId, from_date: fromDate, to_date: toDate, day_part: dayPart, reason: reason.trim(), attachment_name: attachmentFile?.name || attachmentName.trim() || null, attachment_content_base64: attachmentContent, attachment_content_type: attachmentFile?.type || null }) });
       window.dispatchEvent(new Event("hrms-notifications-updated"));
-      setSuccess("Leave application submitted successfully."); setFromDate(""); setToDate(""); setReason(""); setAttachmentName(""); setAttachmentFile(null); setDayPart("full_day"); await loadData();
+      setSuccess(`Leave application submitted to your ${saved?.approval_level || "approver"}${saved?.assigned_approver_name ? ` (${saved.assigned_approver_name})` : ""}.${saved?.approver_notified === false ? " The approver notification could not be created; the request is in their queue." : ""}`); setFromDate(""); setToDate(""); setReason(""); setAttachmentName(""); setAttachmentFile(null); setDayPart("full_day"); await loadData();
     } catch (requestError) { setError(requestError.message || "Unable to submit leave application."); }
     finally { setSubmitting(false); }
   };
@@ -368,12 +387,18 @@ function Leave({ user, onNavigate }) {
     setError(""); setSuccess("");
     if (!permissionDate || !permissionReason.trim()) { setError("Select a permission date and enter a reason."); return; }
     if (permissionEnd <= permissionStart) { setError("End time must be later than start time."); return; }
+    if (permissionDate === todayIso) {
+      const now = new Date();
+      const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(now);
+      const currentTime = `${parts.find((part) => part.type === "hour")?.value || "00"}:${parts.find((part) => part.type === "minute")?.value || "00"}`;
+      if (permissionStart < currentTime) { setError(`Permission for today must start at ${currentTime} or later.`); return; }
+    }
     if (permissionDate < todayIso || permissionDate > permissionMaxDate) { setError(`Permission can be applied only from today to ${formatDate(permissionMaxDate)}.`); return; }
     setSubmitting(true);
     try {
-      await apiRequest("/permissions", { method: "POST", body: JSON.stringify({ permission_date: permissionDate, start_time: permissionStart, end_time: permissionEnd, reason: permissionReason.trim() }) });
+      const saved = await apiRequest("/permissions", { method: "POST", body: JSON.stringify({ permission_date: permissionDate, start_time: permissionStart, end_time: permissionEnd, reason: permissionReason.trim() }) });
       window.dispatchEvent(new Event("hrms-notifications-updated"));
-      setSuccess("Permission request submitted to your reporting manager.");
+      setSuccess(`Permission request submitted to your ${saved?.approval_level || "approver"}${saved?.approver_name ? ` (${saved.approver_name})` : ""}.${saved?.approver_notified === false ? " The approver notification could not be created; the request is in their queue." : ""}`);
       setPermissionReason(""); await loadData();
     } catch (requestError) { setError(requestError.message || "Unable to submit permission request."); }
     finally { setSubmitting(false); }
@@ -391,11 +416,49 @@ function Leave({ user, onNavigate }) {
     finally { setProcessingId(""); }
   };
 
-  const handleCancel = async (requestId) => {
-    if (!window.confirm("Are you sure you want to cancel this leave request?")) return;
-    setProcessingId(requestId); setError(""); setSuccess("");
-    try { await apiRequest(`/requests/${requestId}/cancel`, { method: "PUT" }); window.dispatchEvent(new Event("hrms-notifications-updated")); setSuccess("Leave request cancelled successfully."); await loadData(); }
+  const handleCancel = async (request) => {
+    const approved = request.status === "approved";
+    let body;
+    if (approved) {
+      const reason = window.prompt("This leave is already approved. Your cancellation request goes to the person who approved it. Reason (optional):", "");
+      if (reason === null) return;
+      body = JSON.stringify({ reason: reason.trim() || null });
+    } else if (!window.confirm("Are you sure you want to cancel this leave request?")) return;
+    setProcessingId(request.id); setError(""); setSuccess("");
+    try {
+      const saved = await apiRequest(`/requests/${request.id}/cancel`, { method: "PUT", ...(body ? { body } : {}) });
+      window.dispatchEvent(new Event("hrms-notifications-updated"));
+      setSuccess(approved ? `Cancellation request sent to ${saved?.cancellation?.approver_name || "the original approver"}. The leave stays approved until they decide.` : "Leave request cancelled successfully.");
+      await loadData();
+    }
     catch (requestError) { setError(requestError.message || "Unable to cancel leave request."); await loadData(); }
+    finally { setProcessingId(""); }
+  };
+
+  // Original approver decides a cancellation of approved leave or permission.
+  const handleCancellationDecision = async (kind, requestId, decision) => {
+    const remarks = window.prompt(`${decision === "approve" ? "Approve" : "Reject"} cancellation — remarks (optional):`, "");
+    if (remarks === null) return;
+    setProcessingId(requestId); setError(""); setSuccess("");
+    try {
+      await apiRequest(`/${kind === "leave" ? "requests" : "permissions"}/${requestId}/cancellation/${decision}`, { method: "PUT", body: JSON.stringify({ remarks: remarks.trim() || null }) });
+      window.dispatchEvent(new Event("hrms-notifications-updated"));
+      setSuccess(`Cancellation ${decision === "approve" ? "approved" : "rejected"}.`);
+      await loadData();
+    } catch (requestError) { setError(requestError.message || "Unable to process the cancellation."); }
+    finally { setProcessingId(""); }
+  };
+
+  const requestPermissionCancellation = async (request) => {
+    const reason = window.prompt("This permission is approved. Your cancellation request goes to the person who approved it. Reason (optional):", "");
+    if (reason === null) return;
+    setProcessingId(request.id); setError(""); setSuccess("");
+    try {
+      const saved = await apiRequest(`/permissions/${request.id}/cancel`, { method: "PUT", body: JSON.stringify({ reason: reason.trim() || null }) });
+      window.dispatchEvent(new Event("hrms-notifications-updated"));
+      setSuccess(`Cancellation request sent to ${saved?.cancellation?.approver_name || "the original approver"}.`);
+      await loadData();
+    } catch (requestError) { setError(requestError.message || "Unable to request cancellation."); }
     finally { setProcessingId(""); }
   };
 
@@ -523,7 +586,15 @@ function Leave({ user, onNavigate }) {
     }
   };
 
-  const renderActionCell = (request, approval) => {
+  const renderActionCell = (request, approval, cancellation = false) => {
+    if (cancellation) {
+      return (
+        <div className="d-flex flex-wrap justify-content-end gap-2">
+          <button className="btn btn-sm btn-success" disabled={processingId === request.id} onClick={() => handleCancellationDecision("leave", request.id, "approve")}>Approve Cancellation</button>
+          <button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => handleCancellationDecision("leave", request.id, "reject")}>Reject</button>
+        </div>
+      );
+    }
     if (approval) {
       return (
         <div className="d-flex justify-content-end gap-2">
@@ -534,12 +605,13 @@ function Leave({ user, onNavigate }) {
     }
     if (!["pending", "approved"].includes(request.status)) return null;
     if (request.can_cancel) {
-      return <button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => handleCancel(request.id)}>Cancel</button>;
+      return <button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => handleCancel(request)}>{request.status === "approved" ? "Request Cancellation" : "Cancel"}</button>;
     }
+    if (request.cancellation?.status === "pending") return <span className="small text-muted">Cancellation pending</span>;
     return <span className="small text-muted">Cancel closed</span>;
   };
 
-  const renderRequestsTable = (rows, approval = false) => (
+  const renderRequestsTable = (rows, approval = false, cancellation = false) => (
     <div className="table-responsive">
       <table className="table table-hover align-middle mb-0">
         <thead className="table-light"><tr><th>Employee</th><th>Leave</th><th>Leave Dates</th><th>Applied On <span className="fw-normal text-muted">(IST)</span></th><th>Days</th><th>Reason</th><th>Status</th><th className="text-end">Action</th></tr></thead>
@@ -567,11 +639,17 @@ function Leave({ user, onNavigate }) {
               {["approved", "rejected"].includes(request.status) && request.approver_name && (
                 <div className="small text-muted mt-1">By {request.approver_name}{request.approval_level ? ` (${request.approval_level})` : ""}</div>
               )}
+              {request.cancellation?.status === "pending" && (
+                <div className="small text-warning-emphasis mt-1 text-break">Cancellation requested{cancellation ? "" : ` — waiting for ${request.cancellation.approver_name || "the original approver"}`}{request.cancellation.reason ? `: ${request.cancellation.reason}` : ""}</div>
+              )}
+              {request.cancellation?.status === "rejected" && !cancellation && (
+                <div className="small text-muted mt-1">Cancellation rejected; leave remains approved.</div>
+              )}
               {!approval && request.can_cancel && request.cancel_deadline && (
                 <div className="small text-muted mt-1">Cancel until {formatDateTime(request.cancel_deadline)}</div>
               )}
             </td>
-            <td className="text-end">{renderActionCell(request, approval)}</td>
+            <td className="text-end">{renderActionCell(request, approval, cancellation)}</td>
           </tr>
         ))}</tbody>
       </table>
@@ -590,9 +668,9 @@ function Leave({ user, onNavigate }) {
       <div className="d-flex flex-wrap gap-2 mb-4">
         <button className={`btn ${activeTab === "dashboard" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("dashboard")}>Dashboard</button>
         <button className={`btn ${activeTab === "my-leave" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("my-leave")}>My Leave</button>
-        <button className={`btn ${activeTab === "permissions" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("permissions")}>Permission {pendingPermissions.length > 0 && <span className="badge bg-danger ms-2">{pendingPermissions.length}</span>}</button>
+        <button className={`btn ${activeTab === "permissions" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("permissions")}>Permission {pendingPermissions.length + permissionCancellations.length > 0 && <span className="badge bg-danger ms-2">{pendingPermissions.length + permissionCancellations.length}</span>}</button>
         {isApprover && <>
-          <button className={`btn ${activeTab === "approvals" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("approvals")}>Approval Queue {pendingRequests.length > 0 && <span className="badge bg-danger ms-2">{pendingRequests.length}</span>}</button>
+          <button className={`btn ${activeTab === "approvals" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("approvals")}>Approval Queue {pendingRequests.length + leaveCancellations.length > 0 && <span className="badge bg-danger ms-2">{pendingRequests.length + leaveCancellations.length}</span>}</button>
           {isAdminApprover && <button className={`btn ${activeTab === "reports" ? "btn-primary" : "btn-outline-primary"}`} onClick={loadReport}>Reports</button>}
           {isAdminApprover && <button className={`btn ${activeTab === "setup" ? "btn-primary" : "btn-outline-primary"}`} onClick={() => setActiveTab("setup")}>Leave Setup</button>}
         </>}
@@ -628,7 +706,7 @@ function Leave({ user, onNavigate }) {
                 ? <><i className="bi bi-exclamation-triangle me-2" />{approvalPreview.problem}</>
                 : <><i className="bi bi-person-check me-2" /><strong>{Number(approvalPreview.days).toFixed(1)} leave day(s)</strong> · approved by your {approvalPreview.approval_level}{approvalPreview.approver_name ? ` (${approvalPreview.approver_name})` : ""}</>}
             </div></div>}
-            <div className="col-12"><div className="small text-muted">Leave days exclude weekly offs and holidays. Employees: 1 day → Reporting Manager, 2 days → HOD, more than 2 days → HR Admin. Reporting Managers: 1 day → HOD, 2 or more days → HR Admin. HR Admins: their assigned HR Admin. Approved leave appears in Attendance and your Profile on the leave day itself.</div></div>
+            {APPROVAL_GUIDANCE[approvalCategory] && <div className="col-12"><div className="alert alert-light border small mb-0 text-break"><i className="bi bi-info-circle me-2" />{APPROVAL_GUIDANCE[approvalCategory]}</div></div>}
           </div><div className="mt-3"><button className="btn btn-primary" disabled={submitting || Boolean(approvalPreview?.problem)}>{submitting ? "Submitting..." : "Submit Leave Request"}</button></div></form></div></div>
           <div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">My Leave Requests</h5></div><div className="card-body p-0">{renderRequestsTable(requests, false)}</div></div>
         </>
@@ -636,15 +714,19 @@ function Leave({ user, onNavigate }) {
         <>
           <div className="card border-0 shadow-sm mb-4"><div className="card-header bg-white"><h5 className="mb-0">Apply Permission</h5><small className="text-muted">Choose the date and exact time interval. Your reporting manager will be notified.</small></div><div className="card-body"><form onSubmit={submitPermission}><div className="row g-3">
             <div className="col-md-3"><label className="form-label">Permission Date</label><input type="date" className="form-control" min={todayIso} max={permissionMaxDate} value={permissionDate} onChange={(e) => setPermissionDate(e.target.value)} required /><small className="text-muted">Today up to {formatDate(permissionMaxDate)}.</small></div>
-            <div className="col-md-3"><label className="form-label">Start Time</label><input type="time" className="form-control" value={permissionStart} onChange={(e) => setPermissionStart(e.target.value)} required /></div>
+            <div className="col-md-3"><label className="form-label">Start Time</label><input type="time" className="form-control" min={permissionDate === todayIso ? new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date()) : undefined} value={permissionStart} onChange={(e) => setPermissionStart(e.target.value)} required /></div>
             <div className="col-md-3"><label className="form-label">End Time</label><input type="time" className="form-control" value={permissionEnd} onChange={(e) => setPermissionEnd(e.target.value)} required /></div>
             <div className="col-md-12"><label className="form-label">Reason</label><textarea className="form-control" rows="2" maxLength="1000" value={permissionReason} onChange={(e) => setPermissionReason(e.target.value)} required /></div>
           </div><button className="btn btn-primary mt-3" disabled={submitting}>{submitting ? "Submitting..." : "Submit Permission"}</button></form></div></div>
-          <div className="card border-0 shadow-sm mb-4"><div className="card-header bg-white"><h5 className="mb-0">My Permission Requests</h5></div><div className="card-body p-0"><div className="table-responsive"><table className="table table-hover align-middle mb-0"><thead className="table-light"><tr><th>Date</th><th>Time</th><th>Reason</th><th>Status</th></tr></thead><tbody>{permissionRequests.length ? permissionRequests.map((request) => <tr key={request.id}><td>{formatDate(request.permission_date)}</td><td>{request.start_time} – {request.end_time}</td><td>{request.reason}</td><td><span className={badgeClass(request.status)}>{request.status}</span>{request.decision_remarks && <div className="small text-muted">{request.decision_remarks}</div>}</td></tr>) : <tr><td colSpan="4" className="text-center text-muted py-4">No permission requests yet.</td></tr>}</tbody></table></div></div></div>
+          <div className="card border-0 shadow-sm mb-4"><div className="card-header bg-white"><h5 className="mb-0">My Permission Requests</h5></div><div className="card-body p-0"><div className="table-responsive"><table className="table table-hover align-middle mb-0"><thead className="table-light"><tr><th>Date</th><th>Time</th><th>Reason</th><th>Status</th><th className="text-end">Action</th></tr></thead><tbody>{permissionRequests.length ? permissionRequests.map((request) => <tr key={request.id}><td>{formatDate(request.permission_date)}</td><td>{request.start_time} – {request.end_time}</td><td className="text-break">{request.reason}</td><td><span className={badgeClass(request.status)}>{request.status}</span>{request.status === "pending" && request.approver_name && <div className="small text-muted">Approver: {request.approver_name}</div>}{request.decision_remarks && <div className="small text-muted">{request.decision_remarks}</div>}{request.cancellation?.status === "pending" && <div className="small text-warning-emphasis">Cancellation requested — waiting for {request.cancellation.approver_name || "the original approver"}</div>}{request.cancellation?.status === "rejected" && <div className="small text-muted">Cancellation rejected; permission remains approved.</div>}</td><td className="text-end">{request.can_request_cancellation && <button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => requestPermissionCancellation(request)}>Request Cancellation</button>}</td></tr>) : <tr><td colSpan="5" className="text-center text-muted py-4">No permission requests yet.</td></tr>}</tbody></table></div></div></div>
+          {permissionCancellations.length > 0 && <div className="card border-0 shadow-sm mb-4"><div className="card-header bg-white"><h5 className="mb-0">Permission Cancellation Requests</h5><small className="text-muted">Approved permissions you approved that the employee asked to cancel.</small></div><div className="card-body p-0"><div className="table-responsive"><table className="table table-hover align-middle mb-0"><thead className="table-light"><tr><th>Employee</th><th>Date</th><th>Time</th><th>Cancellation reason</th><th className="text-end">Action</th></tr></thead><tbody>{permissionCancellations.map((request) => <tr key={request.id}><td>{request.employee_name}<div className="small text-muted">{request.employee_id || ""}</div></td><td>{formatDate(request.permission_date)}</td><td>{request.start_time} – {request.end_time}</td><td className="text-break">{request.cancellation?.reason || "—"}</td><td className="text-end"><div className="d-flex flex-wrap justify-content-end gap-2"><button className="btn btn-sm btn-success" disabled={processingId === request.id} onClick={() => handleCancellationDecision("permission", request.id, "approve")}>Approve Cancellation</button><button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => handleCancellationDecision("permission", request.id, "reject")}>Reject</button></div></td></tr>)}</tbody></table></div></div></div>}
           {pendingPermissions.length > 0 && <div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Permission Approval Queue</h5></div><div className="card-body p-0"><div className="table-responsive"><table className="table table-hover align-middle mb-0"><thead className="table-light"><tr><th>Employee</th><th>Date</th><th>Time</th><th>Reason</th><th>Action</th></tr></thead><tbody>{pendingPermissions.map((request) => <tr key={request.id}><td>{request.employee_name}<div className="small text-muted">{request.employee_id || ""}</div></td><td>{formatDate(request.permission_date)}{request.request_type === "wfh_late_check_in" && <div><span className="badge bg-warning text-dark">WFH late check-in</span></div>}</td><td>{request.start_time} – {request.end_time}</td><td>{request.reason}</td><td className="text-nowrap"><button className="btn btn-sm btn-success me-2" disabled={processingId === request.id} onClick={() => decidePermission(request.id, "approve")}>Approve</button><button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => decidePermission(request.id, "reject")}>Reject</button></td></tr>)}</tbody></table></div></div></div>}
         </>
       ) : activeTab === "approvals" && isApprover ? (
+        <>
         <div className="card border-0 shadow-sm"><div className="card-header bg-white d-flex justify-content-between"><div><h5 className="mb-0">Pending Leave Approvals</h5><small className="text-muted">Review, approve or reject employee leave.</small></div><span className="badge bg-primary">{pendingRequests.length} pending</span></div><div className="card-body p-0">{renderRequestsTable(pendingRequests, true)}</div></div>
+        {leaveCancellations.length > 0 && <div className="card border-0 shadow-sm mt-4"><div className="card-header bg-white d-flex justify-content-between"><div><h5 className="mb-0">Leave Cancellation Requests</h5><small className="text-muted">Approved leave you approved that the employee asked to cancel. The leave stays approved until you decide.</small></div><span className="badge bg-warning text-dark align-self-start">{leaveCancellations.length} pending</span></div><div className="card-body p-0">{renderRequestsTable(leaveCancellations, true, true)}</div></div>}
+        </>
       ) : activeTab === "reports" && isAdminApprover ? (
         <div className="card border-0 shadow-sm"><div className="card-header bg-white"><div className="row g-2 align-items-end"><div className="col-md-3"><label className="form-label">Year</label><input type="number" className="form-control" value={reportYear} onChange={(e) => setReportYear(e.target.value)} /></div><div className="col-md-3"><label className="form-label">Month</label><select className="form-select" value={reportMonth} onChange={(e) => setReportMonth(e.target.value)}><option value="">All Months</option>{Array.from({ length: 12 }, (_, i) => <option key={i + 1} value={i + 1}>{new Date(2000, i, 1).toLocaleString("en-IN", { month: "long" })}</option>)}</select></div><div className="col-md-auto"><button className="btn btn-primary" onClick={loadReport}>Load Report</button></div><div className="col-md-auto"><button className="btn btn-outline-success" onClick={downloadReport}>Export CSV</button></div></div></div><div className="card-body"><div className="row g-3 mb-4"><StatCard title="Requests" value={report?.totals?.requests ?? 0} subtitle="Report rows" icon="bi-files" /><StatCard title="Total Days" value={report?.totals?.days ?? 0} subtitle="Requested days" icon="bi-calendar3" /><StatCard title="Approved Days" value={report?.totals?.approved_days ?? 0} subtitle="Approved days" icon="bi-check-circle" /></div>{report ? <div className="table-responsive"><table className="table table-hover"><thead className="table-light"><tr><th>Employee</th><th>Leave</th><th>Dates</th><th>Days</th><th>Status</th></tr></thead><tbody>{report.rows.map((row) => <tr key={row.id}><td>{row.employee_name}<div className="small text-muted">{row.employee_id}</div></td><td>{row.leave_type_code}</td><td>{formatDate(row.from_date)} - {formatDate(row.to_date)}</td><td>{row.days}</td><td><span className={badgeClass(row.status)}>{row.status}</span></td></tr>)}</tbody></table></div> : <div className="text-muted">Select a period and load the report.</div>}</div></div>
       ) : activeTab === "setup" && isAdminApprover ? (
@@ -655,7 +737,7 @@ function Leave({ user, onNavigate }) {
             <div className="col-md-3"><label className="form-label">Weekly Offs per Month</label><input type="number" min="1" max="10" className="form-control" value={companyPolicy.weekly_offs_per_month} onChange={(e) => setCompanyPolicy({ ...companyPolicy, weekly_offs_per_month: e.target.value })} disabled={!isHrAdmin || savingSetup} /></div>
             <div className="col-md-9"><span className="form-label d-block">Weekly Off Days</span><div className="d-flex flex-wrap gap-3">{["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].map((day) => <div className="form-check" key={day}><input className="form-check-input" type="checkbox" id={`weekly-off-${day}`} checked={(companyPolicy.weekly_off_weekdays || []).includes(day)} onChange={(e) => setCompanyPolicy({ ...companyPolicy, weekly_off_weekdays: e.target.checked ? [...(companyPolicy.weekly_off_weekdays || []), day] : (companyPolicy.weekly_off_weekdays || []).filter((item) => item !== day) })} disabled={!isHrAdmin || savingSetup || (!(companyPolicy.weekly_off_weekdays || []).includes(day) && (companyPolicy.weekly_off_weekdays || []).length >= 6)} /><label className="form-check-label" htmlFor={`weekly-off-${day}`}>{day[0].toUpperCase() + day.slice(1)}</label></div>)}</div>{!(companyPolicy.weekly_off_weekdays || []).length && <small className="text-warning-emphasis">No weekly off is configured. Select the company's weekly off day(s); they are used for leave day counts and the attendance calendar.</small>}</div>
             <div className="col-md-3"><label className="form-label">Probation (Months)</label><input type="number" min="0" max="24" className="form-control" value={companyPolicy.probation_period_months} onChange={(e) => setCompanyPolicy({ ...companyPolicy, probation_period_months: e.target.value })} disabled={!isHrAdmin || savingSetup} /></div>
-            <div className="col-md-3"><label className="form-label">Medical Leave</label><div className="form-control bg-light">1 day per month, after {companyPolicy.weekly_offs_per_month} Weekly Offs</div></div>
+            <div className="col-md-3"><label className="form-label">Medical Leave</label><div className="form-control bg-light">1 day per calendar month. Unused days expire at month-end; no carry forward.</div></div>
             <div className="col-md-6"><label className="form-label">Employee Leave Approval</label><div className="form-control bg-light h-auto">1 day: Reporting Manager · 2 days: HOD · more than 2 days: HR Admin</div></div>
             <div className="col-md-6"><label className="form-label">Reporting Manager / HR Admin Leave</label><div className="form-control bg-light h-auto">Reporting Manager: 1 day HOD, 2+ days HR Admin · HR Admin: assigned HR Admin</div></div>
             <div className="col-md-6"><div className="form-check"><input id="sick-before-probation" type="checkbox" className="form-check-input" checked={companyPolicy.sick_leave_before_probation_allowed} onChange={(e) => setCompanyPolicy({ ...companyPolicy, sick_leave_before_probation_allowed: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="sick-before-probation">Allow Medical Leave before probation (HR exception)</label></div></div>

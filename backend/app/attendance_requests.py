@@ -52,19 +52,19 @@ payroll_collection = db["monthly_payroll_records"]
 leave_notifications_collection = db["leave_notifications"]
 notification_sequences_collection = db["notification_sequences"]
 
-RequestStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"]
+RequestStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"]
 # HR Admin may also finalize a requested date as Not Applicable (counted as LOP).
-FinalStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Not Applicable"]
+FinalStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission", "Not Applicable"]
 NOT_APPLICABLE = "Not Applicable"
 BEFORE_JOINING = "Before Joining"
 # Permitted corrections by the date's current attendance status. Leave dates
 # are owned by the Leave module and future/pre-joining dates are not eligible.
 STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    "Not Marked": ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"),
-    NOT_APPLICABLE: ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"),
-    "Absent": ("Present", "Holiday", "Weekly Off", "Medical Leave"),
+    "Not Marked": ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
+    NOT_APPLICABLE: ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
+    "Absent": ("Present", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
     "Weekly Off": ("Present", "Medical Leave", "Absent"),
-    "Present": ("Present", "Absent", "Medical Leave", "Weekly Off"),
+    "Present": ("Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
     "Holiday": ("Present",),
 }
 MEDICAL_LEAVE_MONTHLY_LIMIT = leave.MEDICAL_LEAVE_DAYS_PER_MONTH
@@ -121,8 +121,11 @@ class AttendanceRequestDateIn(BaseModel):
     requested_status: RequestStatus
     requested_check_in_time: str | None = None
     requested_check_out_time: str | None = None
+    requested_permission_start_time: str | None = None
+    requested_permission_end_time: str | None = None
+    requested_permission_reason: str | None = Field(default=None, max_length=1000)
 
-    _times = field_validator("requested_check_in_time", "requested_check_out_time")(classmethod(lambda cls, value: _clean_time(value)))
+    _times = field_validator("requested_check_in_time", "requested_check_out_time", "requested_permission_start_time", "requested_permission_end_time")(classmethod(lambda cls, value: _clean_time(value)))
 
 
 class AttendanceRequestCreate(BaseModel):
@@ -138,8 +141,11 @@ class AttendanceDecisionIn(BaseModel):
     final_status: FinalStatus | None = None
     final_check_in_time: str | None = None
     final_check_out_time: str | None = None
+    final_permission_start_time: str | None = None
+    final_permission_end_time: str | None = None
+    final_permission_reason: str | None = Field(default=None, max_length=1000)
 
-    _times = field_validator("final_check_in_time", "final_check_out_time")(classmethod(lambda cls, value: _clean_time(value)))
+    _times = field_validator("final_check_in_time", "final_check_out_time", "final_permission_start_time", "final_permission_end_time")(classmethod(lambda cls, value: _clean_time(value)))
 
 
 class AttendanceRequestResponsePayload(BaseModel):
@@ -361,11 +367,25 @@ def _month_usage(user: dict[str, Any], ctx: dict[str, Any], exclude_request_id: 
     if medical_types:
         for application in db["leave_requests"].find({
             "user_id": str(user["_id"]), "leave_type_id": {"$in": list(medical_types)},
-            "status": {"$regex": "^pending", "$options": "i"},
-        }, {"leave_dates": 1, "from_date": 1, "day_part": 1}):
+            "status": {"$in": ["pending", "pending_hr_admin", "approved"]},
+        }, {"leave_dates": 1, "from_date": 1, "day_part": 1, "status": 1}):
             per_day = 0.5 if "half" in str(application.get("day_part") or "") else 1
             dates = application.get("leave_dates") or [application.get("from_date")]
-            medical += per_day * sum(1 for value in dates if str(value or "").startswith(period))
+            for value in dates:
+                iso = str(value or "")[:10]
+                if not iso.startswith(period):
+                    continue
+                # Approved leave is normally represented in attendance. Count
+                # approved future dates here until their lazy attendance sync
+                # creates the canonical Medical Leave attendance record.
+                recorded = ctx["records"].get(iso)
+                already_recorded = bool(recorded and (
+                    recorded.get("medical_leave")
+                    or str(recorded.get("leave_type_code") or "").upper() in medical_codes
+                ))
+                if application.get("status") == "approved" and already_recorded:
+                    continue
+                medical += per_day
     return {"weekly_off_used": weekly_off, "medical_leave_used": medical}
 
 
@@ -379,11 +399,6 @@ def leave_module_medical_problem(user: dict[str, Any], leave_dates: list[date], 
     for (year, month), count in sorted(by_month.items()):
         label = date(year, month, 1).strftime("%B %Y")
         usage = _month_usage(user, _month_context(user, year, month))
-        if usage["weekly_off_used"] < weekly_limit:
-            return (
-                f"Medical Leave for {label} is available only after all {weekly_limit} Weekly Off days of the month "
-                f"are used ({usage['weekly_off_used']} of {weekly_limit} used)."
-            )
         if usage["medical_leave_used"] + per_day * count > MEDICAL_LEAVE_MONTHLY_LIMIT:
             return (
                 f"Medical Leave is limited to {MEDICAL_LEAVE_MONTHLY_LIMIT} day per month per employee; "
@@ -393,16 +408,13 @@ def leave_module_medical_problem(user: dict[str, Any], leave_dates: list[date], 
 
 
 def _medical_leave_availability(usage: dict[str, int], weekly_limit: int, extra_weekly_offs: int = 0) -> tuple[bool, str | None]:
-    """Medical Leave is a paid monthly entitlement of one day per employee.
+    """One Medical Leave day is available per calendar month.
 
-    It unlocks only once the month's Weekly Off allowance is fully used
-    (recorded or requested) and does not depend on leave balances.
+    Weekly Off usage is independent. Unused monthly entitlement never carries
+    into another month; this helper is called with month-scoped usage only.
     """
     if usage["medical_leave_used"] + 1 > MEDICAL_LEAVE_MONTHLY_LIMIT:
         return False, f"the monthly limit of {MEDICAL_LEAVE_MONTHLY_LIMIT} medical leave has been reached."
-    weekly_used = usage["weekly_off_used"] + extra_weekly_offs
-    if weekly_used < weekly_limit:
-        return False, f"it unlocks after all {weekly_limit} Weekly Off days of the month are used ({weekly_used} of {weekly_limit} used)."
     return True, None
 
 
@@ -749,6 +761,16 @@ def create_attendance_request(
         if time_problem:
             problems.append(f"{iso}: {time_problem}")
             continue
+        if item.requested_status == "Permission":
+            if not item.requested_permission_start_time or not item.requested_permission_end_time:
+                problems.append(f"{iso}: Permission start and end times are required.")
+                continue
+            if item.requested_permission_end_time <= item.requested_permission_start_time:
+                problems.append(f"{iso}: Permission end time must be later than start time.")
+                continue
+            if not (item.requested_permission_reason or "").strip():
+                problems.append(f"{iso}: Permission reason is required.")
+                continue
         if (
             item.requested_status == "Present" and day["status"] == "Present"
             and (item.requested_check_in_time, item.requested_check_out_time) == (day["check_in_time"], day["check_out_time"])
@@ -781,6 +803,9 @@ def create_attendance_request(
             "requested_status": item.requested_status,
             "requested_check_in_time": item.requested_check_in_time if item.requested_status == "Present" else None,
             "requested_check_out_time": item.requested_check_out_time if item.requested_status == "Present" else None,
+            "requested_permission_start_time": item.requested_permission_start_time if item.requested_status == "Permission" else None,
+            "requested_permission_end_time": item.requested_permission_end_time if item.requested_status == "Permission" else None,
+            "requested_permission_reason": item.requested_permission_reason if item.requested_status == "Permission" else None,
             "decision": None,
             "final_status": None,
             "final_check_in_time": None,
@@ -844,7 +869,8 @@ def create_attendance_request(
     _audit(user, "ATTENDANCE_REQUEST_SUBMITTED", record, {"dates": isos})
     summary = ", ".join(
         f"{_date_label(item['attendance_date'])} ({item['original_status']} → {item['requested_status']}"
-        f"{_times_text(item['requested_check_in_time'], item['requested_check_out_time'])})"
+        f"{_times_text(item['requested_check_in_time'], item['requested_check_out_time'])}"
+        f"{(' ' + item.get('requested_permission_start_time', '') + '–' + item.get('requested_permission_end_time', '')) if item.get('requested_status') == 'Permission' else ''})"
         for item in items
     )
     try:
@@ -1018,6 +1044,37 @@ def _apply_date_decision(
         return False, final_status, lock_reason
     key = {"user_id": user_id, "attendance_date": attendance_date}
     existing = attendance_collection.find_one(key)
+    if final_status == "Permission":
+        if not existing:
+            return False, final_status, "Permission correction requires an existing attendance record for this date."
+        day = date.fromisoformat(attendance_date)
+        ctx = _month_context(employee, day.year, day.month)
+        current_status = _day_status(day, existing, ctx)
+        if not _record_matches_original(item, existing, current_status):
+            return False, final_status, f"Attendance for this date changed after the request was submitted (now {current_status}); the existing record was preserved."
+        if any(leave_item.get("day_part", "full_day") == "full_day" for leave_item in _approved_leaves_for_date(attendance_date, user_id)):
+            return False, final_status, "An approved full-day leave covers this date; Permission was not changed."
+        before = existing.get("approved_permission")
+        if before and before.get("attendance_request_id") == request_id:
+            return True, final_status, "Permission was already recorded."
+        permission = {
+            "start_time": decision.final_permission_start_time,
+            "end_time": decision.final_permission_end_time,
+            "reason": (decision.final_permission_reason or item.get("requested_permission_reason") or "Permission correction").strip(),
+            "approved_by": str(admin["_id"]), "approved_at": datetime.now(timezone.utc),
+            "source": "ATTENDANCE_REQUEST", "attendance_request_id": request_id,
+        }
+        now = datetime.now(timezone.utc)
+        attendance_collection.update_one({"_id": existing["_id"]}, {"$set": {"approved_permission": permission, "updated_at": now, "marked_by": str(admin["_id"])}})
+        try:
+            audit_logs_collection.insert_one({"user_id": str(admin["_id"]), "action": "attendance.permission_request_decision", "old_value": {"user_id": user_id, "attendance_date": attendance_date, "permission": before}, "new_value": {"user_id": user_id, "attendance_date": attendance_date, "permission": permission}, "timestamp": now})
+        except Exception:
+            logger.exception("Unable to audit permission attendance correction")
+        payroll_collection.update_one(
+            {"employee_id": request.get("employee_id", ""), "period": period, "status": {"$in": list(PAYROLL_DRAFT_STATUSES)}},
+            {"$set": {"attendance_outdated": True, "attendance_outdated_at": now, "attendance_outdated_reason": f"Permission attendance correction {request.get('request_number')} changed attendance after payroll was calculated."}, "$addToSet": {"attendance_outdated_dates": attendance_date}},
+        )
+        return True, final_status, f"Permission recorded from {permission['start_time']} to {permission['end_time']}."
     if existing and existing.get("attendance_request_id") == request_id:
         # Applied by an earlier, interrupted attempt of this same response.
         return True, final_status, "Recorded."
@@ -1179,6 +1236,17 @@ def _validate_decisions(request: dict[str, Any], payload: AttendanceRequestRespo
         if not hr_only and decision.final_status not in STATUS_TRANSITIONS.get(original, ()):
             problems.append(f"{iso}: {decision.final_status} is not a permitted correction for a {original} date.")
             continue
+        if decision.final_status == "Permission":
+            if not decision.final_permission_start_time or not decision.final_permission_end_time or decision.final_permission_end_time <= decision.final_permission_start_time:
+                problems.append(f"{iso}: valid Permission start and end times are required.")
+                continue
+            if not (decision.final_permission_reason or item.get("requested_permission_reason") or "").strip():
+                problems.append(f"{iso}: Permission reason is required.")
+                continue
+            if not item.get("requested_permission_start_time"):
+                problems.append(f"{iso}: Permission was not the requested correction type.")
+                continue
+            continue
         time_problem = _time_problem(
             decision.final_status, decision.final_check_in_time, decision.final_check_out_time,
             {"status": original, "check_in_time": item.get("original_check_in_time"), "check_out_time": item.get("original_check_out_time")},
@@ -1326,6 +1394,8 @@ def respond_to_attendance_request(
     def outcome_line(item: dict[str, Any]) -> str:
         requested = f"Requested {item['requested_status']}{_times_text(item.get('requested_check_in_time'), item.get('requested_check_out_time'))}"
         final = f"{item['final_status']}{_times_text(item.get('final_check_in_time'), item.get('final_check_out_time'))}"
+        if item.get("final_status") == "Permission":
+            final += f" ({item.get('requested_permission_start_time') or ''}–{item.get('requested_permission_end_time') or ''})"
         text = {
             "approved": f"Approved as {final}",
             "changed": f"Approved with changes as {final}",

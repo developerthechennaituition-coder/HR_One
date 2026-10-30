@@ -415,6 +415,10 @@ export default function EmployeeDetails({
     canEdit && !readOnly
   );
 
+  // Only HR Admin assigns Reporting Manager, HOD and HR Admin (enforced by the backend too).
+  const canAssignApprovers =
+    String(session?.user?.role || "").trim().toLowerCase() === "hr admin";
+
   const employeeId =
     userId || getUserId(employee);
 
@@ -1069,11 +1073,13 @@ export default function EmployeeDetails({
       );
 
       /*
-       * 3. Save Reporting Manager
+       * 3. Save Reporting Manager, HOD and HR Admin (HR Admin only)
        */
-      await saveReportingManager(
-        token
-      );
+      if (canAssignApprovers) {
+        await saveReportingManager(
+          token
+        );
+      }
 
       setSuccessMessage(
         "Employee details updated successfully."
@@ -1754,7 +1760,7 @@ export default function EmployeeDetails({
 
         <div className="employee-details-grid">
 
-          {isEditing ? (
+          {isEditing && canAssignApprovers ? (
             <SelectField
               label="Reporting Manager"
               name="reporting_manager_id"
@@ -1843,14 +1849,15 @@ export default function EmployeeDetails({
             </h3>
 
             <p>
-              HOD and HR Admin who approve this employee's leave, assigned by HR Admin
+              HOD and HR Admin who approve this employee's leave and permissions, assigned by HR Admin
+              {isEditing && !canAssignApprovers ? " (only HR Admin can change these)" : ""}
             </p>
           </div>
         </div>
 
         <div className="employee-details-grid">
 
-          {isEditing ? (
+          {isEditing && canAssignApprovers ? (
             <>
               <SelectField
                 label="HOD"

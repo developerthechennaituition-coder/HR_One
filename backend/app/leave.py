@@ -49,8 +49,7 @@ audit_logs_collection = db["audit_logs"]
 logger = logging.getLogger(__name__)
 
 APPROVER_ROLES = {"hr admin", "administrator", "hr manager"}
-# Medical Leave (code ML): one day per month per employee, usable only after
-# the month's Weekly Off allowance is used (see attendance_requests).
+# Medical Leave (code ML): one day per employee per calendar month; unused entitlement expires monthly.
 MEDICAL_LEAVE_CODE = "ML"
 MEDICAL_LEAVE_DAYS_PER_MONTH = 1
 HR_ADMIN_ROLE = "hr admin"
@@ -390,13 +389,15 @@ def _direct_report_ids(manager_id: str) -> set[str]:
 
 
 def _applicant_category(user: dict[str, Any]) -> str:
-    """Role precedence for leave routing: HR Admin > Reporting Manager > employee.
+    """Role precedence for routing: HR Admin > HOD > Reporting Manager > employee.
 
     A Reporting Manager is anyone with at least one active direct report
     (the existing Team Members rule), whatever their stored role.
     """
     if _is_hr_admin(user):
         return "hr_admin"
+    if str(user.get("role", "")).strip().lower() == HOD_ROLE:
+        return "hod"
     if _direct_report_ids(str(user["_id"])):
         return "reporting_manager"
     return "employee"
@@ -404,7 +405,7 @@ def _applicant_category(user: dict[str, Any]) -> str:
 
 def _required_approval_stage(category: str, days: float) -> str:
     """Approval level for an applicant category and leave duration (working days)."""
-    if category == "hr_admin":
+    if category in {"hr_admin", "hod"}:
         return "hr_admin"
     if category == "reporting_manager":
         return "hod" if days <= 1 else "hr_admin"
@@ -415,6 +416,15 @@ def _required_approval_stage(category: str, days: float) -> str:
     return "hr_admin"
 
 
+# Permission requests: one approver by applicant category (duration does not matter).
+PERMISSION_STAGES = {
+    "employee": "reporting_manager",
+    "reporting_manager": "hod",
+    "hod": "hr_admin",
+    "hr_admin": "hr_admin",
+}
+
+
 def resolve_leave_approver(user: dict[str, Any], days: float) -> tuple[str, dict[str, Any]]:
     """The single approver for this applicant and duration, validated.
 
@@ -422,16 +432,25 @@ def resolve_leave_approver(user: dict[str, Any], days: float) -> tuple[str, dict
     missing, inactive, lacks the required role or is the applicant.
     """
     stage = _required_approval_stage(_applicant_category(user), days)
+    return stage, _resolve_stage_approver(user, stage, f"{days:g} day(s) of leave")
+
+
+def resolve_permission_approver(user: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Validated approver for a permission request."""
+    stage = PERMISSION_STAGES[_applicant_category(user)]
+    return stage, _resolve_stage_approver(user, stage, "permission requests", status_code=422)
+
+
+def _resolve_stage_approver(user: dict[str, Any], stage: str, duration: str, status_code: int = 400) -> dict[str, Any]:
     field, required_role, label = APPROVAL_STAGES[stage]
     approver_id = (
         _get_reporting_manager_id(user)
         if stage == "reporting_manager"
         else (str(user[field]) if user.get(field) else None)
     )
-    duration = f"{days:g} day(s) of leave"
     if not approver_id or not ObjectId.is_valid(approver_id):
         raise HTTPException(
-            status_code=400,
+            status_code=status_code,
             detail=f"No {label} is assigned to approve {duration}. Please ask HR Admin to assign a valid {label} in your employee details.",
         )
     approver = users_collection.find_one({"_id": ObjectId(approver_id), "is_active": True})
@@ -441,10 +460,10 @@ def resolve_leave_approver(user: dict[str, Any], days: float) -> tuple[str, dict
         or (required_role and str(approver.get("role", "")).strip().lower() != required_role)
     ):
         raise HTTPException(
-            status_code=400,
+            status_code=status_code,
             detail=f"The assigned {label} cannot approve {duration}: the account is inactive, does not have the {label} role, or is the applicant. Please ask HR Admin to assign a valid {label} in your employee details.",
         )
-    return stage, approver
+    return approver
 
 
 def _history_entry(action: str, stage: str | None, approver: dict[str, Any] | None, now: datetime, **extra: Any) -> dict[str, Any]:
@@ -610,7 +629,11 @@ def _is_medical_leave_type(leave_type: dict[str, Any]) -> bool:
 
 
 def _medical_entitlement(user: dict[str, Any], entitlement: float) -> float:
-    """Medical Leave allowance for the year: one day for every month."""
+    """Annual ceiling backing a monthly one-day Medical Leave entitlement.
+
+    Actual availability is enforced per calendar month by attendance_requests;
+    this annual ceiling is retained for compatibility with existing balance UI.
+    """
     yearly = float(MEDICAL_LEAVE_DAYS_PER_MONTH * 12)
     policy = _company_policy()
     if policy.get("sick_leave_before_probation_allowed"):
@@ -694,7 +717,8 @@ def _overlap_exists(user_id: str, start: date, end: date, exclude_request_id: st
 
 
 def _carry_forward(user_id: str, leave_type_id: str, year: int, policy: dict[str, Any]) -> float:
-    if not policy.get("carry_forward_allowed") or year <= 2000:
+    leave_type = leave_types_collection.find_one({"_id": _parse_object_id(leave_type_id, "leave type")})
+    if (leave_type and _is_medical_leave_type(leave_type)) or not policy.get("carry_forward_allowed") or year <= 2000:
         return 0.0
     previous = leave_balances_collection.find_one({"user_id": user_id, "leave_type_id": leave_type_id, "year": year - 1})
     if not previous:
@@ -735,17 +759,38 @@ def _effective_entitled(balance: dict[str, Any], policy: dict[str, Any] | None, 
 def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
     policy = _get_policy(str(balance["leave_type_id"]))
     entitled = _effective_entitled(balance, policy, int(balance["year"]))
-    if _is_medical_leave_type(leave_type):
-        entitled = _medical_entitlement(user, entitled)
+    is_medical = _is_medical_leave_type(leave_type)
     used = float(balance.get("used", 0))
     pending = float(balance.get("pending", 0))
-    return {"id": str(balance["_id"]), "leave_type_id": str(balance["leave_type_id"]), "code": leave_type.get("code"), "name": leave_type.get("name"), "is_paid": leave_type.get("is_paid", True), "entitled": round(entitled, 2), "annual_entitlement": float(balance.get("annual_entitlement", entitled)), "carry_forward": float(balance.get("carry_forward", 0)), "used": round(used, 2), "pending": round(pending, 2), "available": round(max(entitled - used - pending, 0), 2), "year": balance["year"], "accrual_enabled": bool(policy and policy.get("accrual_enabled"))}
+    carry_forward = 0.0 if is_medical else float(balance.get("carry_forward", 0))
+    if is_medical:
+        entitled = _medical_entitlement(user, entitled)
+        # The balance shown to employees is the current calendar month's
+        # entitlement, not the annual accounting ceiling of 12 days.
+        try:
+            from app.attendance_requests import _month_context, _month_usage
+            current_month = company_now().date()
+            usage = _month_usage(user, _month_context(user, current_month.year, current_month.month))
+            used = float(usage["medical_leave_used"])
+            pending = 0.0
+            monthly_entitled = float(MEDICAL_LEAVE_DAYS_PER_MONTH) if entitled else 0.0
+            available = max(monthly_entitled - used, 0.0)
+            displayed_entitled = monthly_entitled
+        except Exception:
+            displayed_entitled = float(MEDICAL_LEAVE_DAYS_PER_MONTH) if entitled else 0.0
+            available = max(displayed_entitled - used - pending, 0.0)
+    else:
+        displayed_entitled = entitled
+        available = max(entitled - used - pending, 0.0)
+    return {"id": str(balance["_id"]), "leave_type_id": str(balance["leave_type_id"]), "code": leave_type.get("code"), "name": leave_type.get("name"), "is_paid": leave_type.get("is_paid", True), "entitled": round(displayed_entitled, 2), "annual_entitlement": float(balance.get("annual_entitlement", entitled)), "carry_forward": carry_forward, "used": round(used, 2), "pending": round(pending, 2), "available": round(available, 2), "year": balance["year"], "accrual_enabled": bool(policy and policy.get("accrual_enabled"))}
 
 
 def _can_cancel(record: dict[str, Any], viewer: dict[str, Any] | None) -> bool:
     """Employee can cancel until company start time on the leave start date.
     HR / Admin approvers are exempt from the deadline."""
     if record.get("status") not in {"pending", "approved"}:
+        return False
+    if (record.get("cancellation") or {}).get("status") == "pending":
         return False
     if viewer and _is_admin_or_hr(viewer):
         return True
@@ -840,6 +885,16 @@ def _email_medical_certificate(
             status_code=503,
             detail="The medical certificate could not be emailed to HR Admin, so the leave request was not submitted. Please try again or contact HR Admin.",
         ) from error
+
+
+def _safe_notify(send: Any, *args: Any, **kwargs: Any) -> bool:
+    """Send one notification; the saved request stays authoritative if it fails."""
+    try:
+        send(*args, **kwargs)
+        return True
+    except Exception:  # noqa: BLE001 - delivery failure must not undo a saved request
+        logger.exception("Notification could not be created")
+        return False
 
 
 def _notify(
@@ -1077,7 +1132,7 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     result = leave_requests_collection.insert_one(record)
     record["_id"] = result.inserted_id
     _update_balance(user_id, payload.leave_type_id, payload.from_date.year, pending_delta=days)
-    _notify(approver_id, "New Leave Request", f"{user.get('name', 'Employee')} submitted {days:g} day(s) of {leave_type.get('name')} for your {APPROVAL_STAGES[approval_stage][2]} approval.", request_id=str(result.inserted_id))
+    record["approver_notified"] = _safe_notify(_notify, approver_id, "New Leave Request", f"{user.get('name', 'Employee')} submitted {days:g} day(s) of {leave_type.get('name')} for your {APPROVAL_STAGES[approval_stage][2]} approval.", request_id=str(result.inserted_id))
     _audit(user, "LEAVE_APPLIED", str(result.inserted_id), {"days": days, "leave_type": leave_type.get("code"), "approval_stage": approval_stage, "approver_id": approver_id})
     return _request_response(record, user)
 
@@ -1150,10 +1205,15 @@ def pending_leave_requests(authorization: str | None = Header(default=None)):
         approval_role = "reporting_manager"
     else:
         approval_role = None
+    # Cancellation requests for leave this user originally approved.
+    cancellations = list(leave_requests_collection.find({
+        "status": "approved", "cancellation.status": "pending", "cancellation.approver_id": user_id,
+    }).sort("cancellation.requested_at", 1))
     return {
-        "can_approve": bool(records or approval_role),
+        "can_approve": bool(records or cancellations or approval_role),
         "approval_role": approval_role,
         "requests": [_request_response(record, user) for record in records],
+        "cancellation_requests": [_request_response(record, user) for record in cancellations],
     }
 
 
@@ -1244,8 +1304,18 @@ def reject_leave(request_id: str, payload: LeaveDecisionPayload, authorization: 
     return _request_response(leave_requests_collection.find_one({"_id": object_id}), approver)
 
 
+class CancellationRequestPayload(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 @router.put("/requests/{request_id}/cancel")
-def cancel_leave(request_id: str, authorization: str | None = Header(default=None)):
+def cancel_leave(
+    request_id: str,
+    authorization: str | None = Header(default=None),
+    payload: CancellationRequestPayload | None = None,
+):
+    """Pending leave is cancelled at once. The applicant's approved leave needs the
+    original approver's approval (see decide_leave_cancellation)."""
     user = _current_user(authorization)
     object_id = _parse_object_id(request_id, "leave request")
     record = leave_requests_collection.find_one({"_id": object_id})
@@ -1256,9 +1326,24 @@ def cancel_leave(request_id: str, authorization: str | None = Header(default=Non
         raise HTTPException(status_code=403, detail="Access denied")
     if record["status"] not in {"pending", "pending_hr_admin", "approved"}:
         raise HTTPException(status_code=400, detail="Only pending or approved leave can be cancelled")
+    if (record.get("cancellation") or {}).get("status") == "pending":
+        raise HTTPException(status_code=409, detail="A cancellation request for this leave is already waiting for approval.")
     if not _can_cancel(record, user):
         raise HTTPException(status_code=400, detail=f"Leave can be cancelled only until {COMPANY_START_TIME} on the leave start date ({record['from_date']}).")
     now = datetime.now(timezone.utc)
+    if record["user_id"] == user_id and record["status"] == "approved":
+        # Nothing is reversed yet: the original approver decides the cancellation.
+        approver = _original_approver(record.get("approved_by"), user_id)
+        _cancellation_request(leave_requests_collection, record, approver, payload.reason if payload else None, now)
+        notified = _safe_notify(
+            _notify, str(approver["_id"]), "Leave Cancellation Requested",
+            f"{user.get('name', 'Employee')} asked to cancel the approved {float(record['days']):g} day(s) leave from {record['from_date']}.",
+            request_id=request_id,
+        )
+        _audit(user, "LEAVE_CANCELLATION_REQUESTED", request_id, {"approver_id": str(approver["_id"])})
+        response = _request_response(leave_requests_collection.find_one({"_id": object_id}), user)
+        response["approver_notified"] = notified
+        return response
     old_status = record["status"]
     result = leave_requests_collection.update_one({"_id": object_id, "status": old_status}, {"$set": {"status": "cancelled", "cancelled_by": user_id, "cancelled_at": now, "updated_at": now}})
     if result.matched_count == 0:
@@ -1336,6 +1421,8 @@ def create_or_update_policy(payload: LeavePolicyCreate, authorization: str | Non
     _get_leave_type(payload.leave_type_id, active_only=False)
     now = datetime.now(timezone.utc)
     values = payload.model_dump()
+    if _is_medical_leave_type(_get_leave_type(payload.leave_type_id, active_only=False)):
+        values.update({"annual_entitlement": 12, "carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False, "accrual_frequency": "annual"})
     values["updated_at"] = now
     leave_policies_collection.update_one({"leave_type_id": payload.leave_type_id}, {"$set": values, "$setOnInsert": {"created_at": now}}, upsert=True)
     record = leave_policies_collection.find_one({"leave_type_id": payload.leave_type_id})
@@ -1350,6 +1437,8 @@ def update_policy(leave_type_id: str, payload: LeavePolicyUpdate, authorization:
         raise HTTPException(status_code=403, detail="Only HR/Admin can manage leave policies")
     _get_leave_type(leave_type_id, active_only=False)
     values = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if _is_medical_leave_type(_get_leave_type(leave_type_id, active_only=False)):
+        values.update({"annual_entitlement": 12, "carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False, "accrual_frequency": "annual"})
     values["updated_at"] = datetime.now(timezone.utc)
     leave_policies_collection.update_one({"leave_type_id": leave_type_id}, {"$set": values, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}}, upsert=True)
     record = leave_policies_collection.find_one({"leave_type_id": leave_type_id})
@@ -1497,6 +1586,16 @@ def _permission_response(record: dict[str, Any]) -> dict[str, Any]:
     employee = users_collection.find_one({"_id": _parse_object_id(result["user_id"], "employee user")})
     result["employee_name"] = employee.get("name") if employee else "Employee"
     result["employee_id"] = employee.get("employee_id") if employee else None
+    approver_id = _permission_approver_id(record)
+    approver = users_collection.find_one({"_id": ObjectId(approver_id)}, {"name": 1}) if ObjectId.is_valid(approver_id) else None
+    result["approver_name"] = approver.get("name") if approver else None
+    result["approval_level"] = APPROVAL_STAGES.get(record.get("approval_stage") or "reporting_manager", (None, None, None))[2]
+    cancellation = record.get("cancellation") or {}
+    result["can_request_cancellation"] = (
+        record.get("status") == "approved"
+        and cancellation.get("status") != "pending"
+        and str(record.get("permission_date", "")) >= company_now().date().isoformat()
+    )
     return result
 
 
@@ -1531,19 +1630,18 @@ def _permission_notify(recipient_id: str, title: str, message: str, permission_i
 def apply_permission(payload: PermissionApplicationCreate, authorization: str | None = Header(default=None)):
     payload.validate_interval()
     user = _current_user(authorization)
-    manager_id = _get_reporting_manager_id(user)
-    if not manager_id or not ObjectId.is_valid(manager_id):
-        raise HTTPException(status_code=422, detail="A reporting manager must be assigned before applying for permission.")
     today = company_now().date()
     if payload.permission_date < today:
         raise HTTPException(status_code=422, detail="Permission cannot be applied for a past date.")
+    if payload.permission_date == today:
+        current_time = company_now().strftime("%H:%M")
+        if payload.start_time < current_time:
+            raise HTTPException(status_code=422, detail=f"Permission for today must start at the current time ({current_time}) or later.")
     if payload.permission_date > today + timedelta(days=PERMISSION_FORWARD_DAYS):
         raise HTTPException(status_code=422, detail=f"Permission can be applied only from today to {(today + timedelta(days=PERMISSION_FORWARD_DAYS)).isoformat()} (the next {PERMISSION_FORWARD_DAYS} days).")
-    if manager_id == str(user["_id"]):
-        raise HTTPException(status_code=422, detail="Your assigned reporting manager is invalid. Please ask HR Admin to assign a valid reporting manager.")
-    manager = users_collection.find_one({"_id": ObjectId(manager_id), "is_active": True})
-    if not manager:
-        raise HTTPException(status_code=422, detail="Your reporting manager is inactive. Please ask HR Admin to assign an active reporting manager before applying for permission.")
+    # Employee -> Reporting Manager, Reporting Manager -> HOD, HOD / HR Admin -> HR Admin.
+    approval_stage, approver = resolve_permission_approver(user)
+    approver_id = str(approver["_id"])
     overlapping = permission_requests_collection.find_one({
         "user_id": str(user["_id"]), "permission_date": payload.permission_date.isoformat(),
         "status": {"$in": ["pending", "approved"]},
@@ -1553,17 +1651,20 @@ def apply_permission(payload: PermissionApplicationCreate, authorization: str | 
         raise HTTPException(status_code=409, detail="This permission overlaps an existing pending or approved request.")
     now = datetime.now(timezone.utc)
     record = {
-        "user_id": str(user["_id"]), "reporting_manager_id": manager_id,
+        "user_id": str(user["_id"]), "reporting_manager_id": _get_reporting_manager_id(user),
+        "approver_id": approver_id, "approval_stage": approval_stage,
         "permission_date": payload.permission_date.isoformat(), "start_time": payload.start_time,
         "end_time": payload.end_time, "reason": payload.reason, "status": "pending",
         "created_at": now, "updated_at": now,
     }
     result = permission_requests_collection.insert_one(record)
     record["_id"] = result.inserted_id
-    manager = users_collection.find_one({"_id": ObjectId(manager_id), "is_active": True})
-    if manager:
-        _permission_notify(manager_id, "Permission approval required", f"{user.get('name', 'Employee')} requested permission on {payload.permission_date.isoformat()} from {payload.start_time} to {payload.end_time}.", str(result.inserted_id))
-    _audit(user, "PERMISSION_SUBMITTED", str(result.inserted_id), {"permission_date": payload.permission_date.isoformat()})
+    record["approver_notified"] = _safe_notify(
+        _permission_notify, approver_id, "Permission approval required",
+        f"{user.get('name', 'Employee')} requested permission on {payload.permission_date.isoformat()} from {payload.start_time} to {payload.end_time} for your {APPROVAL_STAGES[approval_stage][2]} approval.",
+        str(result.inserted_id),
+    )
+    _audit(user, "PERMISSION_SUBMITTED", str(result.inserted_id), {"permission_date": payload.permission_date.isoformat(), "approver_id": approver_id})
     return _permission_response(record)
 
 
@@ -1576,12 +1677,32 @@ def my_permission_requests(authorization: str | None = Header(default=None)):
 
 @router.get("/permissions/pending")
 def pending_permission_requests(authorization: str | None = Header(default=None)):
-    """Permission requests are approved only by the assigned Reporting Manager."""
+    """Permission requests and cancellation requests assigned to the current user."""
     user = _current_user(authorization)
     user_id = str(user["_id"])
-    query: dict[str, Any] = {"status": "pending", "reporting_manager_id": user_id, "user_id": {"$ne": user_id}}
+    query: dict[str, Any] = {
+        "status": "pending",
+        "user_id": {"$ne": user_id},
+        "$or": [
+            {"approver_id": user_id},
+            # Records created before per-role routing (and WFH late check-in).
+            {"approver_id": {"$exists": False}, "reporting_manager_id": user_id},
+        ],
+    }
     records = list(permission_requests_collection.find(query).sort("created_at", 1))
-    return {"can_approve": bool(records or _direct_report_ids(user_id)), "requests": [_permission_response(record) for record in records]}
+    cancellations = list(permission_requests_collection.find({
+        "status": "approved", "cancellation.status": "pending", "cancellation.approver_id": user_id,
+    }).sort("cancellation.requested_at", 1))
+    role = str(user.get("role", "")).strip().lower()
+    return {
+        "can_approve": bool(records or cancellations or _direct_report_ids(user_id) or role in {HOD_ROLE, HR_ADMIN_ROLE}),
+        "requests": [_permission_response(record) for record in records],
+        "cancellation_requests": [_permission_response(record) for record in cancellations],
+    }
+
+
+def _permission_approver_id(record: dict[str, Any]) -> str:
+    return str(record.get("approver_id") or record.get("reporting_manager_id") or "")
 
 
 def _decide_permission(request_id: str, approved: bool, approver: dict[str, Any], remarks: str | None) -> dict[str, Any]:
@@ -1592,8 +1713,8 @@ def _decide_permission(request_id: str, approved: bool, approver: dict[str, Any]
         raise HTTPException(status_code=409, detail="This permission request has already been decided.")
     if str(record.get("user_id")) == str(approver["_id"]):
         raise HTTPException(status_code=403, detail="You cannot approve or reject your own permission request.")
-    if str(record.get("reporting_manager_id")) != str(approver["_id"]):
-        raise HTTPException(status_code=403, detail="Only the assigned Reporting Manager can approve or reject this permission request.")
+    if _permission_approver_id(record) != str(approver["_id"]):
+        raise HTTPException(status_code=403, detail="Only the assigned approver can approve or reject this permission request.")
     now = datetime.now(timezone.utc)
     new_status = "approved" if approved else "rejected"
     result = permission_requests_collection.update_one(
@@ -1628,3 +1749,170 @@ def approve_permission(request_id: str, payload: LeaveDecisionPayload, authoriza
 @router.put("/permissions/{request_id}/reject")
 def reject_permission(request_id: str, payload: LeaveDecisionPayload, authorization: str | None = Header(default=None)):
     return _decide_permission(request_id, False, _current_user(authorization), payload.remarks)
+
+
+
+# ---------------------------------------------------------------------------
+# Cancellation of approved leave / permission, decided by the original approver
+# ---------------------------------------------------------------------------
+
+def _original_approver(approver_id: Any, applicant_id: str) -> dict[str, Any]:
+    """The person who approved the request; never re-derived from current assignments."""
+    approver_id = str(approver_id or "")
+    approver = users_collection.find_one({"_id": ObjectId(approver_id), "is_active": True}) if ObjectId.is_valid(approver_id) else None
+    if not approver or approver_id == applicant_id:
+        raise HTTPException(
+            status_code=409,
+            detail="The person who approved this request is no longer available to decide a cancellation. Please contact HR Admin.",
+        )
+    return approver
+
+
+def _cancellation_request(collection: Any, record: dict[str, Any], approver: dict[str, Any], reason: str | None, now: datetime) -> None:
+    result = collection.update_one(
+        {"_id": record["_id"], "status": "approved", "cancellation.status": {"$ne": "pending"}},
+        {"$set": {
+            "cancellation": {
+                "status": "pending", "reason": (reason or "").strip() or None,
+                "requested_at": now, "approver_id": str(approver["_id"]), "approver_name": approver.get("name"),
+            },
+            "updated_at": now,
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=409, detail="A cancellation is already pending, or the request is no longer approved.")
+
+
+def _assert_cancellation_approver(record: dict[str, Any], approver: dict[str, Any]) -> None:
+    cancellation = record.get("cancellation") or {}
+    if record.get("status") != "approved" or cancellation.get("status") != "pending":
+        raise HTTPException(status_code=409, detail="There is no pending cancellation request for this record.")
+    if str(record.get("user_id")) == str(approver["_id"]):
+        raise HTTPException(status_code=403, detail="You cannot decide the cancellation of your own request.")
+    if cancellation.get("approver_id") != str(approver["_id"]):
+        raise HTTPException(status_code=403, detail="Only the original approver can decide this cancellation.")
+
+
+def _cancellation_update(approved: bool, remarks: str | None, now: datetime) -> dict[str, Any]:
+    return {
+        "cancellation.status": "approved" if approved else "rejected",
+        "cancellation.decided_at": now,
+        "cancellation.remarks": remarks,
+        "updated_at": now,
+    }
+
+
+def _cancellation_decision_filter(record: dict[str, Any], approver: dict[str, Any]) -> dict[str, Any]:
+    return {"_id": record["_id"], "status": "approved", "cancellation.status": "pending", "cancellation.approver_id": str(approver["_id"])}
+
+
+@router.put("/requests/{request_id}/cancellation/{decision}")
+def decide_leave_cancellation(
+    request_id: str,
+    decision: str,
+    payload: LeaveDecisionPayload,
+    authorization: str | None = Header(default=None),
+):
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(status_code=404, detail="Unknown decision")
+    approver = _current_user(authorization)
+    object_id = _parse_object_id(request_id, "leave request")
+    record = leave_requests_collection.find_one({"_id": object_id})
+    if not record:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    _assert_cancellation_approver(record, approver)
+    now = datetime.now(timezone.utc)
+    days = float(record["days"])
+    approved = decision == "approve"
+    update = _cancellation_update(approved, payload.remarks, now)
+    if approved:
+        update.update({"status": "cancelled", "cancelled_by": str(record["user_id"]), "cancelled_at": now})
+    action = "cancellation_approved" if approved else "cancellation_rejected"
+    result = leave_requests_collection.update_one(_cancellation_decision_filter(record, approver), {
+        "$set": update,
+        "$push": {"approval_history": _history_entry(action, None, approver, now, remarks=payload.remarks)},
+    })
+    if result.matched_count == 0:
+        raise HTTPException(status_code=409, detail="This cancellation was already decided.")
+    if approved:
+        # Reversed exactly once: only the update that moved approved -> cancelled gets here.
+        _update_balance(record["user_id"], record["leave_type_id"], int(record["from_date"][:4]), used_delta=-days)
+        remove_leave_attendance(request_id)
+        _safe_notify(_notify, record["user_id"], "Leave Cancellation Approved", f"Your cancellation of {days:g} day(s) leave from {record['from_date']} was approved by {approver.get('name', 'your approver')}.", request_id=request_id)
+    else:
+        _safe_notify(_notify, record["user_id"], "Leave Cancellation Rejected", f"Your cancellation request for the leave from {record['from_date']} was rejected; the leave remains approved. {payload.remarks or ''}".strip(), request_id=request_id)
+    _audit(approver, "LEAVE_CANCELLATION_APPROVED" if approved else "LEAVE_CANCELLATION_REJECTED", request_id, {"employee_user_id": record["user_id"], "days": days})
+    return _request_response(leave_requests_collection.find_one({"_id": object_id}), approver)
+
+
+@router.put("/permissions/{request_id}/cancel")
+def request_permission_cancellation(
+    request_id: str,
+    payload: CancellationRequestPayload | None = None,
+    authorization: str | None = Header(default=None),
+):
+    """Employee asks the original approver to cancel an approved permission."""
+    user = _current_user(authorization)
+    record = permission_requests_collection.find_one({"_id": _parse_object_id(request_id, "permission request")})
+    if not record:
+        raise HTTPException(status_code=404, detail="Permission request not found")
+    if str(record.get("user_id")) != str(user["_id"]):
+        raise HTTPException(status_code=403, detail="You can cancel only your own permission requests.")
+    if record.get("status") != "approved":
+        raise HTTPException(status_code=409, detail="Only an approved permission can be cancelled through approval.")
+    if str(record.get("permission_date", "")) < company_now().date().isoformat():
+        raise HTTPException(status_code=409, detail="A permission for a past date cannot be cancelled.")
+    approver = _original_approver(record.get("decided_by"), str(user["_id"]))
+    now = datetime.now(timezone.utc)
+    _cancellation_request(permission_requests_collection, record, approver, payload.reason if payload else None, now)
+    notified = _safe_notify(
+        _permission_notify, str(approver["_id"]), "Permission cancellation requested",
+        f"{user.get('name', 'Employee')} asked to cancel the approved permission on {record['permission_date']} ({record['start_time']}–{record['end_time']}).",
+        request_id,
+    )
+    _audit(user, "PERMISSION_CANCELLATION_REQUESTED", request_id, {"approver_id": str(approver["_id"])})
+    response = _permission_response(permission_requests_collection.find_one({"_id": record["_id"]}))
+    response["approver_notified"] = notified
+    return response
+
+
+@router.put("/permissions/{request_id}/cancellation/{decision}")
+def decide_permission_cancellation(
+    request_id: str,
+    decision: str,
+    payload: LeaveDecisionPayload,
+    authorization: str | None = Header(default=None),
+):
+    if decision not in {"approve", "reject"}:
+        raise HTTPException(status_code=404, detail="Unknown decision")
+    approver = _current_user(authorization)
+    record = permission_requests_collection.find_one({"_id": _parse_object_id(request_id, "permission request")})
+    if not record:
+        raise HTTPException(status_code=404, detail="Permission request not found")
+    _assert_cancellation_approver(record, approver)
+    now = datetime.now(timezone.utc)
+    approved = decision == "approve"
+    update = _cancellation_update(approved, payload.remarks, now)
+    if approved:
+        update.update({"status": "cancelled", "cancelled_at": now})
+    result = permission_requests_collection.update_one(_cancellation_decision_filter(record, approver), {"$set": update})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=409, detail="This cancellation was already decided.")
+    employee_id = str(record["user_id"])
+    if approved:
+        # Remove the approved-permission metadata this request added to attendance.
+        db["attendance"].update_one(
+            {"user_id": employee_id, "attendance_date": record["permission_date"], "approved_permission.request_id": request_id},
+            {"$unset": {"approved_permission": ""}},
+        )
+        _safe_notify(_permission_notify, employee_id, "Permission cancellation approved", f"Your permission on {record['permission_date']} ({record['start_time']}–{record['end_time']}) is cancelled.", request_id)
+    else:
+        _safe_notify(_permission_notify, employee_id, "Permission cancellation rejected", f"Your cancellation request for the permission on {record['permission_date']} was rejected; the permission remains approved.", request_id)
+    _audit(approver, "PERMISSION_CANCELLATION_APPROVED" if approved else "PERMISSION_CANCELLATION_REJECTED", request_id, {"employee_user_id": employee_id})
+    return _permission_response(permission_requests_collection.find_one({"_id": record["_id"]}))
+
+
+@router.get("/my-approval-role")
+def my_approval_role(authorization: str | None = Header(default=None)):
+    """Routing category of the current user (same precedence as the backend routing)."""
+    return {"category": _applicant_category(_current_user(authorization))}

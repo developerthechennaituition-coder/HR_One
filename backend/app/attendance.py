@@ -242,6 +242,11 @@ class AttendanceCreate(BaseModel):
     status: str
     check_in_time: str | None = None
     check_out_time: str | None = None
+    permission_start_time: str | None = None
+    permission_end_time: str | None = None
+    permission_reason: str | None = None
+    modification_reason: str | None = None
+    remove_permission: bool = False
 
 
 class AttendanceResponse(BaseModel):
@@ -259,6 +264,7 @@ class AttendanceResponse(BaseModel):
     leave_request_id: str | None = None
     leave_day_part: str | None = None
     leave_type_code: str | None = None
+    approved_permission: dict[str, Any] | None = None
 
     attendance_source: str | None = None
     attendance_type: str | None = None
@@ -428,6 +434,10 @@ def ensure_attendance_indexes() -> None:
 
     attendance_collection.create_index(
         "leave_request_id"
+    )
+    db["attendance_modification_history"].create_index(
+        [("user_id", 1), ("attendance_date", 1), ("modified_at", -1)],
+        name="attendance_modification_employee_date_history",
     )
     attendance_remarks_collection.create_index(
         [("user_id", 1), ("attendance_date", 1)],
@@ -993,6 +1003,7 @@ def _to_response(
         "leave_type_code": record.get(
             "leave_type_code"
         ),
+        "approved_permission": record.get("approved_permission"),
         "attendance_source": record.get("attendance_source"),
         "attendance_type": record.get("attendance_type"),
         "first_punch": record.get("first_punch"),
@@ -2814,13 +2825,10 @@ def save_attendance(
 
     today = company_today()
 
-    if selected not in {
-        today,
-        today - timedelta(days=1),
-    }:
+    if selected != today:
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Attendance can only be marked for today or yesterday",
+            status.HTTP_403_FORBIDDEN,
+            "The Daily Attendance page can modify the current date only. Use Historical Attendance Modification for eligible previous months.",
         )
 
     # ------------------------------------------------------------------
@@ -2849,11 +2857,21 @@ def save_attendance(
             "User not found",
         )
 
-    user_id = str(
-        user["_id"]
-    )
+    user_id = str(user["_id"])
+    employee_id_for_lock = str(user.get("employee_id") or "")
+    payroll_row = db["monthly_payroll_records"].find_one({"employee_id": employee_id_for_lock, "period": selected.strftime("%Y-%m")}, {"status": 1}) if employee_id_for_lock else None
+    payroll_status = (payroll_row or {}).get("status")
+    if payroll_status in {"Approved", "Processed", "Paid"}:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Attendance editing is unavailable because payroll for {selected.strftime('%B %Y')} has already reached {payroll_status} status.")
 
     assert_on_or_after_joining(user, selected)
+    if not payload.remove_permission and (payload.permission_start_time or payload.permission_end_time):
+        if not payload.permission_start_time or not payload.permission_end_time:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Both Permission start and end times are required.")
+        _validate_time(payload.permission_start_time, "Permission start")
+        _validate_time(payload.permission_end_time, "Permission end")
+        if payload.permission_end_time <= payload.permission_start_time:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Permission end time must be later than start time.")
 
     # ------------------------------------------------------------------
     # Find approved leave for this employee/date
@@ -3001,10 +3019,30 @@ def save_attendance(
                 "Unable to save Leave attendance.",
             )
 
-        return _to_response(
-            record,
-            user,
-        )
+        old_leave_status = (existing_leave_attendance or {}).get("status")
+        old_leave_type = (existing_leave_attendance or {}).get("leave_type_code")
+        if old_leave_status != "Leave" or old_leave_type != record.get("leave_type_code"):
+            try:
+                change_details = {"status": {"before": old_leave_status or "Not Marked", "after": "Leave"}}
+                if old_leave_type != record.get("leave_type_code"):
+                    change_details["leave_type"] = {"before": old_leave_type, "after": record.get("leave_type_code")}
+                db["attendance_modification_history"].insert_one({
+                    "user_id": user_id, "employee_id": user.get("employee_id", ""), "employee_name": user.get("name", ""),
+                    "attendance_date": payload.attendance_date, "changes": change_details,
+                    "reason": (payload.modification_reason or "Attendance leave correction by HR Admin").strip(),
+                    "modified_by": marked_by, "modified_at": now,
+                })
+                from app.notifications import create_system_notification
+                create_system_notification(
+                    title="Employee Attendance Modified",
+                    message=f"Your attendance record for {payload.attendance_date} was changed from {old_leave_status or 'Not Marked'} to Leave by HR Admin. Leave type: {record.get('leave_type_code') or 'Approved Leave'}. Reason: {(payload.modification_reason or 'Attendance leave correction').strip()}",
+                    validity=timedelta(days=90), event_key=f"attendance-admin-leave-edit:{user_id}:{payload.attendance_date}:{now.isoformat()}",
+                    user_ids=[user_id],
+                )
+            except Exception:
+                logger.exception("Leave attendance was saved but its audit/notification could not be created")
+
+        return _to_response(record, user)
 
     # ------------------------------------------------------------------
     # FULL-DAY LEAVE LOCK
@@ -3131,9 +3169,26 @@ def save_attendance(
         "check_out_time": check_out_time,
         "marked_by": marked_by,
         "attendance_source": "MANUAL",
-        "attendance_type": "OFFICE",
+        "attendance_type": (existing_attendance or {}).get("attendance_type") or "OFFICE",
         "updated_at": now,
     }
+    permission_before = (existing_attendance or {}).get("approved_permission")
+    if payload.remove_permission:
+        values["approved_permission"] = None
+    elif payload.permission_start_time and payload.permission_end_time:
+        requested_permission = {
+            "start_time": payload.permission_start_time,
+            "end_time": payload.permission_end_time,
+            "reason": (payload.permission_reason or "Updated by HR Admin").strip(),
+        }
+        current_permission = permission_before or {}
+        if any(current_permission.get(field) != value for field, value in requested_permission.items()):
+            values["approved_permission"] = {
+                **requested_permission,
+                "approved_by": marked_by,
+                "approved_at": now,
+                "source": "HR_ADMIN_ATTENDANCE_EDIT",
+            }
 
     # If an approved half-day leave previously created a Leave
     # record and HR changes it to Present/Absent/Holiday,
@@ -3189,6 +3244,56 @@ def save_attendance(
             }
         attendance_collection.update_one(key, update_values)
 
+    # Preserve an immutable before/after record for every HR Admin correction.
+    changed_fields = {}
+    before_values = existing_attendance or {}
+    for field, new_value in (("status", attendance_status), ("check_in_time", check_in_time), ("check_out_time", check_out_time)):
+        old_value = before_values.get(field)
+        if old_value != new_value:
+            changed_fields[field] = {"before": old_value, "after": new_value}
+    if permission_before != values.get("approved_permission", permission_before):
+        changed_fields["permission"] = {"before": permission_before, "after": values.get("approved_permission")}
+    if changed_fields:
+        try:
+            db["attendance_modification_history"].insert_one({
+                "user_id": user_id, "employee_id": user.get("employee_id", ""),
+                "employee_name": user.get("name", ""), "attendance_date": payload.attendance_date,
+                "changes": changed_fields, "reason": (payload.modification_reason or payload.permission_reason or "Attendance correction by HR Admin").strip(),
+                "modified_by": marked_by, "modified_at": now,
+            })
+            audit_logs_collection.insert_one({
+                "user_id": marked_by, "action": "attendance.admin_modified",
+                "old_value": {"user_id": user_id, "attendance_date": payload.attendance_date, "changes": {k: v["before"] for k, v in changed_fields.items()}},
+                "new_value": {"user_id": user_id, "attendance_date": payload.attendance_date, "changes": {k: v["after"] for k, v in changed_fields.items()}},
+                "timestamp": now,
+            })
+            from app.notifications import create_system_notification
+            lines = []
+            for field, change in changed_fields.items():
+                if field == "permission":
+                    before = change["before"] or {}
+                    after = change["after"] or {}
+                    before_text = f"{before.get('start_time', '')}–{before.get('end_time', '')}" if before else "None"
+                    after_text = f"{after.get('start_time', '')}–{after.get('end_time', '')}" if after else "None (removed)"
+                    lines.append(f"Permission: {before_text} → {after_text}")
+                else:
+                    lines.append(f"{field.replace('_', ' ').title()}: {change['before'] or '—'} → {change['after'] or '—'}")
+            create_system_notification(
+                title="Employee Attendance Modified",
+                message=f"Your attendance record for {payload.attendance_date} was modified by HR Admin.\n" + "\n".join(lines) + f"\nReason: {(payload.modification_reason or payload.permission_reason or 'Attendance correction').strip()}",
+                validity=timedelta(days=90), event_key=f"attendance-admin-edit:{user_id}:{payload.attendance_date}:{now.isoformat()}",
+                user_ids=[user_id],
+            )
+        except Exception:
+            logger.exception("Attendance was saved but audit/notification creation failed for %s %s", user_id, payload.attendance_date)
+
+    # A calculated payroll is a draft; mark it outdated so it must be recalculated before approval.
+    if payroll_status == "Calculated" and employee_id_for_lock:
+        db["monthly_payroll_records"].update_one(
+            {"employee_id": employee_id_for_lock, "period": selected.strftime("%Y-%m"), "status": "Calculated"},
+            {"$set": {"attendance_outdated": True, "attendance_outdated_at": now, "attendance_outdated_reason": "Attendance was modified by HR Admin."}, "$addToSet": {"attendance_outdated_dates": payload.attendance_date}},
+        )
+
     if existing_attendance and existing_attendance.get("attendance_source") == "ESSL":
         audit_logs_collection.insert_one(
             {
@@ -3234,6 +3339,336 @@ def save_attendance(
         record,
         user,
     )
+
+
+# ---------------------------------------------------------------------------
+# Historical attendance modification (previous three completed months only)
+# ---------------------------------------------------------------------------
+
+class HistoricalAttendanceUpdate(BaseModel):
+    user_id: str
+    attendance_date: str
+    status: str
+    check_in_time: str | None = None
+    check_out_time: str | None = None
+    permission_start_time: str | None = None
+    permission_end_time: str | None = None
+    permission_reason: str | None = None
+    modification_reason: str = Field(min_length=3, max_length=500)
+    expected_updated_at: datetime | None = None
+    remove_permission: bool = False
+
+
+def _historical_month_window(today: date) -> tuple[date, date]:
+    current_start = date(today.year, today.month, 1)
+    month_index = today.year * 12 + today.month - 1 - 3
+    allowed_start = date(month_index // 12, month_index % 12 + 1, 1)
+    return allowed_start, current_start
+
+
+def _require_historical_attendance_permission(authorization: str | None) -> dict[str, Any]:
+    """Require an explicit role permission; HR Admin role alone is not sufficient."""
+    actor = _require_hr_admin(
+        authorization,
+        "Only an authorized HR Admin or Administrator can modify historical attendance.",
+    )
+    role_id = str(actor.get("role_id") or str(actor.get("role") or "").strip().lower().replace(" ", "_"))
+    permission_names = {
+        "attendance.historical.modify",
+        "historical_attendance.modify",
+        "attendance_modify_historical",
+    }
+    assigned = False
+    if role_id:
+        assigned = db["permissions"].find_one({
+            "role_id": role_id,
+            "permission": {"$in": list(permission_names)},
+        }) is not None
+    user_permissions = actor.get("permissions") or []
+    if isinstance(user_permissions, dict):
+        assigned = assigned or bool(user_permissions.get("attendance.historical.modify"))
+    elif isinstance(user_permissions, list):
+        assigned = assigned or bool(permission_names.intersection({str(x) for x in user_permissions}))
+    if not assigned:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Historical attendance modification permission is not assigned to your role. Ask the system administrator to grant attendance.historical.modify.",
+        )
+    return actor
+
+
+def _validate_historical_month(year: int, month: int) -> tuple[date, date]:
+    today = company_today()
+    if month < 1 or month > 12 or year < 2000:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid month or year.")
+    start, current_start = _historical_month_window(today)
+    selected_start = date(year, month, 1)
+    if selected_start < start or selected_start >= current_start:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Only the previous three completed calendar months are available for historical attendance modification. Current month and older months are excluded.",
+        )
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return selected_start, end
+
+
+@router.get("/historical/user/{user_id}")
+def get_historical_attendance_month(
+    user_id: str,
+    year: int = Query(...),
+    month: int = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    _require_historical_attendance_permission(authorization)
+    start, end = _validate_historical_month(year, month)
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
+    employee = users_collection.find_one({"_id": ObjectId(user_id), "is_active": True})
+    if not employee:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
+    _sync_leave_for_user_range(user_id, start.isoformat(), (end - timedelta(days=1)).isoformat())
+    records = {
+        str(item.get("attendance_date", ""))[:10]: item
+        for item in attendance_collection.find({
+            "user_id": user_id,
+            "attendance_date": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+        })
+    }
+    # Reuse the Leave module's canonical holiday calendar and company weekly-off policy.
+    from app.leave import _holiday_dates
+    holidays = _holiday_dates(employee, start, end - timedelta(days=1))
+    weekly_offs = company_weekly_off_weekdays()
+    rows = []
+    cursor = start
+    today = company_today()
+    while cursor < end and cursor <= today:
+        date_iso = cursor.isoformat()
+        record = records.get(date_iso) or {}
+        details = _calculate_daily_attendance(user_id, cursor, employee)
+        permission = record.get("approved_permission") or {}
+        rows.append({
+            "attendance_date": date_iso,
+            "status": record.get("status") or (
+                "Holiday" if cursor in holidays else
+                "Weekly Off" if cursor.weekday() in weekly_offs else
+                details.get("status") or "Not Marked"
+            ),
+            "check_in_time": record.get("check_in_time") or details.get("first_check_in"),
+            "check_out_time": record.get("check_out_time") or details.get("last_check_out"),
+            "attendance_source": record.get("attendance_source"),
+            "attendance_type": record.get("attendance_type"),
+            "permission_start_time": permission.get("start_time"),
+            "permission_end_time": permission.get("end_time"),
+            "permission_reason": permission.get("reason"),
+            "updated_at": record.get("updated_at"),
+            "has_modification_permission": True,
+            "is_before_joining": bool(employee.get("joining_date") and date_iso < str(employee.get("joining_date"))[:10]),
+        })
+        cursor += timedelta(days=1)
+    return {
+        "employee": {"user_id": user_id, "employee_id": employee.get("employee_id", ""), "name": employee.get("name", "")},
+        "year": year,
+        "month": month,
+        "records": rows,
+    }
+
+
+@router.get("/historical/user/{user_id}/history")
+def get_historical_attendance_audit_history(
+    user_id: str,
+    attendance_date: str = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    _require_historical_attendance_permission(authorization)
+    selected = _validate_date(attendance_date)
+    _validate_historical_month(selected.year, selected.month)
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
+    rows = list(db["attendance_modification_history"].find({
+        "user_id": user_id,
+        "attendance_date": selected.isoformat(),
+    }).sort("modified_at", -1))
+    result = []
+    for row in rows:
+        result.append({
+            "id": str(row.get("_id")),
+            "changes": row.get("changes", {}),
+            "reason": row.get("reason", ""),
+            "modified_by": row.get("modified_by", ""),
+            "modified_by_name": row.get("modified_by_name", ""),
+            "modified_at": row.get("modified_at"),
+        })
+    return result
+
+
+@router.post("/historical/modify")
+def modify_historical_attendance(
+    payload: HistoricalAttendanceUpdate,
+    authorization: str | None = Header(default=None),
+):
+    actor = _require_historical_attendance_permission(authorization)
+    selected = _validate_date(payload.attendance_date)
+    _validate_historical_month(selected.year, selected.month)
+    if not ObjectId.is_valid(payload.user_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
+    employee = users_collection.find_one({"_id": ObjectId(payload.user_id), "is_active": True})
+    if not employee:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
+    assert_on_or_after_joining(employee, selected)
+    status_value = payload.status.strip().title()
+    allowed_statuses = {"Present", "Absent", "Holiday", "Leave", "Weekly Off", "Medical Leave", "Permission", "Not Applicable", "Not Marked"}
+    if status_value not in allowed_statuses:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsupported attendance status.")
+    employee_id = str(employee.get("employee_id") or "")
+    payroll = db["monthly_payroll_records"].find_one({"employee_id": employee_id, "period": selected.strftime("%Y-%m")}, {"status": 1}) if employee_id else None
+    payroll_status = (payroll or {}).get("status")
+    if payroll_status in {"Approved", "Processed", "Paid"}:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Attendance is locked because payroll is {payroll_status}.")
+    if payload.permission_start_time or payload.permission_end_time:
+        if not payload.permission_start_time or not payload.permission_end_time:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Both permission start and end times are required.")
+        _validate_time(payload.permission_start_time, "Permission start")
+        _validate_time(payload.permission_end_time, "Permission end")
+        if payload.permission_end_time <= payload.permission_start_time:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Permission end time must be later than start time.")
+    check_in = payload.check_in_time if status_value == "Present" else None
+    check_out = payload.check_out_time if status_value == "Present" else None
+    if status_value == "Permission" and not (payload.permission_start_time and payload.permission_end_time):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Permission status requires permission start and end times.")
+    if status_value == "Present":
+        if not check_in:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Check-in time is required for Present attendance.")
+        _validate_time(check_in, "Check-in")
+        if check_out:
+            _validate_time(check_out, "Check-out")
+            if check_out < check_in:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Check-out time cannot be earlier than check-in time.")
+    key = {"user_id": payload.user_id, "attendance_date": selected.isoformat()}
+    previous = attendance_collection.find_one(key) or {}
+    if payload.expected_updated_at is not None:
+        expected = payload.expected_updated_at
+        actual = previous.get("updated_at")
+        if actual is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This attendance record changed after it was loaded. Refresh the history and try again.")
+        if actual.tzinfo is None:
+            actual = actual.replace(tzinfo=timezone.utc)
+        if expected.tzinfo is None:
+            expected = expected.replace(tzinfo=timezone.utc)
+        if actual != expected:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This attendance record was modified by someone else. Refresh the history before making another change.")
+    approved_leave = _approved_leaves_for_date(selected.isoformat(), payload.user_id)
+    if approved_leave and approved_leave[0].get("day_part", "full_day") == "full_day" and status_value != "Leave":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Approved full-day leave locks this attendance date. Cancel the leave first.")
+    if status_value == "Leave":
+        if not approved_leave:
+            raise HTTPException(status.HTTP_409_CONFLICT, "No approved leave exists for this employee on the selected date.")
+        values = _build_leave_attendance_fields(approved_leave[0], datetime.now(timezone.utc))
+        values["attendance_source"] = "MANUAL"
+        values["attendance_type"] = (previous or {}).get("attendance_type") or "OFFICE"
+    else:
+        values = {
+            "status": status_value,
+            "check_in_time": check_in,
+            "check_out_time": check_out,
+            "attendance_source": "MANUAL",
+            "attendance_type": previous.get("attendance_type") or "OFFICE",
+            "marked_by": str(actor["_id"]),
+            "updated_at": datetime.now(timezone.utc),
+            "leave_request_id": None,
+            "leave_day_part": None,
+            "leave_type_code": None,
+        }
+        if status_value == "Not Marked":
+            values["check_in_time"] = None
+            values["check_out_time"] = None
+        if payload.remove_permission:
+            values["approved_permission"] = None
+        elif payload.permission_start_time and payload.permission_end_time:
+            values["approved_permission"] = {
+                "start_time": payload.permission_start_time,
+                "end_time": payload.permission_end_time,
+                "reason": (payload.permission_reason or "Historical attendance correction").strip(),
+                "approved_by": str(actor["_id"]),
+                "approved_at": datetime.now(timezone.utc),
+                "source": "HISTORICAL_ATTENDANCE_EDIT",
+            }
+    now = datetime.now(timezone.utc)
+    values["marked_by"] = str(actor["_id"])
+    values["updated_at"] = now
+    update_query = dict(key)
+    if payload.expected_updated_at is not None and previous.get("updated_at") is not None:
+        update_query["updated_at"] = previous.get("updated_at")
+    try:
+        update_result = attendance_collection.update_one(
+            update_query,
+            {"$set": values, "$setOnInsert": {"employee_id": employee_id, "created_at": now}},
+            upsert=not bool(previous),
+        )
+    except DuplicateKeyError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This attendance record was modified concurrently. Refresh the history and try again.") from exc
+    if previous and update_result.matched_count == 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This attendance record was modified concurrently. Refresh the history and try again.")
+    saved = attendance_collection.find_one(key) or {}
+    permission_before = previous.get("approved_permission") or None
+    permission_after = saved.get("approved_permission") or None
+    before_after = {
+        "status": {"before": previous.get("status") or "Not Marked", "after": saved.get("status") or status_value},
+        "check_in_time": {"before": previous.get("check_in_time"), "after": saved.get("check_in_time")},
+        "check_out_time": {"before": previous.get("check_out_time"), "after": saved.get("check_out_time")},
+        "attendance_source": {"before": previous.get("attendance_source"), "after": saved.get("attendance_source")},
+        "permission": {"before": permission_before, "after": permission_after},
+    }
+    changes = {name: values_pair for name, values_pair in before_after.items() if values_pair["before"] != values_pair["after"]}
+    if not changes:
+        return {"message": "No attendance changes were detected.", "record": _to_response(saved, employee), "changed": False}
+    modification_id = secrets.token_hex(12)
+    actor_name = actor.get("name") or actor.get("work_email") or "HR Admin"
+    db["attendance_modification_history"].insert_one({
+        "modification_id": modification_id,
+        "user_id": payload.user_id,
+        "employee_id": employee_id,
+        "employee_name": employee.get("name", ""),
+        "attendance_date": selected.isoformat(),
+        "changes": changes,
+        "reason": payload.modification_reason.strip(),
+        "modified_by": str(actor["_id"]),
+        "modified_by_name": actor_name,
+        "modified_at": now,
+    })
+    audit_logs_collection.insert_one({
+        "user_id": str(actor["_id"]),
+        "action": "attendance.historical_modified",
+        "old_value": {"user_id": payload.user_id, "attendance_date": selected.isoformat(), "changes": {k: v["before"] for k, v in changes.items()}},
+        "new_value": {"user_id": payload.user_id, "attendance_date": selected.isoformat(), "changes": {k: v["after"] for k, v in changes.items()}, "reason": payload.modification_reason.strip()},
+        "timestamp": now,
+    })
+    try:
+        from app.notifications import create_system_notification
+        def display(value):
+            if value is None or value == "":
+                return "—"
+            if isinstance(value, dict):
+                return f"{value.get('start_time', '—')}–{value.get('end_time', '—')}"
+            return str(value)
+        details = "\n".join(
+            f"{field.replace('_', ' ').title()}: {display(pair['before'])} → {display(pair['after'])}"
+            for field, pair in changes.items()
+        )
+        create_system_notification(
+            title="Historical Attendance Modified",
+            message=f"Hello {employee.get('name', 'Employee')}, your attendance for {selected.isoformat()} was modified by {actor_name}.\n{details}\nReason: {payload.modification_reason.strip()}\nModified at: {now.isoformat()}",
+            validity=timedelta(days=90),
+            event_key=f"attendance-historical-modify:{modification_id}",
+            user_ids=[payload.user_id],
+        )
+    except Exception:
+        logger.exception("Historical attendance saved and audited, but employee notification failed for %s %s", payload.user_id, selected.isoformat())
+    if payroll_status == "Calculated" and employee_id:
+        db["monthly_payroll_records"].update_one(
+            {"employee_id": employee_id, "period": selected.strftime("%Y-%m"), "status": "Calculated"},
+            {"$set": {"attendance_outdated": True, "attendance_outdated_at": now, "attendance_outdated_reason": "Historical attendance was modified by HR Admin."}, "$addToSet": {"attendance_outdated_dates": selected.isoformat()}},
+        )
+    return {"message": "Historical attendance updated successfully.", "record": _to_response(saved, employee), "changed": True, "modification_id": modification_id}
 
 
 # ---------------------------------------------------------------------------
@@ -3361,6 +3796,24 @@ def list_attendance_employees(
     rows.sort(key=lambda row: row["name"].casefold())
 
     return rows
+
+
+
+
+@router.get("/payroll-locks")
+def get_attendance_payroll_locks(
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    authorization: str | None = Header(default=None),
+):
+    """Return employee-specific payroll statuses for the selected attendance month."""
+    _require_hr_admin(authorization, "Only HR Admin or Administrator can view attendance payroll locks.")
+    period = f"{year:04d}-{month:02d}"
+    return [
+        {"employee_id": row.get("employee_id"), "status": row.get("status")}
+        for row in db["monthly_payroll_records"].find({"period": period}, {"employee_id": 1, "status": 1})
+        if row.get("employee_id")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3510,7 +3963,8 @@ def _calculate_daily_attendance(
     is_essl = source == "ESSL" or attendance_type == "OFFICE"
     # An HR-approved attendance-request correction replaces the day's raw
     # punches; show the approved check-in/check-out instead.
-    if source == "ATTENDANCE_REQUEST":
+    if source in {"ATTENDANCE_REQUEST", "MANUAL", "ADMIN"}:
+        # Explicit HR/manual corrections supersede imported raw biometric punches.
         punch_times = []
 
     # ESSL raw punches are the source of truth for office intervals.

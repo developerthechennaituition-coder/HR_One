@@ -25,12 +25,20 @@ const initialDecisions = (request) => Object.fromEntries((request.dates || []).m
   final_status: (item.allowed_final_statuses || []).includes(item.requested_status) ? item.requested_status : "",
   check_in: item.requested_check_in_time || item.original_check_in_time || "",
   check_out: item.requested_check_out_time || item.original_check_out_time || "",
+  permission_start: item.requested_permission_start_time || "",
+  permission_end: item.requested_permission_end_time || "",
+  permission_reason: item.requested_permission_reason || "",
 }]));
 
 function decisionProblem(item, decision) {
   if (!decision?.action) return "Choose Approve or Reject.";
   if (decision.action === "reject") return "";
   if (!decision.final_status) return "Select the final status.";
+  if (decision.final_status === "Permission") {
+    if (!decision.permission_start || !decision.permission_end || decision.permission_end <= decision.permission_start) return "Enter valid Permission start and end times.";
+    if (!decision.permission_reason?.trim()) return "Enter a Permission reason.";
+    return "";
+  }
   if (decision.final_status !== "Present") return "";
   if (decision.check_in && decision.check_out && decision.check_out <= decision.check_in) return "Check-out must be later than check-in.";
   if (item.original_status === "Present") {
@@ -148,6 +156,9 @@ function AttendanceRequestInbox() {
               final_status: decision.final_status,
               final_check_in_time: isPresent ? decision.check_in || null : null,
               final_check_out_time: isPresent ? decision.check_out || null : null,
+              final_permission_start_time: decision.final_status === "Permission" ? decision.permission_start : null,
+              final_permission_end_time: decision.final_status === "Permission" ? decision.permission_end : null,
+              final_permission_reason: decision.final_status === "Permission" ? decision.permission_reason.trim() : null,
             };
         }),
         comments.trim(),
@@ -181,7 +192,7 @@ function AttendanceRequestInbox() {
     const decision = decisions[item.attendance_date];
     if (decision?.action === "reject") return "Reject (attendance unchanged)";
     if (decision?.action !== "approve" || !decision.final_status) return "No decision";
-    const times = decision.final_status === "Present" ? formatTimeRange(decision.check_in, decision.check_out) : "";
+    const times = decision.final_status === "Present" ? formatTimeRange(decision.check_in, decision.check_out) : decision.final_status === "Permission" ? `${decision.permission_start}–${decision.permission_end}` : "";
     return `Approve as ${decision.final_status}${times ? ` (${times})` : ""}`;
   };
 
@@ -298,6 +309,7 @@ function AttendanceRequestInbox() {
                               <td>
                                 <div className="fw-semibold">{item.requested_status}</div>
                                 {item.requested_status === "Present" && <div className="small">Requested: {timesOrDash(item.requested_check_in_time, item.requested_check_out_time)}</div>}
+                                {item.requested_status === "Permission" && <div className="small">Requested: {item.requested_permission_start_time}–{item.requested_permission_end_time}<br />{item.requested_permission_reason}</div>}
                               </td>
                               <td className="small" style={{ minWidth: 150 }}>
                                 {item.payroll_status ? `Payroll ${item.payroll_status}` : "No payroll yet"}
@@ -322,6 +334,13 @@ function AttendanceRequestInbox() {
                                       <option value="">Final status...</option>
                                       {(item.allowed_final_statuses || []).map((option) => <option key={option} value={option}>{option}</option>)}
                                     </select>
+                                    {decision.final_status === "Permission" && (
+                                      <div className="d-flex flex-wrap gap-2 mt-2">
+                                        <label className="small mb-0">Permission start<input type="time" className="form-control form-control-sm" value={decision.permission_start} disabled={submitting} onChange={(e) => updateDecision(iso, { permission_start: e.target.value })} /></label>
+                                        <label className="small mb-0">Permission end<input type="time" className="form-control form-control-sm" value={decision.permission_end} disabled={submitting} onChange={(e) => updateDecision(iso, { permission_end: e.target.value })} /></label>
+                                        <label className="small mb-0 w-100">Reason<input type="text" className="form-control form-control-sm" value={decision.permission_reason} disabled={submitting} onChange={(e) => updateDecision(iso, { permission_reason: e.target.value })} /></label>
+                                      </div>
+                                    )}
                                     {decision.final_status === "Present" && (
                                       <div className="d-flex flex-wrap gap-2 mt-2">
                                         <label className="small mb-0">Final check-in

@@ -167,6 +167,83 @@ class LeaveHierarchyRoutingTests(unittest.TestCase):
             self.assert_http(403, leave.approve_permission, created["id"], leave.LeaveDecisionPayload(), other["auth"])
         self.assertEqual(leave.approve_permission(created["id"], leave.LeaveDecisionPayload(), self.manager["auth"])["status"], "approved")
 
+    def test_hod_routing_and_role_categories(self):
+        self.assign(self.hod, hr_admin_id=self.hr_b)
+        for days, start in [(1, 0), (2, 1)]:
+            request = self.apply(self.hod, days, start=start)
+            self.assertEqual((request["approval_stage"], request["approver_id"]), ("hr_admin", str(self.hr_b["_id"])))
+        for user, category in [(self.employee, "employee"), (self.manager, "reporting_manager"), (self.hod, "hod"), (self.hr_a, "hr_admin")]:
+            self.assertEqual(leave.my_approval_role(user["auth"])["category"], category)
+
+    def test_permission_routing_by_role(self):
+        from datetime import date
+        self.assign(self.hod, hr_admin_id=self.hr_b)
+
+        def apply_permission(user):
+            return leave.apply_permission(leave.PermissionApplicationCreate(
+                permission_date=date(2027, 1, 4), start_time="10:00", end_time="11:00", reason="Bank"), user["auth"])
+
+        cases = [(self.employee, self.manager), (self.manager, self.hod), (self.hod, self.hr_b), (self.hr_a, self.hr_b)]
+        for applicant, approver in cases:
+            created = apply_permission(applicant)
+            self.assertEqual(created["approver_id"], str(approver["_id"]), applicant["name"])
+            self.assertTrue(created["approver_notified"])
+            queue = [r["id"] for r in leave.pending_permission_requests(approver["auth"])["requests"]]
+            self.assertIn(created["id"], queue)
+            self.assert_http(403, leave.approve_permission, created["id"], leave.LeaveDecisionPayload(), applicant["auth"])
+        notifications = db["leave_notifications"].count_documents({"permission_request_id": {"$exists": True}, "title": "Permission approval required"})
+        self.assertEqual(notifications, 4)  # one per submission, only to the approver
+        self.assign(self.hod, hr_admin_id=None)
+        self.assertIn("No HR Admin is assigned", self.assert_http(422, apply_permission, self.hod))
+
+    def test_approved_leave_cancellation_goes_to_the_original_approver(self):
+        request = self.apply(self.employee, 2)  # -> HOD
+        leave.approve_leave(request["id"], leave.LeaveDecisionPayload(), self.hod["auth"])
+        self.assign(self.employee, hod_id=self.hod2)  # later assignment change must not matter
+        asked = leave.cancel_leave(request["id"], self.employee["auth"], leave.CancellationRequestPayload(reason="Plans changed"))
+        self.assertEqual((asked["status"], asked["cancellation"]["status"], asked["cancellation"]["approver_id"]), ("approved", "pending", str(self.hod["_id"])))
+        self.assertIn("Leave Cancellation Requested", self.notified(self.hod))
+        self.assertNotIn("Leave Cancellation Requested", self.notified(self.hod2))
+        balance = lambda: db["leave_balances"].find_one({"user_id": str(self.employee["_id"])})["used"]  # noqa: E731
+        self.assertEqual(balance(), 2)  # nothing reversed while pending
+        self.assert_http(409, leave.cancel_leave, request["id"], self.employee["auth"])  # no duplicate
+        self.assertEqual([r["id"] for r in leave.pending_leave_requests(self.hod["auth"])["cancellation_requests"]], [request["id"]])
+        for intruder in (self.employee, self.hod2, self.hr_a):
+            self.assert_http(403, leave.decide_leave_cancellation, request["id"], "approve", leave.LeaveDecisionPayload(), intruder["auth"])
+        done = leave.decide_leave_cancellation(request["id"], "approve", leave.LeaveDecisionPayload(), self.hod["auth"])
+        self.assertEqual((done["status"], done["cancellation"]["status"]), ("cancelled", "approved"))
+        self.assertEqual(balance(), 0)
+        self.assert_http(409, leave.decide_leave_cancellation, request["id"], "approve", leave.LeaveDecisionPayload(), self.hod["auth"])
+        self.assertEqual(balance(), 0)  # reversed exactly once
+        self.assertIn("Leave Cancellation Approved", self.notified(self.employee))
+
+    def test_rejected_leave_cancellation_keeps_the_approval(self):
+        request = self.apply(self.employee, 1)  # -> Reporting Manager
+        leave.approve_leave(request["id"], leave.LeaveDecisionPayload(), self.manager["auth"])
+        leave.cancel_leave(request["id"], self.employee["auth"])
+        rejected = leave.decide_leave_cancellation(request["id"], "reject", leave.LeaveDecisionPayload(remarks="Needed"), self.manager["auth"])
+        self.assertEqual((rejected["status"], rejected["cancellation"]["status"]), ("approved", "rejected"))
+        self.assertEqual(db["leave_balances"].find_one({"user_id": str(self.employee["_id"])})["used"], 1)
+        self.assertIn("Leave Cancellation Rejected", self.notified(self.employee))
+        # The original approver must still be active to decide.
+        db["users"].update_one({"_id": self.manager["_id"]}, {"$set": {"is_active": False}})
+        self.assertIn("no longer available", self.assert_http(409, leave.cancel_leave, request["id"], self.employee["auth"]))
+
+    def test_approved_permission_cancellation(self):
+        from datetime import date
+        created = leave.apply_permission(leave.PermissionApplicationCreate(
+            permission_date=date(2027, 1, 4), start_time="10:00", end_time="11:00", reason="Bank"), self.employee["auth"])
+        self.assert_http(409, leave.request_permission_cancellation, created["id"], None, self.employee["auth"])  # not approved yet
+        leave.approve_permission(created["id"], leave.LeaveDecisionPayload(), self.manager["auth"])
+        self.assert_http(403, leave.request_permission_cancellation, created["id"], None, self.manager["auth"])  # not the owner
+        asked = leave.request_permission_cancellation(created["id"], leave.CancellationRequestPayload(reason="Not needed"), self.employee["auth"])
+        self.assertEqual((asked["status"], asked["cancellation"]["approver_id"], asked["can_request_cancellation"]), ("approved", str(self.manager["_id"]), False))
+        self.assertEqual([r["id"] for r in leave.pending_permission_requests(self.manager["auth"])["cancellation_requests"]], [created["id"]])
+        self.assert_http(403, leave.decide_permission_cancellation, created["id"], "approve", leave.LeaveDecisionPayload(), self.employee["auth"])
+        done = leave.decide_permission_cancellation(created["id"], "approve", leave.LeaveDecisionPayload(), self.manager["auth"])
+        self.assertEqual(done["status"], "cancelled")
+        self.assert_http(409, leave.decide_permission_cancellation, created["id"], "approve", leave.LeaveDecisionPayload(), self.manager["auth"])
+
     # -- approval security ------------------------------------------------
 
     def test_only_the_assigned_approver_can_decide_once(self):

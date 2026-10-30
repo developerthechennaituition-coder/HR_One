@@ -27,11 +27,11 @@ export function DateDecisionList({ dates }) {
         <li key={item.attendance_date}>
           <strong>{formatRequestDate(item.attendance_date)}</strong>
           {item.original_status && <span className="text-muted"> · was {item.original_status}{timeSuffix(item.original_check_in_time, item.original_check_out_time)}</span>}
-          <div>Requested {item.requested_status}{timeSuffix(item.requested_check_in_time, item.requested_check_out_time)}</div>
+          <div>Requested {item.requested_status}{timeSuffix(item.requested_check_in_time, item.requested_check_out_time)}{item.requested_status === "Permission" ? ` (${item.requested_permission_start_time}–${item.requested_permission_end_time})` : ""}</div>
           {item.outcome ? (
             <div className={item.outcome === "rejected" || item.outcome === "not_applied" ? "text-danger" : "text-success"}>
               {OUTCOME_LABELS[item.outcome]}
-              {(item.outcome === "approved" || item.outcome === "changed") && <> <strong>{item.final_status}</strong>{timeSuffix(item.final_check_in_time, item.final_check_out_time)}</>}
+              {(item.outcome === "approved" || item.outcome === "changed") && <> <strong>{item.final_status}</strong>{timeSuffix(item.final_check_in_time, item.final_check_out_time)}{item.final_status === "Permission" && item.requested_permission_start_time ? ` (${item.requested_permission_start_time}–${item.requested_permission_end_time})` : ""}</>}
               {item.outcome === "not_applied" && item.message && <span> — {item.message}</span>}
             </div>
           ) : <div className="text-muted">Awaiting HR Admin decision</div>}
@@ -44,6 +44,12 @@ export function DateDecisionList({ dates }) {
 function rowProblem(entry) {
   const { day, requested_status: status, check_in: checkIn, check_out: checkOut } = entry;
   if (!status) return "Select the status you are requesting.";
+  if (status === "Permission") {
+    if (!entry.permission_start || !entry.permission_end) return "Enter Permission start and end times.";
+    if (entry.permission_end <= entry.permission_start) return "Permission end must be later than Permission start.";
+    if (!entry.permission_reason?.trim()) return "Enter a Permission reason.";
+    return "";
+  }
   if (status !== "Present") return "";
   if (checkIn && checkOut && checkOut <= checkIn) return "Check-out must be later than check-in.";
   if (day.status === "Present") {
@@ -136,6 +142,9 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
           // Existing times prefill the Present correction fields; nothing is invented.
           check_in: day.check_in_time || "",
           check_out: day.check_out_time || "",
+          permission_start: "",
+          permission_end: "",
+          permission_reason: "",
         };
       } else {
         delete next[day.attendance_date];
@@ -182,6 +191,9 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
             requested_status: entry.requested_status,
             requested_check_in_time: isPresent ? entry.check_in || null : null,
             requested_check_out_time: isPresent ? entry.check_out || null : null,
+            requested_permission_start_time: entry.requested_status === "Permission" ? entry.permission_start : null,
+            requested_permission_end_time: entry.requested_status === "Permission" ? entry.permission_end : null,
+            requested_permission_reason: entry.requested_status === "Permission" ? entry.permission_reason.trim() : null,
           };
         }),
         remarks.trim(),
@@ -311,7 +323,6 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                 {limits && (
                   <div className="small text-muted mb-2">
                     This month: Weekly Off {limits.weekly_off_used} of {limits.weekly_off_limit} used · Medical Leave {limits.medical_leave_used} of {limits.medical_leave_limit} used
-                    {limits.medical_leave_note && <> · {limits.medical_leave_note}</>}
                   </div>
                 )}
 
@@ -355,7 +366,13 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                                 ) : null}
                               </td>
                               <td style={{ minWidth: 200 }}>
-                                {entry?.requested_status === "Present" ? (
+                                {entry?.requested_status === "Permission" ? (
+                                  <div className="d-flex flex-wrap gap-2">
+                                    <label className="small mb-0">Permission start<input type="time" className="form-control form-control-sm" value={entry.permission_start || ""} disabled={submitting} onChange={(e) => updateEntry(iso, { permission_start: e.target.value })} /></label>
+                                    <label className="small mb-0">Permission end<input type="time" className="form-control form-control-sm" value={entry.permission_end || ""} disabled={submitting} onChange={(e) => updateEntry(iso, { permission_end: e.target.value })} /></label>
+                                    <label className="small mb-0 w-100">Reason<input type="text" className="form-control form-control-sm" value={entry.permission_reason || ""} disabled={submitting} onChange={(e) => updateEntry(iso, { permission_reason: e.target.value })} /></label>
+                                  </div>
+                                ) : entry?.requested_status === "Present" ? (
                                   <div className="d-flex flex-wrap gap-2">
                                     <label className="small mb-0">Check-in
                                       <input type="time" className="form-control form-control-sm" value={entry.check_in} disabled={submitting}

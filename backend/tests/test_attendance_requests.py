@@ -474,9 +474,9 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
     def test_request_options_follow_the_current_status(self):
         self.set_weekly_offs([])
         days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
-        # Medical Leave stays locked until the month's Weekly Off allowance is used.
-        self.assertEqual(days["2026-09-07"]["request_options"], ["Present", "Absent", "Holiday", "Weekly Off"])
-        self.assertTrue(any("unlocks after all 4 Weekly Off days" in note for note in days["2026-09-07"]["option_notes"]))
+        # Medical Leave is independent of Weekly Off usage.
+        self.assertEqual(days["2026-09-07"]["request_options"], ["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"])
+        self.assertFalse(any("Weekly Off" in note and "Medical Leave" in note for note in days["2026-09-07"]["option_notes"]))
         db["attendance"].insert_many([
             {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-08", "status": "Absent"},
             {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-09", "status": "Weekly Off"},
@@ -598,16 +598,17 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         # A new calendar month has its own allowance.
         self.assertIn("Medical Leave", self.calendar_day(self.other, "2026-10-01")["request_options"])
 
-    def test_medical_leave_unlocks_after_four_weekly_offs(self):
+    def test_medical_leave_is_independent_of_weekly_off_usage(self):
         self.set_weekly_offs([])
         auth = self.other["auth"]
-        self.assertIn("unlocks after", self.assert_http(422, ar.create_attendance_request, payload(("2026-09-08", "Medical Leave")), auth))
-        weekly = ar.create_attendance_request(payload(*[(f"2026-09-0{day}", "Weekly Off") for day in range(1, 5)]), auth)
-        self.assertIn("Medical Leave", self.calendar_day(self.other, "2026-09-08")["request_options"])
         medical = ar.create_attendance_request(payload(("2026-09-08", "Medical Leave")), auth)
-        # If the Weekly Off days are rejected, Medical Leave cannot be approved.
-        ar.respond_to_attendance_request(weekly["id"], decisions(*[(f"2026-09-0{day}", "reject") for day in range(1, 5)], comments="Worked"), self.hr["auth"])
-        self.assertIn("unlocks after", str(self.assert_http(422, ar.respond_to_attendance_request, medical["id"], decisions(("2026-09-08", "Medical Leave")), self.hr["auth"])))
+        self.assertEqual(medical["status"], "pending")
+        self.assertNotIn("Medical Leave", self.calendar_day(self.other, "2026-09-09")["request_options"])
+        approved = ar.respond_to_attendance_request(medical["id"], decisions(("2026-09-08", "Medical Leave")), self.hr["auth"])
+        self.assertEqual(approved["status"], "approved")
+        self.assertNotIn("Medical Leave", self.calendar_day(self.other, "2026-09-09")["request_options"])
+        # A fresh calendar month has a fresh entitlement, regardless of Weekly Off usage.
+        self.assertIn("Medical Leave", self.calendar_day(self.other, "2026-10-01")["request_options"])
 
     def test_payroll_counts_weekly_offs_and_medical_leave_as_payable(self):
         self.set_weekly_offs([])
@@ -647,7 +648,8 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         medical_type = db["leave_types"].insert_one({"code": "ML", "name": "Medical Leave", "is_active": True, "is_paid": True}).inserted_id
         self.assertTrue(leave._is_medical_leave_type({"code": "ML", "name": "Medical Leave"}))
         self.assertFalse(leave._is_medical_leave_type({"code": "SL", "name": "Sick Leave"}))
-        # September has four configured Sundays, so Medical Leave is unlocked.
+        # Medical Leave is available without using configured Weekly Off days.
+        self.set_weekly_offs([])
         self.assertIsNone(ar.leave_module_medical_problem(self.other, [date(2026, 9, 8)], "full_day"))
         self.assertIn("1 day per month", ar.leave_module_medical_problem(self.other, [date(2026, 9, 8), date(2026, 9, 9)], "full_day"))
         # A pending Medical Leave application uses the month's allowance in both modules.
@@ -655,9 +657,8 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
                                          "from_date": "2026-09-08", "to_date": "2026-09-08", "leave_dates": ["2026-09-08"], "day_part": "full_day"})
         self.assertIn("1 day per month", ar.leave_module_medical_problem(self.other, [date(2026, 9, 9)], "full_day"))
         self.assertNotIn("Medical Leave", self.calendar_day(self.other, "2026-09-09")["request_options"])
-        # Without four Weekly Offs in the month it stays locked.
-        self.set_weekly_offs([])
-        self.assertIn("only after all 4 Weekly Off days", ar.leave_module_medical_problem(self.other, [date(2026, 10, 8)], "full_day"))
+        # A new month has a fresh one-day allowance even with no Weekly Off usage.
+        self.assertIsNone(ar.leave_module_medical_problem(self.other, [date(2026, 10, 8)], "full_day"))
         # The yearly Medical Leave balance is one day for every month.
         db["leave_policies"].update_one({"leave_type_id": "__company_policy__"}, {"$set": {"probation_period_months": 3}})
         self.assertEqual(leave._medical_entitlement(self.other, 3.0), 12.0)
