@@ -1,5 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
 import { getEmployeeAttendanceCalendar } from "../services/attendanceRequestApi";
@@ -47,6 +47,13 @@ function UserAttendance({ session }) {
 
   const [employees, setEmployees] = useState([]);
   const [employeesLoading, setEmployeesLoading] = useState(true);
+  const [departments, setDepartments] = useState([]);
+  const [departmentsLoading, setDepartmentsLoading] = useState(true);
+  const [departmentsError, setDepartmentsError] = useState("");
+  const [departmentId, setDepartmentId] = useState("all");
+  const employeesRequest = useRef(0);
+  const calendarRequest = useRef(0);
+  const monthlyRequest = useRef(0);
   const [search, setSearch] = useState("");
   const [selectedUserId, setSelectedUserId] = useState("");
   const [year, setYear] = useState(today.year);
@@ -64,23 +71,57 @@ function UserAttendance({ session }) {
 
   const headers = useMemo(() => ({ Authorization: `Bearer ${token}` }), [token]);
 
-  // ---- employee list ------------------------------------------------------
+  // ---- departments (Department master + departments found on employee records) ----
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     (async () => {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/attendance/employees`, { headers });
-        if (!response.ok) throw new Error(await readError(response, "Unable to load employees."));
+        const response = await fetch(`${API_BASE_URL}/api/attendance/departments`, { headers, signal: controller.signal });
+        if (!response.ok) throw new Error(await readError(response, "Unable to load departments."));
         const data = await response.json();
-        if (!cancelled) setEmployees(Array.isArray(data) ? data : []);
+        setDepartments(Array.isArray(data) ? data : []);
       } catch (e) {
-        if (!cancelled) setError(e.message || "Unable to load employees.");
+        if (e.name !== "AbortError") setDepartmentsError(e.message || "Unable to load departments.");
       } finally {
-        if (!cancelled) setEmployeesLoading(false);
+        if (!controller.signal.aborted) setDepartmentsLoading(false);
       }
     })();
-    return () => { cancelled = true; };
+    return () => controller.abort();
   }, [headers]);
+
+  // ---- employees of the selected department ---------------------------------
+  // The server resolves each employee's department id, so this filters on the
+  // real department relationship. Only the latest response is applied.
+  useEffect(() => {
+    const requestId = ++employeesRequest.current;
+    const controller = new AbortController();
+    setEmployees([]);
+    setEmployeesLoading(true);
+    setSelectedUserId("");
+    (async () => {
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/api/attendance/department-employees?department_id=${encodeURIComponent(departmentId)}`,
+          { headers, signal: controller.signal },
+        );
+        if (!response.ok) throw new Error(await readError(response, "Unable to load employees."));
+        const data = await response.json();
+        if (requestId !== employeesRequest.current) return;
+        const unique = new Map();
+        (Array.isArray(data) ? data : []).forEach((item) => {
+          if (item?.user_id && item.employee_id && !unique.has(item.user_id)) unique.set(item.user_id, item);
+        });
+        setEmployees([...unique.values()]);
+        setError("");
+      } catch (e) {
+        if (e.name === "AbortError" || requestId !== employeesRequest.current) return;
+        setError(e.message || "Unable to load employees.");
+      } finally {
+        if (requestId === employeesRequest.current) setEmployeesLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [headers, departmentId]);
 
   const filteredEmployees = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -99,20 +140,25 @@ function UserAttendance({ session }) {
 
   const loadAttendance = useCallback(async () => {
     if (!selectedUserId) {
+      calendarRequest.current += 1;
       setCalendar(null);
+      setLoading(false);
       return;
     }
+    const requestId = ++calendarRequest.current;
     setLoading(true);
     setError("");
     try {
       const data = await getEmployeeAttendanceCalendar(selectedUserId, year, month);
+      if (requestId !== calendarRequest.current) return;
       setCalendar(data);
       setJoiningDate(data?.joining_date || null);
     } catch (e) {
+      if (requestId !== calendarRequest.current) return;
       setCalendar(null);
       setError(e.message || "Unable to load attendance.");
     } finally {
-      setLoading(false);
+      if (requestId === calendarRequest.current) setLoading(false);
     }
   }, [selectedUserId, year, month]);
 
@@ -152,6 +198,7 @@ function UserAttendance({ session }) {
       setMonthlyDetailsError("Select an employee first.");
       return;
     }
+    const requestId = ++monthlyRequest.current;
     setMonthlyDetailsLoading(true);
     setMonthlyDetailsError("");
     try {
@@ -161,12 +208,14 @@ function UserAttendance({ session }) {
       );
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body?.detail || "Unable to load monthly attendance details.");
+      if (requestId !== monthlyRequest.current) return;
       setMonthlyDetails(body);
     } catch (err) {
+      if (requestId !== monthlyRequest.current) return;
       setMonthlyDetails(null);
       setMonthlyDetailsError(err?.message || "Unable to load monthly attendance details.");
     } finally {
-      setMonthlyDetailsLoading(false);
+      if (requestId === monthlyRequest.current) setMonthlyDetailsLoading(false);
     }
   }, [selectedUserId, year, month, headers]);
 
@@ -203,7 +252,10 @@ function UserAttendance({ session }) {
   }, [selectedUserId, year, month, headers, selectedEmployee]);
 
   useEffect(() => { loadAttendance(); }, [loadAttendance]);
-  useEffect(() => { setMonthlyDetails(null); setMonthlyDetailsError(""); }, [selectedUserId, year, month]);
+  useEffect(() => {
+    monthlyRequest.current += 1;
+    setMonthlyDetails(null); setMonthlyDetailsError(""); setMonthlyDetailsLoading(false);
+  }, [selectedUserId, year, month]);
 
   // Recorded attendance only (as before); upcoming holidays/leave are not counted.
   const counts = useMemo(() => {
@@ -232,6 +284,23 @@ function UserAttendance({ session }) {
         <div className="card-body">
           <div className="row g-3 align-items-end">
             <div className="col-lg-3 col-md-6">
+              <label className="form-label fw-semibold" htmlFor="ua-department">Department</label>
+              <select
+                id="ua-department"
+                className="form-select"
+                value={departmentId}
+                disabled={departmentsLoading}
+                onChange={(e) => setDepartmentId(e.target.value)}
+              >
+                <option value="all">{departmentsLoading ? "Loading departments..." : "All Departments"}</option>
+                {departments.map((item) => (
+                  <option key={item.id} value={item.id}>{item.department_name || item.name}</option>
+                ))}
+              </select>
+              {departmentsError && <div className="small text-danger mt-1">{departmentsError}</div>}
+              {!departmentsLoading && !departmentsError && departments.length === 0 && <div className="small text-muted mt-1">No departments found.</div>}
+            </div>
+            <div className="col-lg-3 col-md-6">
               <label className="form-label fw-semibold" htmlFor="ua-search">Search employee</label>
               <input
                 id="ua-search"
@@ -241,7 +310,7 @@ function UserAttendance({ session }) {
                 onChange={(e) => setSearch(e.target.value)}
               />
             </div>
-            <div className="col-lg-4 col-md-6">
+            <div className="col-lg-3 col-md-6">
               <label className="form-label fw-semibold" htmlFor="ua-employee">Employee</label>
               <select
                 id="ua-employee"
@@ -250,7 +319,7 @@ function UserAttendance({ session }) {
                 disabled={employeesLoading}
                 onChange={(e) => setSelectedUserId(e.target.value)}
               >
-                <option value="">{employeesLoading ? "Loading employees..." : "Select an employee"}</option>
+                <option value="">{employeesLoading ? "Loading employees..." : filteredEmployees.length ? "Select an employee" : "No employees found"}</option>
                 {filteredEmployees.map((e) => (
                   <option key={e.user_id} value={e.user_id}>
                     {e.name} ({e.employee_id})
@@ -258,7 +327,7 @@ function UserAttendance({ session }) {
                 ))}
               </select>
             </div>
-            <div className="col-lg-3 col-md-6">
+            <div className="col-lg-2 col-md-6">
               <label className="form-label fw-semibold" htmlFor="ua-month">Month</label>
               <select id="ua-month" className="form-select" value={month} onChange={(e) => changeMonth(year, Number(e.target.value))}>
                 {monthOptions(calendarRange, year).map((item) => (
@@ -266,7 +335,7 @@ function UserAttendance({ session }) {
                 ))}
               </select>
             </div>
-            <div className="col-lg-2 col-md-6">
+            <div className="col-lg-1 col-md-6">
               <label className="form-label fw-semibold" htmlFor="ua-year">Year</label>
               <select
                 id="ua-year"
@@ -356,13 +425,26 @@ function UserAttendance({ session }) {
             />
             {monthlyDetailsError && <div className="alert alert-danger mt-3 mb-0" role="alert">{monthlyDetailsError}</div>}
 
-            {monthlyDetails && (
+            {monthlyDetails && (() => {
+              const days = monthlyDetails.days || [];
+              const summary = monthlyDetails.summary || {};
+              const pendingRequests = days.flatMap((day) => day.pending_requests || []);
+              const badgeClass = (status) => {
+                const key = String(status || "").toLowerCase();
+                if (key === "present") return "text-bg-success";
+                if (key === "absent") return "text-bg-danger";
+                if (["leave", "medical leave"].includes(key)) return "text-bg-primary";
+                if (["holiday", "permission"].includes(key)) return "text-bg-warning";
+                if (key === "not marked") return "text-bg-light border";
+                return "text-bg-secondary";
+              };
+              return (
               <section className="mt-4">
                 <div className="d-flex flex-wrap justify-content-between align-items-end gap-2 mb-3">
                   <div>
                     <h5 className="mb-1">Monthly Attendance Details</h5>
                     <div className="text-muted small">
-                      {MONTH_NAMES[monthlyDetails.month - 1]} {monthlyDetails.year} · {monthlyDetails.records.length} recorded day(s)
+                      {MONTH_NAMES[monthlyDetails.month - 1]} {monthlyDetails.year} · {days.length} day(s) · {monthlyDetails.records.length} with attendance records
                     </div>
                   </div>
                   <div className="d-flex flex-wrap gap-3 small">
@@ -370,37 +452,80 @@ function UserAttendance({ session }) {
                     <span><strong>ID:</strong> {monthlyDetails.employee?.employee_id || selectedEmployee.employee_id}</span>
                   </div>
                 </div>
+                <div className="row g-2 mb-3 small">
+                  {[
+                    ["Monthly Permission Count", summary.permission_count ?? 0],
+                    ["Monthly Permission Total Duration", summary.permission_total_text || "00 Hours 00 Minutes"],
+                    ["Medical Leave (ML) Days", summary.medical_leave_days ?? 0],
+                    ["Normal Leave Days", summary.normal_leave_days ?? 0],
+                    ["Pending Requests", summary.pending_request_count ?? 0],
+                  ].map(([label, value]) => (
+                    <div className="col-6 col-lg" key={label}>
+                      <div className="border rounded p-2 h-100"><div className="text-muted">{label}</div><div className="fw-semibold">{value}</div></div>
+                    </div>
+                  ))}
+                </div>
                 <div className="table-responsive border rounded monthly-attendance-scroll" style={{ maxHeight: "480px", overflowY: "auto", overflowX: "auto" }}>
                   <table className="table table-hover table-striped align-middle mb-0">
                     <thead className="table-light">
                       <tr>
                         <th>Date</th>
+                        <th>Day</th>
                         <th>Status</th>
-                        <th>First Check-In</th>
-                        <th>Last Check-Out</th>
+                        <th>Check-In</th>
+                        <th>Check-Out</th>
+                        <th>Attendance Category</th>
+                        <th>Source</th>
+                        <th>Permission</th>
+                        <th>Leave Details</th>
                         <th>Break Duration</th>
                         <th>Break Time List</th>
                         <th>Net Working Time</th>
-                        <th>Attendance Type</th>
-                        <th>Source</th>
+                        <th>Request Status</th>
                         <th>Remarks</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {monthlyDetails.records.map((record) => (
+                      {days.map((record) => (
                         <tr key={record.attendance_date}>
                           <td className="text-nowrap">
                             {new Date(`${record.attendance_date}T00:00:00`).toLocaleDateString("en-IN", {
                               timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric",
                             })}
                           </td>
+                          <td>{record.day}</td>
                           <td>
-                            <span className={`badge ${String(record.status).toLowerCase() === "present" ? "text-bg-success" : String(record.status).toLowerCase() === "absent" ? "text-bg-danger" : ["leave", "holiday"].includes(String(record.status).toLowerCase()) ? "text-bg-warning" : "text-bg-secondary"}`}>
-                              {record.status || "Not Marked"}
-                            </span>
+                            <span className={`badge ${badgeClass(record.status)}`}>{record.status || "Not Marked"}</span>
+                            {record.hr_admin_edited && <div className="mt-1"><span className="badge text-bg-info">HR Admin Edited</span></div>}
+                            {record.holiday_name && <div className="small text-muted">{record.holiday_name}</div>}
                           </td>
-                          <td className="text-nowrap">{formatLocalDateTime(record.first_check_in)}</td>
-                          <td className="text-nowrap">{formatLocalDateTime(record.last_check_out)}</td>
+                          <td className="text-nowrap">{record.check_in_text}</td>
+                          <td className="text-nowrap">{record.check_out_text}</td>
+                          <td>{record.attendance_category}</td>
+                          <td>{record.attendance_source_label || record.attendance_source || "—"}</td>
+                          <td style={{ minWidth: 200 }}>
+                            {record.permissions?.length ? (
+                              <>
+                                {record.permissions.map((item, index) => (
+                                  <div key={`${item.start_time}-${index}`} className="small mb-1">
+                                    <span className="fw-semibold">{item.start_text} – {item.end_text}</span>
+                                    <span className="text-muted"> · {item.duration_text}</span>
+                                    <span className="badge text-bg-success ms-1">{item.status}</span>
+                                    {item.reason && <div className="text-muted">{item.reason}</div>}
+                                  </div>
+                                ))}
+                                {record.permissions.length > 1 && <div className="small text-muted">Total: {record.permission_total_text}</div>}
+                              </>
+                            ) : "—"}
+                          </td>
+                          <td style={{ minWidth: 160 }}>
+                            {record.leave ? (
+                              <>
+                                <span className={`badge ${record.leave.is_medical ? "text-bg-danger" : "text-bg-primary"}`}>{record.leave.leave_type}</span>
+                                <div className="small text-muted">{record.leave.day_part_label}</div>
+                              </>
+                            ) : "—"}
+                          </td>
                           <td className="text-nowrap">{record.break_duration || "0h 00m"}</td>
                           <td style={{ minWidth: 220, whiteSpace: "pre-line" }}>
                             {record.break_intervals?.length
@@ -413,22 +538,57 @@ function UserAttendance({ session }) {
                               : <span className="text-muted small">No qualifying breaks</span>}
                           </td>
                           <td className="text-nowrap">{record.working_duration || "0h 00m"}</td>
-                          <td>{record.attendance_type === "WFH" ? "Work From Home" : record.attendance_type === "OFFICE" ? "Work From Office" : record.attendance_type || "—"}</td>
-                          <td>{record.attendance_source || "—"}</td>
+                          <td>
+                            {record.request_status
+                              ? <span className={`badge ${["Pending", "Under Review"].includes(record.request_status) ? "text-bg-warning" : record.request_status === "Approved" ? "text-bg-success" : "text-bg-secondary"}`}>{record.request_status}</span>
+                              : "—"}
+                          </td>
                           <td style={{ minWidth: 220, whiteSpace: "pre-wrap" }}>{record.remarks || "—"}</td>
                         </tr>
                       ))}
-                      {!monthlyDetails.records.length && (
-                        <tr><td colSpan="10" className="text-center text-muted py-4">No attendance records found for this employee and month.</td></tr>
+                      {!days.length && (
+                        <tr><td colSpan="14" className="text-center text-muted py-4">No dates found for this employee and month.</td></tr>
                       )}
                     </tbody>
                   </table>
                 </div>
-                <p className="small text-muted mt-2 mb-0">
-                  Break details use the existing daily attendance calculation. Only qualifying break intervals reported by that calculation are listed.
+                <p className="small text-muted mt-2 mb-3">
+                  Every date of the month is listed. Break details use the existing daily attendance calculation. Pending requests are shown separately and are not treated as approved attendance.
                 </p>
+
+                <h6 className="mb-2">Pending Requests</h6>
+                {pendingRequests.length === 0 ? (
+                  <div className="text-muted small">No pending attendance or permission requests for this month.</div>
+                ) : (
+                  <div className="table-responsive border rounded">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead className="table-light">
+                        <tr>
+                          <th>Request Date</th><th>Attendance Date</th><th>Request Type</th><th>Requested Status</th>
+                          <th>Check-In / Check-Out</th><th>Permission</th><th>Reason</th><th>Status</th><th>Pending Approver</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pendingRequests.map((item, index) => (
+                          <tr key={`${item.request_type}-${item.request_number}-${item.attendance_date}-${item.permission_start}-${index}`}>
+                            <td className="text-nowrap">{item.request_date}</td>
+                            <td className="text-nowrap">{item.attendance_date}</td>
+                            <td>{item.request_type}{item.request_number ? <div className="small text-muted">{item.request_number}</div> : null}</td>
+                            <td>{item.requested_status || "—"}</td>
+                            <td className="text-nowrap">{item.requested_check_in || item.requested_check_out ? `${item.requested_check_in || "—"} – ${item.requested_check_out || "—"}` : "—"}</td>
+                            <td className="text-nowrap">{item.permission_start || item.permission_end ? `${item.permission_start || "—"} – ${item.permission_end || "—"}` : "—"}</td>
+                            <td style={{ minWidth: 160 }}>{item.reason || "—"}</td>
+                            <td><span className="badge text-bg-warning">{item.status}</span></td>
+                            <td>{item.approval_stage}{item.approver ? <div className="small text-muted">{item.approver}</div> : null}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </section>
-            )}
+              );
+            })()}
 
             {selectedUserId && (
               <AttendanceDayBreakdown

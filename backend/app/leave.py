@@ -49,8 +49,9 @@ audit_logs_collection = db["audit_logs"]
 logger = logging.getLogger(__name__)
 
 APPROVER_ROLES = {"hr admin", "administrator", "hr manager"}
-# Medical Leave (code ML): one day per employee per calendar month; unused entitlement expires monthly.
+# Medical Leave (code ML) keeps its certificate workflow; its allocation is policy-configurable.
 MEDICAL_LEAVE_CODE = "ML"
+# Monthly cap used by attendance request validation (Medical Leave: 1 day/month).
 MEDICAL_LEAVE_DAYS_PER_MONTH = 1
 HR_ADMIN_ROLE = "hr admin"
 # The HOD role keeps its stored identifier "HR Manager" (permissions and
@@ -85,12 +86,33 @@ class LeaveTypeCreate(BaseModel):
 
 class LeavePolicyCreate(BaseModel):
     leave_type_id: str = Field(min_length=1)
-    annual_entitlement: float = Field(ge=0)
+    annual_entitlement: float = Field(default=0, ge=0)
+    allocation_period: str = "annual"
+    monthly_entitlement: float = Field(default=0, ge=0)
+    is_unlimited: bool = False
+    eligible_work_stages: list[str] = Field(default_factory=lambda: ["Probation", "Employee"])
     carry_forward_allowed: bool = False
     max_carry_forward: float = Field(default=0, ge=0)
     accrual_enabled: bool = False
     accrual_frequency: str = "annual"
     is_active: bool = True
+
+    @field_validator("allocation_period")
+    @classmethod
+    def valid_allocation_period(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"monthly", "annual", "unlimited"}:
+            raise ValueError("Allocation period must be monthly, annual or unlimited")
+        return value
+
+    @field_validator("eligible_work_stages")
+    @classmethod
+    def valid_eligible_stages(cls, value: list[str]) -> list[str]:
+        allowed = {"Probation", "Employee"}
+        cleaned = list(dict.fromkeys(str(item).strip().title() for item in value if str(item).strip()))
+        if not set(cleaned).issubset(allowed):
+            raise ValueError("Eligible Work Stages may contain only Probation and Employee.")
+        return cleaned
 
     @field_validator("accrual_frequency")
     @classmethod
@@ -143,11 +165,34 @@ class LeaveTypeUpdate(BaseModel):
 
 class LeavePolicyUpdate(BaseModel):
     annual_entitlement: float | None = Field(default=None, ge=0)
+    allocation_period: str | None = None
+    monthly_entitlement: float | None = Field(default=None, ge=0)
+    is_unlimited: bool | None = None
+    eligible_work_stages: list[str] | None = None
     carry_forward_allowed: bool | None = None
     max_carry_forward: float | None = Field(default=None, ge=0)
     accrual_enabled: bool | None = None
     accrual_frequency: str | None = None
     is_active: bool | None = None
+
+    @field_validator("allocation_period")
+    @classmethod
+    def valid_update_allocation_period(cls, value: str | None) -> str | None:
+        if value is None: return None
+        value = value.strip().lower()
+        if value not in {"monthly", "annual", "unlimited"}:
+            raise ValueError("Allocation period must be monthly, annual or unlimited")
+        return value
+
+    @field_validator("eligible_work_stages")
+    @classmethod
+    def valid_update_eligible_stages(cls, value: list[str] | None) -> list[str] | None:
+        if value is None: return None
+        allowed = {"Probation", "Employee"}
+        cleaned = list(dict.fromkeys(str(item).strip().title() for item in value if str(item).strip()))
+        if not set(cleaned).issubset(allowed):
+            raise ValueError("Eligible Work Stages may contain only Probation and Employee.")
+        return cleaned
 
     @field_validator("accrual_frequency")
     @classmethod
@@ -218,6 +263,8 @@ def ensure_leave_indexes() -> None:
         {"$max": {"value": maximum_id}},
         upsert=True,
     )
+    leave_types_collection.update_many({"code": {"$in": ["CL", "EL", "ML"]}}, {"$set": {"is_paid": True}})
+    leave_types_collection.update_many({"code": "LOP"}, {"$set": {"is_paid": False}})
     company_policy_defaults = LeaveCompanyPolicy().model_dump()
     leave_policies_collection.update_one(
         {"leave_type_id": "__company_policy__"},
@@ -607,6 +654,52 @@ def _get_policy(leave_type_id: str) -> dict[str, Any] | None:
     return leave_policies_collection.find_one({"leave_type_id": leave_type_id, "is_active": True})
 
 
+def _employee_work_stage(user: dict[str, Any]) -> str:
+    details = employee_details_collection.find_one({"user_id": str(user.get("_id"))}, {"work_stage": 1}) or {}
+    value = str(details.get("work_stage") or user.get("work_stage") or "Employee").strip().title()
+    return value if value in {"Probation", "Employee"} else "Employee"
+
+
+def _leave_allocation_period(leave_type: dict[str, Any], policy: dict[str, Any] | None) -> str:
+    if str(leave_type.get("code", "")).upper() == "LOP":
+        return "unlimited"
+    if policy and policy.get("allocation_period") in {"monthly", "annual", "unlimited"}:
+        return str(policy["allocation_period"])
+    if policy and policy.get("accrual_enabled") and policy.get("accrual_frequency") == "monthly":
+        return "monthly"
+    return "annual"
+
+
+def _leave_stage_allowed(user: dict[str, Any], leave_type: dict[str, Any]) -> bool:
+    policy = leave_policies_collection.find_one({"leave_type_id": str(leave_type["_id"])}) or {}
+    eligible = policy.get("eligible_work_stages")
+    if eligible is None:
+        eligible = ["Probation", "Employee"]
+    return _employee_work_stage(user) in eligible
+
+
+def _monthly_leave_usage(user_id: str, leave_type_id: str, year: int, month: int) -> tuple[float, float]:
+    start = date(year, month, 1)
+    end = date(year + (month == 12), (month % 12) + 1, 1)
+    used = pending = 0.0
+    for request in leave_requests_collection.find({
+        "user_id": user_id, "leave_type_id": leave_type_id,
+        "status": {"$in": ["approved", "pending", "pending_hr_admin"]},
+        "from_date": {"$lt": end.isoformat()}, "to_date": {"$gte": start.isoformat()},
+    }):
+        dates = request.get("leave_dates") or []
+        month_dates = [str(value)[:10] for value in dates if str(value)[:7] == f"{year:04d}-{month:02d}"]
+        if not month_dates:
+            continue
+        day_value = 0.5 if request.get("day_part") in {"first_half", "second_half"} else 1.0
+        amount = len(month_dates) * day_value
+        if request.get("status") == "approved":
+            used += amount
+        else:
+            pending += amount
+    return round(used, 2), round(pending, 2)
+
+
 def _employee_id_for_user(user: dict[str, Any]) -> str | None:
     value = user.get("employee_id")
     return str(value).strip() if value else None
@@ -626,25 +719,6 @@ def _add_months(value: date, months: int) -> date:
 
 def _is_medical_leave_type(leave_type: dict[str, Any]) -> bool:
     return str(leave_type.get("code", "")).strip().upper() == MEDICAL_LEAVE_CODE
-
-
-def _medical_entitlement(user: dict[str, Any], entitlement: float) -> float:
-    """Annual ceiling backing a monthly one-day Medical Leave entitlement.
-
-    Actual availability is enforced per calendar month by attendance_requests;
-    this annual ceiling is retained for compatibility with existing balance UI.
-    """
-    yearly = float(MEDICAL_LEAVE_DAYS_PER_MONTH * 12)
-    policy = _company_policy()
-    if policy.get("sick_leave_before_probation_allowed"):
-        return yearly
-    joining = _joining_date(user)
-    if not joining:
-        return 0.0
-    eligible_from = _add_months(joining, int(policy["probation_period_months"]))
-    if company_now().date() < eligible_from:
-        return 0.0
-    return yearly
 
 
 def _holiday_dates(user: dict[str, Any], start: date, end: date) -> set[date]:
@@ -746,7 +820,7 @@ def _ensure_balance(user_id: str, leave_type_id: str, year: int) -> dict[str, An
 def _effective_entitled(balance: dict[str, Any], policy: dict[str, Any] | None, year: int) -> float:
     base = float(balance.get("annual_entitlement", balance.get("entitled", 0)))
     carry = float(balance.get("carry_forward", 0))
-    if not policy or not policy.get("accrual_enabled") or policy.get("accrual_frequency") == "annual" or year != datetime.now(timezone.utc).year:
+    if (not policy or policy.get("allocation_period") in {"monthly", "annual", "unlimited"} or not policy.get("accrual_enabled") or policy.get("accrual_frequency") == "annual" or year != datetime.now(timezone.utc).year):
         return base + carry
     now = datetime.now(timezone.utc)
     if policy.get("accrual_frequency") == "monthly":
@@ -759,30 +833,22 @@ def _effective_entitled(balance: dict[str, Any], policy: dict[str, Any] | None, 
 def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
     policy = _get_policy(str(balance["leave_type_id"]))
     entitled = _effective_entitled(balance, policy, int(balance["year"]))
-    is_medical = _is_medical_leave_type(leave_type)
     used = float(balance.get("used", 0))
     pending = float(balance.get("pending", 0))
-    carry_forward = 0.0 if is_medical else float(balance.get("carry_forward", 0))
-    if is_medical:
-        entitled = _medical_entitlement(user, entitled)
-        # The balance shown to employees is the current calendar month's
-        # entitlement, not the annual accounting ceiling of 12 days.
-        try:
-            from app.attendance_requests import _month_context, _month_usage
-            current_month = company_now().date()
-            usage = _month_usage(user, _month_context(user, current_month.year, current_month.month))
-            used = float(usage["medical_leave_used"])
-            pending = 0.0
-            monthly_entitled = float(MEDICAL_LEAVE_DAYS_PER_MONTH) if entitled else 0.0
-            available = max(monthly_entitled - used, 0.0)
-            displayed_entitled = monthly_entitled
-        except Exception:
-            displayed_entitled = float(MEDICAL_LEAVE_DAYS_PER_MONTH) if entitled else 0.0
-            available = max(displayed_entitled - used - pending, 0.0)
-    else:
-        displayed_entitled = entitled
-        available = max(entitled - used - pending, 0.0)
-    return {"id": str(balance["_id"]), "leave_type_id": str(balance["leave_type_id"]), "code": leave_type.get("code"), "name": leave_type.get("name"), "is_paid": leave_type.get("is_paid", True), "entitled": round(displayed_entitled, 2), "annual_entitlement": float(balance.get("annual_entitlement", entitled)), "carry_forward": carry_forward, "used": round(used, 2), "pending": round(pending, 2), "available": round(available, 2), "year": balance["year"], "accrual_enabled": bool(policy and policy.get("accrual_enabled"))}
+    carry_forward = float(balance.get("carry_forward", 0))
+    displayed_entitled = entitled
+    available = max(entitled - used - pending, 0.0)
+    allocation_period = _leave_allocation_period(leave_type, policy)
+    monthly_entitlement = float((policy or {}).get("monthly_entitlement", 0) or 0)
+    if allocation_period == "monthly":
+        now_local = company_now().date()
+        used, pending = _monthly_leave_usage(str(user["_id"]), str(balance["leave_type_id"]), now_local.year, now_local.month)
+        displayed_entitled = monthly_entitlement
+        available = max(displayed_entitled - used - pending, 0.0)
+    elif allocation_period == "unlimited":
+        displayed_entitled = "Unlimited"
+        available = "Unlimited"
+    return {"id": str(balance["_id"]), "leave_type_id": str(balance["leave_type_id"]), "code": leave_type.get("code"), "name": leave_type.get("name"), "is_paid": leave_type.get("is_paid", True), "allocation_period": allocation_period, "monthly_entitlement": monthly_entitlement, "entitled": displayed_entitled if isinstance(displayed_entitled, str) else round(displayed_entitled, 2), "allocated": displayed_entitled if isinstance(displayed_entitled, str) else round(displayed_entitled, 2), "annual_entitlement": float(balance.get("annual_entitlement", entitled)), "carry_forward": carry_forward, "used": round(used, 2), "pending": round(pending, 2), "available": available if isinstance(available, str) else round(available, 2), "year": balance["year"], "accrual_enabled": bool(policy and policy.get("accrual_enabled")), "eligible_work_stages": (policy or {}).get("eligible_work_stages", ["Probation", "Employee"])}
 
 
 def _can_cancel(record: dict[str, Any], viewer: dict[str, Any] | None) -> bool:
@@ -963,8 +1029,11 @@ def startup_leave_module():
 
 @router.get("/types")
 def list_leave_types(authorization: str | None = Header(default=None)):
-    _current_user(authorization)
-    return [_serialize(record) for record in leave_types_collection.find({"is_active": True}).sort("name", 1)]
+    user = _current_user(authorization)
+    records = list(leave_types_collection.find({"is_active": True}).sort("name", 1))
+    if not _is_admin_or_hr(user):
+        records = [record for record in records if _leave_stage_allowed(user, record)]
+    return [_serialize(record) for record in records]
 
 
 @router.get("/balance")
@@ -975,6 +1044,8 @@ def get_leave_balance(authorization: str | None = Header(default=None), year: in
         raise HTTPException(status_code=400, detail="Invalid year")
     response_data = []
     for leave_type in leave_types_collection.find({"is_active": True}).sort("name", 1):
+        if not _is_admin_or_hr(user) and not _leave_stage_allowed(user, leave_type):
+            continue
         balance = _ensure_balance(str(user["_id"]), str(leave_type["_id"]), target_year)
         response_data.append(_balance_response(balance, leave_type, user))
     return response_data
@@ -1033,19 +1104,6 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
         if payload.from_date != payload.to_date:
             raise HTTPException(status_code=400, detail="Half-day leave can be applied for a single date only")
     company_policy = _company_policy()
-    if _is_medical_leave_type(leave_type) and not company_policy.get("sick_leave_before_probation_allowed"):
-        joining = _joining_date(user)
-        if joining is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Your date of joining is missing. Please ask HR Admin to update your employee profile before applying for Medical Leave.",
-            )
-        eligible_from = _add_months(joining, int(company_policy["probation_period_months"]))
-        if company_now().date() < eligible_from:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Medical Leave is available after your {company_policy['probation_period_months']}-month probation period. Eligibility begins on {eligible_from.isoformat()}.",
-            )
     requires_medical_certificate = (
         company_policy.get("medical_certificate_required")
         and _is_medical_leave_type(leave_type)
@@ -1097,14 +1155,28 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     user_id = str(user["_id"])
     if _overlap_exists(user_id, payload.from_date, payload.to_date):
         raise HTTPException(status_code=409, detail="You already have pending or approved leave overlapping these dates")
+    if not _leave_stage_allowed(user, leave_type):
+        raise HTTPException(status_code=403, detail=f"{leave_type.get('name', 'This leave type')} is not available for your current Work Stage ({_employee_work_stage(user)}). Contact HR Admin if your Work Stage is incorrect.")
     balance = _ensure_balance(user_id, payload.leave_type_id, payload.from_date.year)
-    policy = _get_policy(payload.leave_type_id)
-    entitled = _effective_entitled(balance, policy, payload.from_date.year)
-    if _is_medical_leave_type(leave_type):
-        entitled = _medical_entitlement(user, entitled)
-    available = entitled - float(balance.get("used", 0)) - float(balance.get("pending", 0))
-    if leave_type.get("is_paid", True) and days > available:
-        raise HTTPException(status_code=400, detail=f"Insufficient {leave_type.get('name', 'leave')} balance. Available: {available:g} day(s).")
+    policy = _get_policy(payload.leave_type_id) or {}
+    allocation_period = _leave_allocation_period(leave_type, policy)
+    if leave_type.get("is_paid", True) and allocation_period == "monthly":
+        monthly_limit = float(policy.get("monthly_entitlement", 0) or 0)
+        if monthly_limit <= 0:
+            raise HTTPException(status_code=400, detail=f"A monthly allocation must be configured for {leave_type.get('name', 'this leave type')}.")
+        requested_by_month: dict[int, float] = {}
+        for selected_day in working_dates:
+            requested_by_month[selected_day.month] = requested_by_month.get(selected_day.month, 0.0) + (0.5 if payload.day_part != "full_day" else 1.0)
+        for selected_month, requested_month_days in requested_by_month.items():
+            used_month, pending_month = _monthly_leave_usage(user_id, payload.leave_type_id, payload.from_date.year, selected_month)
+            if used_month + pending_month + requested_month_days > monthly_limit + 1e-9:
+                available_month = max(monthly_limit - used_month - pending_month, 0.0)
+                raise HTTPException(status_code=400, detail=f"Insufficient {leave_type.get('name', 'leave')} balance for {calendar.month_name[selected_month]}. Available: {available_month:g} day(s).")
+    else:
+        entitled = _effective_entitled(balance, policy, payload.from_date.year)
+        available = entitled - float(balance.get("used", 0)) - float(balance.get("pending", 0))
+        if leave_type.get("is_paid", True) and allocation_period != "unlimited" and days > available:
+            raise HTTPException(status_code=400, detail=f"Insufficient {leave_type.get('name', 'leave')} balance. Available: {available:g} day(s).")
     now = datetime.now(timezone.utc)
     # Single approver from the applicant's role, assignments and working-day count.
     approval_stage, approver = resolve_leave_approver(user, days)
@@ -1378,6 +1450,8 @@ def create_leave_type(payload: LeaveTypeCreate, authorization: str | None = Head
         raise HTTPException(status_code=409, detail="Leave type code already exists")
     now = datetime.now(timezone.utc)
     record = {**payload.model_dump(), "code": code, "created_at": now, "updated_at": now}
+    if code in {"CL", "EL", "ML"}: record["is_paid"] = True
+    if code == "LOP": record["is_paid"] = False
     result = leave_types_collection.insert_one(record)
     record["_id"] = result.inserted_id
     _audit(user, "LEAVE_TYPE_CREATED", str(result.inserted_id), {"code": code})
@@ -1391,6 +1465,9 @@ def update_leave_type(leave_type_id: str, payload: LeaveTypeUpdate, authorizatio
         raise HTTPException(status_code=403, detail="Only HR/Admin can manage leave types")
     object_id = _parse_object_id(leave_type_id, "leave type")
     values = {k: v for k, v in payload.model_dump().items() if v is not None}
+    code = str(leave_types_collection.find_one({"_id": object_id}, {"code": 1}).get("code") or "").upper()
+    if code in {"CL", "EL", "ML"}: values["is_paid"] = True
+    if code == "LOP": values["is_paid"] = False
     if "name" in values:
         values["name"] = values["name"].strip()
     values["updated_at"] = datetime.now(timezone.utc)
@@ -1421,8 +1498,15 @@ def create_or_update_policy(payload: LeavePolicyCreate, authorization: str | Non
     _get_leave_type(payload.leave_type_id, active_only=False)
     now = datetime.now(timezone.utc)
     values = payload.model_dump()
-    if _is_medical_leave_type(_get_leave_type(payload.leave_type_id, active_only=False)):
-        values.update({"annual_entitlement": 12, "carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False, "accrual_frequency": "annual"})
+    selected_type = _get_leave_type(payload.leave_type_id, active_only=False)
+    if values.get("allocation_period") == "monthly" and float(values.get("monthly_entitlement", 0) or 0) <= 0:
+        raise HTTPException(status_code=422, detail="Configure a monthly leave allocation greater than zero.")
+    if str(selected_type.get("code", "")).upper() == "LOP":
+        values.update({"allocation_period": "unlimited", "is_unlimited": True, "annual_entitlement": 0, "monthly_entitlement": 0})
+    else:
+        values["is_unlimited"] = False
+        if values.get("allocation_period") == "monthly":
+            values.update({"carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False})
     values["updated_at"] = now
     leave_policies_collection.update_one({"leave_type_id": payload.leave_type_id}, {"$set": values, "$setOnInsert": {"created_at": now}}, upsert=True)
     record = leave_policies_collection.find_one({"leave_type_id": payload.leave_type_id})
@@ -1437,8 +1521,18 @@ def update_policy(leave_type_id: str, payload: LeavePolicyUpdate, authorization:
         raise HTTPException(status_code=403, detail="Only HR/Admin can manage leave policies")
     _get_leave_type(leave_type_id, active_only=False)
     values = {k: v for k, v in payload.model_dump().items() if v is not None}
-    if _is_medical_leave_type(_get_leave_type(leave_type_id, active_only=False)):
-        values.update({"annual_entitlement": 12, "carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False, "accrual_frequency": "annual"})
+    selected_type = _get_leave_type(leave_type_id, active_only=False)
+    current_policy = leave_policies_collection.find_one({"leave_type_id": leave_type_id}) or {}
+    if values.get("allocation_period", current_policy.get("allocation_period")) == "monthly":
+        monthly_value = values.get("monthly_entitlement", current_policy.get("monthly_entitlement", 0))
+        if float(monthly_value or 0) <= 0:
+            raise HTTPException(status_code=422, detail="Configure a monthly leave allocation greater than zero.")
+    if str(selected_type.get("code", "")).upper() == "LOP":
+        values.update({"allocation_period": "unlimited", "is_unlimited": True, "annual_entitlement": 0, "monthly_entitlement": 0})
+    elif "allocation_period" in values:
+        values["is_unlimited"] = False
+        if values.get("allocation_period") == "monthly":
+            values.update({"carry_forward_allowed": False, "max_carry_forward": 0, "accrual_enabled": False})
     values["updated_at"] = datetime.now(timezone.utc)
     leave_policies_collection.update_one({"leave_type_id": leave_type_id}, {"$set": values, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}}, upsert=True)
     record = leave_policies_collection.find_one({"leave_type_id": leave_type_id})
@@ -1492,10 +1586,31 @@ def leave_dashboard(authorization: str | None = Header(default=None), year: int 
             summary["approved_days"] += days
         code_record = leave_types_collection.find_one({"_id": _parse_object_id(item["leave_type_id"], "leave type")})
         code = code_record.get("code", "Unknown") if code_record else "Unknown"
-        by_type[code] = by_type.get(code, 0) + days
+        if state == "approved":
+            by_type[code] = by_type.get(code, 0) + days
     summary["total_days"] = round(summary["total_days"], 2)
     summary["approved_days"] = round(summary["approved_days"], 2)
-    return {"year": target_year, "summary": summary, "days_by_leave_type": by_type}
+    balance_rows = []
+    for leave_type in leave_types_collection.find({"is_active": True}).sort("name", 1):
+        if not _leave_stage_allowed(user, leave_type):
+            continue
+        balance = _ensure_balance(str(user["_id"]), str(leave_type["_id"]), target_year)
+        balance_rows.append(_balance_response(balance, leave_type, user))
+    paid_rows = [row for row in balance_rows if row.get("is_paid")]
+    unpaid_used = sum(float(row.get("used", 0) or 0) for row in balance_rows if not row.get("is_paid"))
+    def numeric(value):
+        try: return float(value)
+        except (TypeError, ValueError): return 0.0
+    paid_allocated = sum(numeric(row.get("allocated")) for row in paid_rows)
+    paid_used = sum(numeric(row.get("used")) for row in paid_rows)
+    paid_pending = sum(numeric(row.get("pending")) for row in balance_rows)
+    paid_available = sum(numeric(row.get("available")) for row in paid_rows)
+    summary["paid_leave_allocated"] = round(paid_allocated, 2)
+    summary["paid_leave_used"] = round(paid_used, 2)
+    summary["pending_leave_days"] = round(paid_pending, 2)
+    summary["remaining_paid_leave"] = round(paid_available, 2)
+    summary["unpaid_leave_used"] = round(unpaid_used, 2)
+    return {"year": target_year, "summary": summary, "days_by_leave_type": by_type, "leave_type_balances": balance_rows}
 
 
 @router.get("/reports")

@@ -71,6 +71,7 @@ def serialize_details(record: dict | None) -> dict:
             "date_of_birth": None,
             "blood_group": "",
             "date_of_joining": None,
+            "work_stage": "Employee",
             "work_field": "",
             "nationality": "",
             "address": "",
@@ -88,6 +89,7 @@ def serialize_details(record: dict | None) -> dict:
         "date_of_birth": serialize_date(record.get("date_of_birth")),
         "blood_group": record.get("blood_group") or "",
         "date_of_joining": serialize_date(record.get("date_of_joining")),
+        "work_stage": record.get("work_stage") if record.get("work_stage") in {"Probation", "Employee"} else "Employee",
         "work_field": record.get("work_field") or "",
         "nationality": record.get("nationality") or "",
         "address": record.get("address") or "",
@@ -186,6 +188,7 @@ class EmployeeExtraDetailsPayload(BaseModel):
     date_of_birth: date | None = None
     blood_group: str = ""
     date_of_joining: date | None = None
+    work_stage: str = "Employee"
     work_field: str = ""
     nationality: str = ""
     address: str = ""
@@ -197,6 +200,14 @@ class EmployeeExtraDetailsPayload(BaseModel):
     city: str = ""
     state: str = ""
     country: str = ""
+
+    @field_validator("work_stage")
+    @classmethod
+    def validate_work_stage(cls, value: str) -> str:
+        value = (value or "Employee").strip().title()
+        if value not in {"Probation", "Employee"}:
+            raise ValueError("Work Stage must be Probation or Employee.")
+        return value
 
     @field_validator("blood_group")
     @classmethod

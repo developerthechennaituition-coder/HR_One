@@ -189,6 +189,10 @@ function normalizeEmployeeDetails(data) {
       details?.date_of_joining ||
       "",
 
+    work_stage:
+      details?.work_stage ||
+      "Employee",
+
     work_field:
       details?.work_field ||
       "",
@@ -897,6 +901,9 @@ export default function EmployeeDetails({
       date_of_joining:
         employee?.date_of_joining ||
         null,
+
+      work_stage:
+        employee?.work_stage || "Employee",
 
       work_field:
         employee?.work_field || "",
@@ -1619,7 +1626,7 @@ export default function EmployeeDetails({
           />
 
           <Field
-            label="Religion (optional)"
+            label="Religion"
             name="religion"
             value={employee.religion}
             editing={isEditing}
@@ -1703,6 +1710,15 @@ export default function EmployeeDetails({
             value={
               employee.date_of_joining
             }
+            editing={isEditing}
+            onChange={handleChange}
+          />
+
+          <SelectField
+            label="Work Stage"
+            name="work_stage"
+            value={employee.work_stage || "Employee"}
+            options={["Probation", "Employee"]}
             editing={isEditing}
             onChange={handleChange}
           />

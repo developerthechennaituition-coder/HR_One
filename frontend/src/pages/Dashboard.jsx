@@ -64,7 +64,7 @@ export default function Dashboard({ session, user, onNavigate }) {
 
   const name = me.name || me.full_name || me.employee_name || "there";
   const initials = name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase();
-  const activeEmployees = employees.filter((e) => e.is_active !== false && String(e.status || "active").toLowerCase() !== "inactive").length;
+  const activeEmployees = users.filter((e) => e.is_active !== false && String(e.status || "active").toLowerCase() !== "inactive").length;
   const activeUsers = users.filter((u) => u.is_active !== false && String(u.status || "active").toLowerCase() !== "inactive").length;
   const present = attendance.filter((a) => { const s = String(a.status || a.attendance_status || "").toLowerCase(); return s === "present" || s === "late" || Boolean(a.check_in || a.check_in_time); }).length;
   const quickLinks = admin ? [

@@ -42,6 +42,7 @@ import re
 import secrets
 import hashlib
 import smtplib
+import calendar
 from email.message import EmailMessage
 from urllib.parse import quote, urlsplit
 from datetime import date, datetime, time, timedelta, timezone
@@ -3030,7 +3031,8 @@ def save_attendance(
                     "user_id": user_id, "employee_id": user.get("employee_id", ""), "employee_name": user.get("name", ""),
                     "attendance_date": payload.attendance_date, "changes": change_details,
                     "reason": (payload.modification_reason or "Attendance leave correction by HR Admin").strip(),
-                    "modified_by": marked_by, "modified_at": now,
+                    "modified_by": marked_by, "modified_by_name": admin.get("name") or admin.get("work_email") or "HR Admin",
+                    "modified_by_role": str(admin.get("role") or ""), "modified_at": now,
                 })
                 from app.notifications import create_system_notification
                 create_system_notification(
@@ -3259,7 +3261,8 @@ def save_attendance(
                 "user_id": user_id, "employee_id": user.get("employee_id", ""),
                 "employee_name": user.get("name", ""), "attendance_date": payload.attendance_date,
                 "changes": changed_fields, "reason": (payload.modification_reason or payload.permission_reason or "Attendance correction by HR Admin").strip(),
-                "modified_by": marked_by, "modified_at": now,
+                "modified_by": marked_by, "modified_by_name": admin.get("name") or admin.get("work_email") or "HR Admin",
+                "modified_by_role": str(admin.get("role") or ""), "modified_at": now,
             })
             audit_logs_collection.insert_one({
                 "user_id": marked_by, "action": "attendance.admin_modified",
@@ -3342,7 +3345,7 @@ def save_attendance(
 
 
 # ---------------------------------------------------------------------------
-# Historical attendance modification (previous three completed months only)
+# Historical attendance: read from joining month; modify previous three completed months and prior current-month dates
 # ---------------------------------------------------------------------------
 
 class HistoricalAttendanceUpdate(BaseModel):
@@ -3364,6 +3367,26 @@ def _historical_month_window(today: date) -> tuple[date, date]:
     month_index = today.year * 12 + today.month - 1 - 3
     allowed_start = date(month_index // 12, month_index % 12 + 1, 1)
     return allowed_start, current_start
+
+
+def _validate_historical_read_month(user: dict[str, Any], year: int, month: int) -> tuple[date, date]:
+    today = company_today()
+    if month < 1 or month > 12 or year < 2000:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid month or year.")
+    selected_start = date(year, month, 1)
+    current_start = date(today.year, today.month, 1)
+    joining_value = user.get("joining_date")
+    if isinstance(joining_value, datetime):
+        joining_value = joining_value.date()
+    elif isinstance(joining_value, str):
+        try:
+            joining_value = date.fromisoformat(joining_value[:10])
+        except ValueError:
+            joining_value = None
+    if selected_start > current_start or (joining_value and selected_start < date(joining_value.year, joining_value.month, 1)):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a month between the employee's joining month and the current month.")
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return selected_start, end
 
 
 def _require_historical_attendance_permission(authorization: str | None) -> dict[str, Any]:
@@ -3406,7 +3429,7 @@ def _validate_historical_month(year: int, month: int) -> tuple[date, date]:
     if selected_start < start or selected_start >= current_start:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Only the previous three completed calendar months are available for historical attendance modification. Current month and older months are excluded.",
+            "Attendance modification is available only for the previous three completed months. The current month is view-only.",
         )
     end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
     return selected_start, end
@@ -3420,12 +3443,12 @@ def get_historical_attendance_month(
     authorization: str | None = Header(default=None),
 ):
     _require_historical_attendance_permission(authorization)
-    start, end = _validate_historical_month(year, month)
     if not ObjectId.is_valid(user_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
     employee = users_collection.find_one({"_id": ObjectId(user_id), "is_active": True})
     if not employee:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
+    start, end = _validate_historical_read_month(employee, year, month)
     _sync_leave_for_user_range(user_id, start.isoformat(), (end - timedelta(days=1)).isoformat())
     records = {
         str(item.get("attendance_date", ""))[:10]: item
@@ -3439,9 +3462,18 @@ def get_historical_attendance_month(
     holidays = _holiday_dates(employee, start, end - timedelta(days=1))
     weekly_offs = company_weekly_off_weekdays()
     rows = []
-    cursor = start
+    employee_id = str(employee.get("employee_id") or "")
+    payroll = db["monthly_payroll_records"].find_one(
+        {"employee_id": employee_id, "period": f"{year:04d}-{month:02d}"},
+        {"status": 1},
+    ) if employee_id else None
+    payroll_status = (payroll or {}).get("status")
+    payroll_locked = payroll_status in {"Approved", "Processed", "Paid"}
+    modifiable_start, current_month_start = _historical_month_window(company_today())
+    month_in_edit_window = modifiable_start <= start < current_month_start
     today = company_today()
-    while cursor < end and cursor <= today:
+    cursor = start
+    while cursor < end and cursor < today:
         date_iso = cursor.isoformat()
         record = records.get(date_iso) or {}
         details = _calculate_daily_attendance(user_id, cursor, employee)
@@ -3460,9 +3492,17 @@ def get_historical_attendance_month(
             "permission_start_time": permission.get("start_time"),
             "permission_end_time": permission.get("end_time"),
             "permission_reason": permission.get("reason"),
+            "working_duration": details.get("working_duration") or details.get("total_working_duration") or "0h 00m",
+            "break_duration": details.get("break_duration") or "0h 00m",
+            "outside_duration": details.get("outside_duration") or "0h 00m",
+            "working_intervals": details.get("working_intervals") or [],
+            "break_intervals": details.get("break_intervals") or [],
+            "attendance_state": details.get("attendance_state"),
             "updated_at": record.get("updated_at"),
-            "has_modification_permission": True,
             "is_before_joining": bool(employee.get("joining_date") and date_iso < str(employee.get("joining_date"))[:10]),
+            "payroll_status": payroll_status,
+            "payroll_locked": payroll_locked,
+            "can_modify": bool(month_in_edit_window and not payroll_locked and cursor < today and not (employee.get("joining_date") and date_iso < str(employee.get("joining_date"))[:10])),
         })
         cursor += timedelta(days=1)
     return {
@@ -3481,22 +3521,64 @@ def get_historical_attendance_audit_history(
 ):
     _require_historical_attendance_permission(authorization)
     selected = _validate_date(attendance_date)
-    _validate_historical_month(selected.year, selected.month)
     if not ObjectId.is_valid(user_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
+    employee = users_collection.find_one({"_id": ObjectId(user_id), "is_active": True})
+    if not employee:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
+    _validate_historical_read_month(employee, selected.year, selected.month)
     rows = list(db["attendance_modification_history"].find({
         "user_id": user_id,
         "attendance_date": selected.isoformat(),
     }).sort("modified_at", -1))
+    # Resolve display names for the actors and permission approvers so the UI
+    # never has to show raw user ids. Leave-correction rows were saved without
+    # the actor's name.
+    def permission_pairs(changes: Any):
+        permission = changes.get("permission") if isinstance(changes, dict) else None
+        for side in ("before", "after"):
+            value = permission.get(side) if isinstance(permission, dict) else None
+            if isinstance(value, dict):
+                yield value
+
+    wanted_ids = set()
+    for row in rows:
+        if not row.get("modified_by_name") and row.get("modified_by"):
+            wanted_ids.add(str(row["modified_by"]))
+        for permission in permission_pairs(row.get("changes")):
+            if permission.get("approved_by"):
+                wanted_ids.add(str(permission["approved_by"]))
+    user_names = {
+        str(item["_id"]): item.get("name") or item.get("work_email") or ""
+        for item in users_collection.find(
+            {"_id": {"$in": [ObjectId(value) for value in wanted_ids if ObjectId.is_valid(value)]}},
+            {"name": 1, "work_email": 1},
+        )
+    } if wanted_ids else {}
     result = []
     for row in rows:
+        modified_by = str(row.get("modified_by", "") or "")
+        changes = _utc_iso(row.get("changes", {}))
+        for permission in permission_pairs(changes):
+            approver = str(permission.get("approved_by") or "")
+            permission["approved_by_name"] = user_names.get(approver, "") if approver else ""
+        modified_at_value = row.get("modified_at")
+        if isinstance(modified_at_value, datetime):
+            if modified_at_value.tzinfo is None:
+                modified_at_value = modified_at_value.replace(tzinfo=timezone.utc)
+            modified_at_ist = modified_at_value.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M:%S %p IST")
+        else:
+            modified_at_ist = ""
         result.append({
             "id": str(row.get("_id")),
-            "changes": row.get("changes", {}),
+            "changes": changes,
             "reason": row.get("reason", ""),
-            "modified_by": row.get("modified_by", ""),
-            "modified_by_name": row.get("modified_by_name", ""),
-            "modified_at": row.get("modified_at"),
+            "modified_by": modified_by,
+            "modified_by_name": row.get("modified_by_name") or user_names.get(modified_by, ""),
+            # Stored as UTC (``datetime.now(timezone.utc)``) but PyMongo returns
+            # it naive. Send an explicit offset so clients convert it exactly once.
+            "modified_at": _utc_iso(row.get("modified_at")),
+            "modified_at_ist": modified_at_ist,
         })
     return result
 
@@ -3509,6 +3591,8 @@ def modify_historical_attendance(
     actor = _require_historical_attendance_permission(authorization)
     selected = _validate_date(payload.attendance_date)
     _validate_historical_month(selected.year, selected.month)
+    if selected >= company_today():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Today's attendance cannot be modified from Historical Attendance. Use Daily Attendance for today's record.")
     if not ObjectId.is_valid(payload.user_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
     employee = users_collection.find_one({"_id": ObjectId(payload.user_id), "is_active": True})
@@ -3633,6 +3717,7 @@ def modify_historical_attendance(
         "reason": payload.modification_reason.strip(),
         "modified_by": str(actor["_id"]),
         "modified_by_name": actor_name,
+        "modified_by_role": str(actor.get("role") or ""),
         "modified_at": now,
     })
     audit_logs_collection.insert_one({
@@ -3644,6 +3729,8 @@ def modify_historical_attendance(
     })
     try:
         from app.notifications import create_system_notification
+        from zoneinfo import ZoneInfo
+        modified_at_ist = now.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y %I:%M:%S %p IST")
         def display(value):
             if value is None or value == "":
                 return "—"
@@ -3656,7 +3743,7 @@ def modify_historical_attendance(
         )
         create_system_notification(
             title="Historical Attendance Modified",
-            message=f"Hello {employee.get('name', 'Employee')}, your attendance for {selected.isoformat()} was modified by {actor_name}.\n{details}\nReason: {payload.modification_reason.strip()}\nModified at: {now.isoformat()}",
+            message=f"Hello {employee.get('name', 'Employee')}, your attendance for {selected.isoformat()} was modified by {actor_name}.\n{details}\nReason: {payload.modification_reason.strip()}\nModified at: {modified_at_ist}",
             validity=timedelta(days=90),
             event_key=f"attendance-historical-modify:{modification_id}",
             user_ids=[payload.user_id],
@@ -3798,6 +3885,210 @@ def list_attendance_employees(
     return rows
 
 
+
+
+def _utc_iso(value: Any) -> Any:
+    """Serialize datetimes as explicit-UTC ISO strings (recursively).
+
+    PyMongo returns naive datetimes for values stored in UTC. Naive ISO strings
+    are ambiguous for clients, so attach the UTC offset before sending them.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, dict):
+        return {key: _utc_iso(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_utc_iso(item) for item in value]
+    return value
+
+
+def _department_key(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\u2013", "-").replace("\u2014", "-")).strip().casefold()
+
+
+def _department_directory() -> tuple[dict[str, str], dict[str, set[str]], dict[str, str]]:
+    """Department master: ``({id: name}, {normalised alias: {ids}}, {any id: canonical id})``.
+
+    Aliases cover the full name ("IT - Information Technology") and its two
+    halves ("IT", "Information Technology"), because employee records store
+    the department as free text, as a display name or as an id. Departments
+    with the same name in several companies collapse into one entry.
+    A record that has no ``is_active`` flag is treated as active.
+    """
+    names: dict[str, str] = {}
+    canonical: dict[str, str] = {}
+    by_name: dict[str, str] = {}
+    aliases: dict[str, set[str]] = {}
+    for record in db["departments"].find({"is_active": {"$ne": False}}):
+        record_id = str(record["_id"])
+        configured_id = str(record.get("department_id") or "").strip()
+        name = str(record.get("department_name") or record.get("name") or "").strip()
+        if not name:
+            continue
+        name_key = _department_key(name)
+        department_id = by_name.setdefault(name_key, record_id)
+        canonical[record_id] = department_id
+        if configured_id:
+            canonical[configured_id] = department_id
+        if department_id != record_id:
+            continue
+        names[department_id] = name
+        keys = {name_key}
+        for separator in (" - ", " \u2013 ", " \u2014 "):
+            if separator in name:
+                head, tail = name.split(separator, 1)
+                keys.update({_department_key(head), _department_key(tail)})
+        for key in keys:
+            if key:
+                aliases.setdefault(key, set()).add(department_id)
+    return names, aliases, canonical
+
+
+def _resolve_department_id(
+    candidates: list[Any],
+    names: dict[str, str],
+    aliases: dict[str, set[str]],
+    canonical: dict[str, str] | None = None,
+) -> str:
+    """First candidate (reference ids before display names) that maps to exactly one department."""
+    canonical = canonical or {}
+    for raw in candidates:
+        if isinstance(raw, dict):
+            raw = raw.get("id") or raw.get("_id") or raw.get("department_id") or raw.get("department_name") or raw.get("name")
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if text in canonical:
+            return canonical[text]
+        if text in names:
+            return text
+        matches = aliases.get(_department_key(text), set())
+        if len(matches) == 1:
+            return next(iter(matches))
+    return ""
+
+
+def _load_department_employees() -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Every active employee resolved to a department, plus the full department list.
+
+    Departments come from the Department master (Organization Setup) *and* from
+    the department text on employee records. Employee Details accepts free-text
+    departments, so departments that were never created in the master would
+    otherwise be invisible. Those are listed under a ``name:<text>`` id.
+    """
+    names, aliases, canonical = _department_directory()
+    users = list(users_collection.find({"is_active": {"$ne": False}}))
+    employee_codes = [str(user.get("employee_id") or "").strip() for user in users if user.get("employee_id")]
+    master_by_code = {
+        str(item.get("employee_id") or "").strip().casefold(): item
+        for item in db["employees"].find({"employee_id": {"$in": employee_codes}})
+    } if employee_codes else {}
+    details_by_user = {
+        str(item.get("user_id")): item
+        for item in db["employee_details"].find({"user_id": {"$in": [str(user["_id"]) for user in users]}})
+    } if users else {}
+
+    departments = dict(names)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for user in users:
+        user_id = str(user["_id"])
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        code = str(user.get("employee_id") or "").strip()
+        master = master_by_code.get(code.casefold(), {})
+        details = details_by_user.get(user_id, {})
+        resolved_id = _resolve_department_id(
+            [
+                user.get("department_id"), details.get("department_id"), master.get("department_id"),
+                user.get("department"), details.get("department"), master.get("department"),
+                user.get("department_name"), details.get("department_name"), master.get("department_name"),
+                user.get("department_ref"), details.get("department_ref"), master.get("department_ref"),
+            ],
+            names, aliases, canonical,
+        )
+        if not resolved_id:
+            raw_text = next(
+                (re.sub(r"\s+", " ", value).strip() for value in (user.get("department"), details.get("department"), master.get("department"))
+                 if isinstance(value, str) and value.strip() and not ObjectId.is_valid(value.strip())),
+                "",
+            )
+            if raw_text:
+                resolved_id = f"name:{_department_key(raw_text)}"
+                departments.setdefault(resolved_id, raw_text)
+        joining = employee_joining_date({"date_of_joining": user.get("date_of_joining") if user.get("date_of_joining") is not None else details.get("date_of_joining")})
+        rows.append({
+            "id": user_id,
+            "user_id": user_id,
+            "employee_id": code,
+            "name": str(user.get("name") or master.get("employee_name") or "").strip(),
+            "email": user.get("work_email", ""),
+            "role": user.get("role", ""),
+            "department_id": resolved_id,
+            "department_name": departments.get(resolved_id, ""),
+            "joining_date": joining.isoformat() if joining else None,
+        })
+    return departments, rows
+
+
+@router.get("/departments")
+def list_attendance_departments(
+    authorization: str | None = Header(default=None),
+):
+    """Complete department list for the attendance filters (HR Admin / Administrator).
+
+    ``/api/departments`` only returns the Department master, which can hold a
+    single department while employees carry others as free text. This merges
+    both so the dropdown shows every department that really exists.
+    """
+    _require_hr_admin(
+        authorization,
+        "Only HR Admin or Administrator can view employee attendance",
+    )
+    departments, rows = _load_department_employees()
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["department_id"]] = counts.get(row["department_id"], 0) + 1
+    result = [
+        {
+            "id": department_id,
+            "department_name": name,
+            "name": name,
+            "source": "master" if not department_id.startswith("name:") else "employee_records",
+            "employee_count": counts.get(department_id, 0),
+        }
+        for department_id, name in departments.items()
+    ]
+    result.sort(key=lambda item: (item["department_name"].casefold(), item["id"]))
+    return result
+
+
+@router.get("/department-employees")
+def list_department_employees(
+    department_id: str = Query(default="all"),
+    search: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+):
+    """Active employees, each resolved to a department id, optionally for one department."""
+    _require_hr_admin(
+        authorization,
+        "Only HR Admin or Administrator can view employee attendance",
+    )
+    departments, rows = _load_department_employees()
+    wanted = (department_id or "all").strip()
+    if wanted.lower() != "all" and wanted not in departments:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Department not found.")
+    query = _department_key(search)
+    result = [
+        row for row in rows
+        if (wanted.lower() == "all" or row["department_id"] == wanted)
+        and (not query or query in _department_key(row["name"]) or query in _department_key(row["employee_id"]))
+    ]
+    result.sort(key=lambda row: (row["name"].casefold(), row["employee_id"]))
+    return result
 
 
 @router.get("/payroll-locks")
@@ -4394,6 +4685,404 @@ def _report_employee(user_id: str, authorization: str | None) -> dict[str, Any]:
     return employee
 
 
+# ---------------------------------------------------------------------------
+# Complete monthly report: every calendar date, permissions, leave, requests
+# ---------------------------------------------------------------------------
+
+SOURCE_LABELS = {
+    "ESSL": "ESSL",
+    "MANUAL": "Manual",
+    "ATTENDANCE_REQUEST": "Attendance Request",
+    "WFH_FACE_GPS": "WFH (Face + GPS)",
+}
+
+
+def _hhmm_minutes(value: Any) -> int | None:
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})(?::\d{2})?\s*", str(value or ""))
+    if not match:
+        return None
+    hours, minutes = int(match.group(1)), int(match.group(2))
+    return hours * 60 + minutes if hours < 24 and minutes < 60 else None
+
+
+def _clock_text(value: Any) -> str:
+    """'14:30' -> '02:30 PM'; ISO timestamps -> company-time clock; blank -> '—'."""
+    if not value:
+        return "—"
+    minutes = _hhmm_minutes(value)
+    if minutes is not None:
+        return f"{(minutes // 60) % 12 or 12:02d}:{minutes % 60:02d} {'PM' if minutes >= 720 else 'AM'}"
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(COMPANY_TZ).strftime("%I:%M %p")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _permission_duration_text(total_minutes: int) -> str:
+    total_minutes = max(0, int(total_minutes))
+    return f"{total_minutes // 60:02d} Hours {total_minutes % 60:02d} Minutes"
+
+
+def _company_date_text(value: Any) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(COMPANY_TZ).strftime("%d-%b-%Y")
+    return str(value or "")[:10] or "—"
+
+
+def _union_minutes(intervals: list[tuple[int, int]]) -> int:
+    """Total minutes covered by possibly overlapping intervals (nothing counted twice)."""
+    total, current_end = 0, None
+    for start, end in sorted(intervals):
+        if current_end is None or start > current_end:
+            total += end - start
+            current_end = end
+        elif end > current_end:
+            total += end - current_end
+            current_end = end
+    return total
+
+
+def _permission_entry(source: str, start: Any, end: Any, reason: Any, status_text: str) -> dict[str, Any] | None:
+    start_minutes, end_minutes = _hhmm_minutes(start), _hhmm_minutes(end)
+    if start_minutes is None or end_minutes is None or end_minutes <= start_minutes:
+        return None
+    duration = end_minutes - start_minutes
+    return {
+        "start_time": str(start)[:5],
+        "end_time": str(end)[:5],
+        "start_text": _clock_text(start),
+        "end_text": _clock_text(end),
+        "duration_minutes": duration,
+        "duration_text": _permission_duration_text(duration),
+        "reason": str(reason or "").strip(),
+        "status": status_text,
+        "source": source,
+        "_interval": (start_minutes, end_minutes),
+    }
+
+
+def _collect_permissions(user_id: str, start_iso: str, end_iso: str, records: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Approved permissions per date from every place the project stores them.
+
+    ``permission_requests`` holds the approval workflow; an approval is also
+    copied onto the attendance record (only one per date), and attendance
+    corrections / HR edits write ``approved_permission`` directly. Requests are
+    the primary source; attendance-only permissions are added when they do not
+    duplicate one already listed, so nothing is lost or counted twice.
+    Pending, rejected and cancelled requests are never listed as permission.
+    """
+    result: dict[str, list[dict[str, Any]]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    request_ids: set[str] = set()
+
+    def add(day: str, entry: dict[str, Any] | None) -> None:
+        if not entry:
+            return
+        key = (day, entry["start_time"], entry["end_time"])
+        if key in seen:
+            return
+        seen.add(key)
+        result.setdefault(day, []).append(entry)
+
+    for item in permission_requests_collection.find({
+        "user_id": user_id, "status": "approved",
+        "permission_date": {"$gte": start_iso, "$lt": end_iso},
+    }).sort("start_time", 1):
+        request_ids.add(str(item["_id"]))
+        add(str(item["permission_date"])[:10], _permission_entry(
+            "Permission Request", item.get("start_time"), item.get("end_time"), item.get("reason"), "Approved"))
+    for day, record in records.items():
+        permission = record.get("approved_permission")
+        if not isinstance(permission, dict):
+            continue
+        if str(permission.get("request_id") or "") in request_ids:
+            continue
+        origin = "Attendance Request" if permission.get("source") == "ATTENDANCE_REQUEST" else "Attendance Correction"
+        add(day, _permission_entry(origin, permission.get("start_time"), permission.get("end_time"), permission.get("reason"), "Approved"))
+    for entries in result.values():
+        entries.sort(key=lambda entry: entry["_interval"])
+    return result
+
+
+def _collect_requests(user_id: str, period: str, start_iso: str, end_iso: str) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+    """Pending requests per date, plus each date's latest request status.
+
+    Read-only: requests are displayed, never applied to attendance.
+    """
+    from app import leave as leave_module
+
+    pending: dict[str, list[dict[str, Any]]] = {}
+    latest: dict[str, tuple[Any, str]] = {}
+    seen: set[tuple[str, str, str]] = set()
+
+    def note_status(day: str, when: Any, label: str) -> None:
+        stamp = when if isinstance(when, datetime) else datetime.min
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+        if day not in latest or stamp >= latest[day][0]:
+            latest[day] = (stamp, label)
+
+    for request in db["attendance_requests"].find({"user_id": user_id, "periods": period}):
+        active = request.get("status") in ("pending", "processing")
+        submitted = request.get("submitted_at") or request.get("created_at")
+        for item in request.get("dates", []):
+            day = str(item.get("attendance_date") or "")[:10]
+            if not (start_iso <= day < end_iso):
+                continue
+            decision = item.get("decision")
+            if decision == "approve":
+                label = "Approved"
+            elif decision == "reject":
+                label = "Rejected"
+            elif request.get("status") == "cancelled":
+                label = "Cancelled"
+            elif active:
+                label = "Pending" if request.get("status") == "pending" else "Under Review"
+            else:
+                continue
+            note_status(day, submitted, label)
+            key = ("attendance", str(request["_id"]), day)
+            if not active or decision or key in seen:
+                continue
+            seen.add(key)
+            requested = item.get("requested_status") or ""
+            check_in, check_out = item.get("requested_check_in_time"), item.get("requested_check_out_time")
+            pending.setdefault(day, []).append({
+                "request_type": "Attendance Request",
+                "request_number": request.get("request_number") or "",
+                "request_date": _company_date_text(submitted),
+                "attendance_date": day,
+                "requested_status": requested,
+                "requested_check_in": _clock_text(check_in) if check_in else "",
+                "requested_check_out": _clock_text(check_out) if check_out else "",
+                "permission_start": _clock_text(item.get("requested_permission_start_time")) if item.get("requested_permission_start_time") else "",
+                "permission_end": _clock_text(item.get("requested_permission_end_time")) if item.get("requested_permission_end_time") else "",
+                "reason": (item.get("requested_permission_reason") if requested == "Permission" else None) or request.get("employee_remarks") or "",
+                "status": label,
+                "approver": "HR Admin",
+                "approval_stage": "HR Admin Review",
+            })
+
+    approver_ids = set()
+    permission_items = list(permission_requests_collection.find({
+        "user_id": user_id, "permission_date": {"$gte": start_iso, "$lt": end_iso},
+    }))
+    for item in permission_items:
+        if item.get("status") == "pending" and ObjectId.is_valid(str(item.get("approver_id") or "")):
+            approver_ids.add(str(item["approver_id"]))
+    approver_names = {
+        str(user["_id"]): user.get("name") or ""
+        for user in users_collection.find({"_id": {"$in": [ObjectId(value) for value in approver_ids]}}, {"name": 1})
+    } if approver_ids else {}
+    for item in permission_items:
+        day = str(item.get("permission_date") or "")[:10]
+        raw = str(item.get("status") or "")
+        label = {"pending": "Pending", "approved": "Approved", "rejected": "Rejected", "cancelled": "Cancelled"}.get(raw, raw.title())
+        note_status(day, item.get("created_at"), label)
+        key = ("permission", str(item["_id"]), day)
+        if raw != "pending" or key in seen:
+            continue
+        seen.add(key)
+        stage = item.get("approval_stage") or "reporting_manager"
+        stage_label = leave_module.APPROVAL_STAGES.get(stage, (None, None, stage))[2]
+        pending.setdefault(day, []).append({
+            "request_type": "Permission Request",
+            "request_number": "",
+            "request_date": _company_date_text(item.get("created_at")),
+            "attendance_date": day,
+            "requested_status": "Permission",
+            "requested_check_in": "",
+            "requested_check_out": "",
+            "permission_start": _clock_text(item.get("start_time")),
+            "permission_end": _clock_text(item.get("end_time")),
+            "reason": item.get("reason") or "",
+            "status": label,
+            "approver": approver_names.get(str(item.get("approver_id") or ""), ""),
+            "approval_stage": f"{stage_label} Approval",
+        })
+    for entries in pending.values():
+        entries.sort(key=lambda entry: (entry["request_type"], entry["permission_start"], entry["request_number"]))
+    return pending, {day: label for day, (_, label) in latest.items()}
+
+
+def _pending_request_text(entries: list[dict[str, Any]]) -> str:
+    lines = []
+    for entry in entries:
+        parts = [entry["request_type"] + (f" {entry['request_number']}" if entry["request_number"] else ""), f"Status: {entry['status']}"]
+        if entry["requested_status"]:
+            parts.append(f"Requested: {entry['requested_status']}")
+        if entry["requested_check_in"] or entry["requested_check_out"]:
+            parts.append(f"Check-in/out: {entry['requested_check_in'] or '—'} – {entry['requested_check_out'] or '—'}")
+        if entry["permission_start"] or entry["permission_end"]:
+            parts.append(f"Permission: {entry['permission_start'] or '—'} – {entry['permission_end'] or '—'}")
+        if entry["reason"]:
+            parts.append(f"Reason: {entry['reason']}")
+        parts.append(f"Requested on: {entry['request_date']}")
+        if entry["approver"] or entry["approval_stage"]:
+            parts.append(f"Awaiting: {entry['approval_stage']}" + (f" ({entry['approver']})" if entry["approver"] else ""))
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, month: int, legacy: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Every calendar date of the month, resolved with the existing attendance logic.
+
+    ``_monthly_report_rows`` (unchanged) supplies working-time and break data for
+    dates that have attendance. The Attendance Request calendar supplies the
+    resolved status of *every* date (record, holiday, weekly off, approved
+    leave, not marked, ...), so dates without a record are no longer dropped.
+    """
+    # Imported here: attendance_requests imports this module at load time.
+    from app import leave as leave_module
+    from app.attendance_requests import _build_calendar, _medical_leave_types
+
+    legacy_rows = {row["attendance_date"]: row for row in (legacy if legacy is not None else _monthly_report_rows(user_id, employee, year, month))}
+    calendar = _build_calendar(employee, year, month)
+    start_iso = f"{year:04d}-{month:02d}-01"
+    end_iso = (date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)).isoformat()
+    period = f"{year:04d}-{month:02d}"
+
+    records = {
+        str(item.get("attendance_date", ""))[:10]: item
+        for item in attendance_collection.find({"user_id": user_id, "attendance_date": {"$gte": start_iso, "$lt": end_iso}})
+    }
+    permissions = _collect_permissions(user_id, start_iso, end_iso, records)
+    pending, request_status = _collect_requests(user_id, period, start_iso, end_iso)
+
+    # Derive HR Admin Edited strictly from the append-only modification audit trail.
+    # Older audit rows without an actor role are resolved against the current user record.
+    audit_rows = list(db["attendance_modification_history"].find(
+        {"user_id": user_id, "attendance_date": {"$gte": start_iso, "$lt": end_iso}},
+        {"modified_by": 1, "modified_by_role": 1, "attendance_date": 1},
+    ))
+    actor_ids = {str(item.get("modified_by")) for item in audit_rows if item.get("modified_by")}
+    actor_roles = {
+        str(item["_id"]): str(item.get("role") or "")
+        for item in users_collection.find(
+            {"_id": {"$in": [ObjectId(value) for value in actor_ids if ObjectId.is_valid(value)]}},
+            {"role": 1},
+        )
+    } if actor_ids else {}
+    hr_admin_edited_dates = set()
+    for audit in audit_rows:
+        role_name = str(audit.get("modified_by_role") or actor_roles.get(str(audit.get("modified_by") or ""), "")).strip().casefold()
+        if role_name == "hr admin":
+            day_value = str(audit.get("attendance_date") or "")[:10]
+            if day_value:
+                hr_admin_edited_dates.add(day_value)
+
+    # Medical Leave is identified from the configured leave types (code ML / leave type id),
+    # never by display name, so Normal Leave is not counted as Medical Leave.
+    medical_by_id = _medical_leave_types()
+    medical_codes = set(medical_by_id.values()) or {leave_module.MEDICAL_LEAVE_CODE}
+    leave_type_docs = list(leave_types_collection.find({}, {"code": 1, "name": 1}))
+    type_name_by_code = {str(item.get("code") or "").strip().upper(): item.get("name") or "" for item in leave_type_docs}
+    type_by_id = {str(item["_id"]): item for item in leave_type_docs}
+    leave_request_ids = [ObjectId(str(r["leave_request_id"])) for r in records.values() if ObjectId.is_valid(str(r.get("leave_request_id") or ""))]
+    leave_type_by_request = {
+        str(item["_id"]): str(item.get("leave_type_id") or "")
+        for item in db["leave_requests"].find({"_id": {"$in": leave_request_ids}}, {"leave_type_id": 1})
+    } if leave_request_ids else {}
+
+    def leave_details(day: dict[str, Any], record: dict[str, Any] | None) -> dict[str, Any] | None:
+        upcoming = day.get("upcoming_leave") or {}
+        if not ((record and (record.get("status") == "Leave" or record.get("leave_request_id"))) or upcoming):
+            return None
+        code = str((record or {}).get("leave_type_code") or upcoming.get("leave_type_code") or "").strip().upper()
+        type_id = leave_type_by_request.get(str((record or {}).get("leave_request_id") or ""), "")
+        if type_id in type_by_id and not code:
+            code = str(type_by_id[type_id].get("code") or "").strip().upper()
+        is_medical = bool((record or {}).get("medical_leave")) or code in medical_codes or type_id in medical_by_id
+        name = type_name_by_code.get(code) or upcoming.get("leave_type_name") or ("Medical Leave" if is_medical else "")
+        part = str((record or {}).get("leave_day_part") or upcoming.get("day_part") or "full_day")
+        part_label = "Full Day" if part == "full_day" else part.replace("_", " ").title()
+        label = f"{name} ({code})" if name and code else (name or code or "Leave")
+        return {
+            "leave_type_code": code,
+            "leave_type_name": name,
+            "leave_type": label,
+            "is_medical": is_medical,
+            "day_part": part,
+            "day_part_label": part_label,
+            "days": 1.0 if part == "full_day" else 0.5,
+            "details": f"{label} · {part_label}",
+        }
+
+    rows: list[dict[str, Any]] = []
+    all_permission_intervals = 0
+    permission_count = 0
+    medical_days = normal_days = 0.0
+    for day in calendar["days"]:
+        iso = day["attendance_date"]
+        record = records.get(iso)
+        legacy = legacy_rows.get(iso)
+        selected = date.fromisoformat(iso)
+        entries = permissions.get(iso, [])
+        day_permission_minutes = _union_minutes([entry["_interval"] for entry in entries])
+        all_permission_intervals += day_permission_minutes
+        permission_count += len(entries)
+        leave_info = leave_details(day, record)
+        if leave_info:
+            if leave_info["is_medical"]:
+                medical_days += leave_info["days"]
+            else:
+                normal_days += leave_info["days"]
+        base = legacy or {
+            "attendance_date": iso,
+            "first_check_in": None, "last_check_out": None,
+            "working_minutes": 0, "working_duration": "0h 00m",
+            "break_minutes": 0, "break_duration": "0h 00m", "break_intervals": [],
+            "break_details": "No qualifying breaks recorded",
+            "attendance_type": (record or {}).get("attendance_type") or "—",
+            "attendance_source": (record or {}).get("attendance_source") or "—",
+            "leave_type_code": (record or {}).get("leave_type_code") or "",
+            "remarks": (record or {}).get("remarks") or "",
+        }
+        check_in = base.get("first_check_in") or day.get("check_in_time")
+        check_out = base.get("last_check_out") or day.get("check_out_time")
+        source = base.get("attendance_source") or "—"
+        status_text = day.get("status_label") or day.get("status") or "Not Marked"
+        rows.append({
+            **{key: value for key, value in base.items() if key not in {"status"}},
+            "day": selected.strftime("%A"),
+            "status": status_text,
+            "check_in_text": _clock_text(check_in),
+            "check_out_text": _clock_text(check_out),
+            "attendance_category": day.get("attendance_category") or "—",
+            "attendance_source_label": SOURCE_LABELS.get(str(source), str(source)),
+            "holiday_name": day.get("holiday_name") or "",
+            "permissions": [{k: v for k, v in entry.items() if not k.startswith("_")} for entry in entries],
+            "permission_total_minutes": day_permission_minutes,
+            "permission_total_text": _permission_duration_text(day_permission_minutes) if entries else "",
+            "leave": leave_info,
+            "pending_requests": pending.get(iso, []),
+            "request_status": request_status.get(iso, ""),
+            "hr_admin_edited": iso in hr_admin_edited_dates,
+            # Dates that existed in the original report; its metrics only cover these.
+            "in_legacy": legacy is not None,
+        })
+
+    return {
+        "rows": rows,
+        "summary": {
+            "total_days": len(rows),
+            "permission_count": permission_count,
+            "permission_total_minutes": all_permission_intervals,
+            "permission_total_text": _permission_duration_text(all_permission_intervals),
+            "medical_leave_days": medical_days,
+            "normal_leave_days": normal_days,
+            "pending_request_count": sum(len(items) for items in pending.values()),
+            "hr_admin_edited_count": len(hr_admin_edited_dates),
+            "hr_admin_edited_dates": sorted(hr_admin_edited_dates),
+        },
+    }
+
+
 @router.get("/user/{user_id}/monthly-details")
 def get_user_monthly_attendance_details(
     user_id: str,
@@ -4404,6 +5093,7 @@ def get_user_monthly_attendance_details(
     """Monthly table data including shared working-time and break calculations."""
     employee = _report_employee(user_id, authorization)
     rows = _monthly_report_rows(user_id, employee, year, month)
+    complete = _complete_monthly_report(user_id, employee, year, month, rows)
     return {
         "employee": {
             "user_id": str(employee["_id"]),
@@ -4414,7 +5104,11 @@ def get_user_monthly_attendance_details(
         },
         "year": year,
         "month": month,
+        # Recorded dates only (unchanged, kept for existing consumers).
         "records": rows,
+        # Every calendar date of the month, plus permission / leave / request details.
+        "days": complete["rows"],
+        "summary": complete["summary"],
     }
 
 
@@ -4427,7 +5121,12 @@ def export_user_monthly_attendance(
 ):
     """Create a professionally formatted two-worksheet monthly attendance workbook."""
     employee = _report_employee(user_id, authorization)
-    rows = _monthly_report_rows(user_id, employee, year, month)
+    legacy_rows = _monthly_report_rows(user_id, employee, year, month)
+    complete = _complete_monthly_report(user_id, employee, year, month, legacy_rows)
+    # Daily sheet: every calendar date. Attendance Metrics: the original recorded rows only.
+    all_rows = complete["rows"]
+    rows = [row for row in all_rows if row.get("in_legacy")]
+    report_summary = complete["summary"]
 
     month_name = date(year, month, 1).strftime("%B")
     employee_id = str(employee.get("employee_id") or user_id)
@@ -4446,7 +5145,7 @@ def export_user_monthly_attendance(
     white = "FFFFFF"
     thin_grey = Side(style="thin", color="D9E1F2")
 
-    summary.merge_cells("A1:D1")
+    summary.merge_cells("A1:E1")
     summary["A1"] = "EMPLOYEE MONTHLY ATTENDANCE REPORT"
     summary["A1"].font = Font(name="Aptos Display", size=16, bold=True, color=white)
     summary["A1"].fill = PatternFill("solid", fgColor=navy)
@@ -4482,11 +5181,16 @@ def export_user_monthly_attendance(
         cell.fill = PatternFill("solid", fgColor=navy)
         cell.alignment = Alignment(horizontal="center")
     metrics = [
+        ("Total Days in Month", calendar.monthrange(year, month)[1]),
         ("Recorded Attendance Days", len(rows)),
         ("Present", sum(v for k, v in counts.items() if k.casefold() == "present")),
         ("Absent", sum(v for k, v in counts.items() if k.casefold() == "absent")),
         ("Leave", sum(v for k, v in counts.items() if k.casefold() == "leave")),
+        ("Medical Leave", sum(v for k, v in counts.items() if k.casefold() == "medical leave")),
         ("Holiday", sum(v for k, v in counts.items() if k.casefold() == "holiday")),
+        ("Weekly Off", sum(v for k, v in counts.items() if k.casefold() == "weekly off")),
+        ("Not Applicable (LOP)", sum(v for k, v in counts.items() if k.casefold() == "not applicable")),
+        ("Not Marked", sum(v for k, v in counts.items() if k.casefold() == "not marked")),
         ("Total Net Working Time", _format_duration(total_work_minutes)),
         ("Total Qualifying Break Time", _format_duration(total_break_minutes)),
     ]
@@ -4499,25 +5203,74 @@ def export_user_monthly_attendance(
         for cell in summary[r][:2]:
             cell.border = Border(bottom=thin_grey)
             cell.alignment = Alignment(vertical="center")
+    # Separate blocks to the right of Attendance Metrics (column C is a spacer);
+    # the Attendance Metrics themselves are untouched.
+    def side_block(top_row: int, title: str, items: list[tuple[str, Any]]) -> None:
+        for col, text in ((4, title), (5, "Value")):
+            cell = summary.cell(top_row, col, text)
+            cell.font = Font(bold=True, color=white)
+            cell.fill = PatternFill("solid", fgColor=navy)
+            cell.alignment = Alignment(horizontal="center")
+        for offset, (label, value) in enumerate(items, start=1):
+            label_cell = summary.cell(top_row + offset, 4, label)
+            value_cell = summary.cell(top_row + offset, 5, value)
+            label_cell.font = Font(bold=True, color=navy)
+            label_cell.fill = PatternFill("solid", fgColor=light_blue)
+            value_cell.fill = PatternFill("solid", fgColor="F7F9FB")
+            for cell in (label_cell, value_cell):
+                cell.border = Border(bottom=thin_grey)
+                cell.alignment = Alignment(vertical="center", horizontal="left" if cell is label_cell else "center")
+
+    side_block(7, "Permission Summary", [
+        ("Monthly Permission Count", report_summary["permission_count"]),
+        ("Monthly Permission Total Duration", report_summary["permission_total_text"]),
+    ])
+    side_block(11, "Leave Breakdown", [
+        ("Medical Leave Days (ML)", f"{report_summary['medical_leave_days']:g}"),
+        ("Normal Leave Days", f"{report_summary['normal_leave_days']:g}"),
+        ("Pending Requests", report_summary["pending_request_count"]),
+    ])
+    edited_dates = report_summary.get("hr_admin_edited_dates", [])
+    for col, text in ((1, "HR Admin Edited Attendance Summary"), (2, "Value")):
+        cell = summary.cell(20, col, text)
+        cell.font = Font(bold=True, color=white)
+        cell.fill = PatternFill("solid", fgColor=navy)
+        cell.alignment = Alignment(horizontal="center")
+    edited_summary_rows = [
+        ("Total HR Admin Edited Attendance", len(edited_dates)),
+        ("HR Admin Edited Dates", ", ".join(date_text[8:10] for date_text in edited_dates) if edited_dates else "No HR Admin edited attendance dates"),
+    ]
+    for row_number, (label, value) in enumerate(edited_summary_rows, start=21):
+        summary.cell(row_number, 1, label)
+        summary.cell(row_number, 2, value)
+        summary.cell(row_number, 1).font = Font(bold=True, color=navy)
+        summary.cell(row_number, 1).fill = PatternFill("solid", fgColor=light_blue)
+        summary.cell(row_number, 2).fill = PatternFill("solid", fgColor="F7F9FB")
+        for cell in summary[row_number][:2]:
+            cell.border = Border(bottom=thin_grey)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
     if not rows:
         summary["A16"] = "No attendance records were found for this employee and month."
         summary["A16"].font = Font(italic=True, color="666666")
 
-    summary.column_dimensions["A"].width = 31
+    summary.column_dimensions["A"].width = 36
     summary.column_dimensions["B"].width = 28
     summary.column_dimensions["C"].width = 20
-    summary.column_dimensions["D"].width = 32
+    summary.column_dimensions["D"].width = 36
+    summary.column_dimensions["E"].width = 30
     summary.freeze_panes = "A7"
     summary.sheet_view.showGridLines = False
     summary.page_setup.orientation = "portrait"
     summary.page_setup.fitToWidth = 1
     summary.sheet_properties.pageSetUpPr.fitToPage = True
-    summary.print_area = f"A1:D{max(15, 7 + len(metrics))}"
+    summary.print_area = f"A1:E{max(22, 7 + len(metrics))}"
 
     headers = [
         "Attendance Date", "Day", "Status", "First Check-In", "Last Check-Out",
         "Break Duration", "Break Time List", "Net Working Duration",
         "Attendance Type", "Source", "Leave Type", "Remarks",
+        "Permission Start Time", "Permission End Time", "Permission Duration", "Permission Reason",
+        "Leave Details", "Request Status", "Pending Request Details", "HR Admin Edited",
     ]
     detail.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
     title_cell = detail.cell(1, 1, f"{employee_name} — Daily Attendance — {month_name} {year}")
@@ -4544,28 +5297,38 @@ def export_user_monthly_attendance(
         except (TypeError, ValueError):
             return str(value)
 
-    for idx, row in enumerate(rows, start=4):
+    for idx, row in enumerate(all_rows, start=4):
         attendance_date = date.fromisoformat(row["attendance_date"])
         values = [
             attendance_date,
             attendance_date.strftime("%A"),
             row.get("status") or "Not Marked",
-            local_clock(row.get("first_check_in")),
-            local_clock(row.get("last_check_out")),
+            row.get("check_in_text") or "—",
+            row.get("check_out_text") or "—",
             row.get("break_duration") or "0h 00m",
             row.get("break_details") or "No qualifying breaks recorded",
             row.get("working_duration") or "0h 00m",
-            row.get("attendance_type") or "—",
-            row.get("attendance_source") or "—",
-            row.get("leave_type_code") or "—",
+            row.get("attendance_category") if row.get("attendance_category") not in (None, "—") else (
+                {"WFH": "Work From Home", "OFFICE": "Office", "Office": "Office"}.get(str(row.get("attendance_type")), row.get("attendance_type") or "—")
+            ),
+            row.get("attendance_source_label") or row.get("attendance_source") or "—",
+            (row.get("leave") or {}).get("leave_type") or "—",
             row.get("remarks") or "—",
+            "\n".join(entry["start_text"] for entry in row.get("permissions", [])) or "—",
+            "\n".join(entry["end_text"] for entry in row.get("permissions", [])) or "—",
+            "\n".join(entry["duration_text"] for entry in row.get("permissions", [])) or "—",
+            "\n".join(entry["reason"] or "—" for entry in row.get("permissions", [])) or "—",
+            (row.get("leave") or {}).get("details") or "—",
+            row.get("request_status") or "—",
+            _pending_request_text(row.get("pending_requests", [])) or "—",
+            "Yes" if row.get("hr_admin_edited") else "No",
         ]
         for col, value in enumerate(values, start=1):
             cell = detail.cell(idx, col, value)
             cell.alignment = Alignment(
                 vertical="top",
-                wrap_text=col in (7, 12),
-                horizontal="left" if col in (7, 12) else "center",
+                wrap_text=col in (7, 12, 13, 14, 15, 16, 17, 19),
+                horizontal="left" if col in (7, 12, 16, 17, 19) else "center",
             )
             cell.border = Border(bottom=thin_grey)
             if idx % 2 == 0:
@@ -4578,8 +5341,16 @@ def export_user_monthly_attendance(
                     cell.fill = PatternFill("solid", fgColor=green)
                 elif normalized == "absent":
                     cell.fill = PatternFill("solid", fgColor="F4CCCC")
-                elif normalized in {"leave", "holiday"}:
-                    cell.fill = PatternFill("solid", fgColor=orange if normalized == "leave" else blue)
+                elif normalized in {"leave", "medical leave"}:
+                    cell.fill = PatternFill("solid", fgColor=orange)
+                elif normalized == "holiday":
+                    cell.fill = PatternFill("solid", fgColor=blue)
+                elif normalized == "weekly off":
+                    cell.fill = PatternFill("solid", fgColor="EDEDED")
+                elif normalized == "not marked":
+                    cell.fill = PatternFill("solid", fgColor="FFF2CC")
+            if col == 18 and str(value).casefold() in {"pending", "under review"}:
+                cell.fill = PatternFill("solid", fgColor="FFF2CC")
         # Size each row for BOTH the break list and the complete remark.
         # Excel does not always auto-fit row heights in generated workbooks,
         # so estimate wrapped lines using the configured column widths.
@@ -4596,26 +5367,29 @@ def export_user_monthly_attendance(
         estimated_lines = max(
             _wrapped_line_count(break_text, 40),
             _wrapped_line_count(remark_text, 43),
+            _wrapped_line_count(str(values[18]), 60),
+            _wrapped_line_count(str(values[15]), 28),
+            len(row.get("permissions", [])),
         )
         # Keep ordinary rows compact while allowing long remarks to expand.
         detail.row_dimensions[idx].height = min(300, max(24, 15 * estimated_lines + 6))
 
-    if rows:
-        table = Table(displayName="MonthlyAttendance", ref=f"A3:L{3 + len(rows)}")
+    if all_rows:
+        table = Table(displayName="MonthlyAttendance", ref=f"A3:T{3 + len(all_rows)}")
         table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
         detail.add_table(table)
     else:
         detail.cell(4, 1, "No attendance records were found for this employee and month.")
-        detail.merge_cells("A4:L4")
+        detail.merge_cells("A4:T4")
         detail["A4"].font = Font(italic=True, color="666666")
 
     # A wider Remarks column plus wrapped text and dynamic row heights keeps
     # long employee remarks readable without truncating the exported value.
-    widths = [17, 15, 16, 18, 18, 18, 42, 22, 22, 20, 16, 45]
+    widths = [17, 15, 16, 18, 18, 18, 42, 22, 22, 20, 22, 45, 20, 20, 24, 30, 30, 16, 60, 18]
     for idx, width in enumerate(widths, start=1):
         detail.column_dimensions[chr(64 + idx)].width = width
     detail.freeze_panes = "A4"
-    detail.auto_filter.ref = f"A3:L{max(3, 3 + len(rows))}"
+    detail.auto_filter.ref = f"A3:T{max(3, 3 + len(all_rows))}"
     detail.sheet_view.showGridLines = False
     detail.page_setup.orientation = "landscape"
     detail.page_setup.fitToWidth = 1
@@ -4627,13 +5401,14 @@ def export_user_monthly_attendance(
     detail.page_margins.right = 0.25
     detail.page_margins.top = 0.5
     detail.page_margins.bottom = 0.5
-    detail.print_area = f"A1:L{max(4, 3 + len(rows))}"
+    detail.print_area = f"A1:T{max(4, 3 + len(all_rows))}"
 
     output = BytesIO()
     workbook.save(output)
     output.seek(0)
     safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", employee_id).strip("_") or "employee"
-    filename = f"Employee_Attendance_{safe_id}_{month_name}_{year}.xlsx"
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", employee_name).strip("_") or "employee"
+    filename = f"Attendance_{safe_name}_{safe_id}_{month_name}_{year}.xlsx"
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

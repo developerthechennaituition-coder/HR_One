@@ -327,3 +327,15 @@ body {
     padding-left: 14px;
   }
 }
+
+
+/* HRMS responsive data tables: keep table headings visible inside contained scrollers. */
+.monthly-attendance-scroll thead th { position: sticky; top: 0; z-index: 2; background: var(--bs-tertiary-bg, #f8f9fa); }
+@media (max-width: 767.98px) {
+  .modal-dialog { margin: .5rem; }
+  .modal-content { max-height: calc(100dvh - 1rem); }
+  .modal-body { overflow-y: auto; }
+  .table-responsive { -webkit-overflow-scrolling: touch; }
+  .page-header, .attendance-page-header { gap: .75rem; align-items: flex-start; flex-wrap: wrap; }
+  .page-header .btn, .attendance-page-header .btn { max-width: 100%; }
+}

@@ -1,11 +1,10 @@
 import { HRONE_API_BASE } from "../config/api.js";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
 import HistoricalAttendanceModal from "../components/HistoricalAttendanceModal";
 import { roleLabel } from "../services/roleLabels";
 
 const USERS_API_URL = HRONE_API_BASE + "/api/users";
-const EMPLOYEES_API_URL = HRONE_API_BASE + "/api/employees";
 const ATTENDANCE_API_URL = HRONE_API_BASE + "/api/attendance";
 
 const getCompanyDateString = (date = new Date()) => {
@@ -135,6 +134,12 @@ function Attendance({ session }) {
   const [attendanceFilter, setAttendanceFilter] = useState("all");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [departmentFilter, setDepartmentFilter] = useState("all");
+  const [selectedEmployeeFilter, setSelectedEmployeeFilter] = useState("all");
+  // Employees of the selected department, resolved by the server (null while loading).
+  const [departmentEmployeeIds, setDepartmentEmployeeIds] = useState(null);
+  const [departmentLoading, setDepartmentLoading] = useState(false);
+  const [departmentError, setDepartmentError] = useState("");
+  const departmentRequest = useRef(0);
 
   const [attendanceState, setAttendanceState] = useState({});
 
@@ -226,27 +231,27 @@ function Attendance({ session }) {
             `${ATTENDANCE_API_URL}?attendance_date=${selectedDate}`,
             "Unable to load attendance."
           ),
-          request(EMPLOYEES_API_URL, "Unable to load employee departments."),
+          request(`${ATTENDANCE_API_URL}/department-employees?department_id=all`, "Unable to load employee departments."),
           request(`${ATTENDANCE_API_URL}/payroll-locks?month=${Number(selectedDate.slice(5, 7))}&year=${Number(selectedDate.slice(0, 4))}`, "Unable to load payroll lock status."),
-          request(`${HRONE_API_BASE}/api/departments`, "Unable to load departments."),
+          request(`${ATTENDANCE_API_URL}/departments`, "Unable to load departments."),
         ]);
         setDepartmentOptions(Array.isArray(departmentData) ? departmentData : []);
 
-        const departmentsByEmployeeId = new Map(
-          employeeData.map((employee) => [
-            employee.employee_id,
-            employee.department,
-          ]),
+        // The server resolves each employee's department against the department
+        // master, so filtering is by department id rather than by name text.
+        const departmentByUserId = new Map(
+          (Array.isArray(employeeData) ? employeeData : []).map((employee) => [String(employee.id), employee]),
         );
         const payrollByEmployee = new Map((payrollData || []).map((row) => [String(row.employee_id), row.status]));
-        const usersWithDepartments = userData.map((user) => ({
-          ...user,
-          payroll_status: payrollByEmployee.get(String(user.employee_id)) || null,
-          department:
-            user.department ||
-            departmentsByEmployeeId.get(user.employee_id) ||
-            "",
-        }));
+        const usersWithDepartments = userData.map((user) => {
+          const resolved = departmentByUserId.get(String(user.id));
+          return {
+            ...user,
+            payroll_status: payrollByEmployee.get(String(user.employee_id)) || null,
+            department: resolved?.department_name || "",
+            department_id: resolved?.department_id || "",
+          };
+        });
         setUsers(usersWithDepartments);
 
         const initial = {};
@@ -666,14 +671,18 @@ function Attendance({ session }) {
         sourceFilter === "all" || currentSource === sourceFilter;
       const matchesDepartment =
         departmentFilter === "all" ||
-        (user.department || "") === departmentFilter;
+        Boolean(departmentEmployeeIds && departmentEmployeeIds.has(String(user.id)));
+      const matchesEmployee =
+        selectedEmployeeFilter === "all" ||
+        String(user.id) === String(selectedEmployeeFilter);
 
       return (
         matchesSearch &&
         matchesStatus &&
         matchesAttendance &&
         matchesSource &&
-        matchesDepartment
+        matchesDepartment &&
+        matchesEmployee
       );
     });
   }, [
@@ -684,12 +693,53 @@ function Attendance({ session }) {
     attendanceState,
     sourceFilter,
     departmentFilter,
+    departmentEmployeeIds,
+    selectedEmployeeFilter,
   ]);
 
   const departments = useMemo(() => {
-    const configured = departmentOptions.map((item) => item.department_name).filter(Boolean);
-    return configured.length ? [...new Set(configured)].sort() : [...new Set(users.map((user) => user.department).filter(Boolean))].sort();
-  }, [departmentOptions, users]);
+    const byId = new Map();
+    departmentOptions.forEach((item) => {
+      const id = String(item.id || item._id || "").trim();
+      const name = String(item.department_name || item.name || "").trim();
+      if (id && name && !byId.has(id)) byId.set(id, name);
+    });
+    return [...byId].map(([id, name]) => ({ id, name })).sort((x, y) => x.name.localeCompare(y.name));
+  }, [departmentOptions]);
+
+  // Reload the department's employees from the server whenever the department changes.
+  useEffect(() => {
+    const requestId = ++departmentRequest.current;
+    setSelectedEmployeeFilter("all");
+    setDepartmentError("");
+    if (departmentFilter === "all") {
+      setDepartmentEmployeeIds(null);
+      setDepartmentLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setDepartmentEmployeeIds(null);
+    setDepartmentLoading(true);
+    (async () => {
+      try {
+        const response = await fetch(
+          `${ATTENDANCE_API_URL}/department-employees?department_id=${encodeURIComponent(departmentFilter)}`,
+          { headers: getHeaders(), signal: controller.signal },
+        );
+        const data = await response.json().catch(() => ([]));
+        if (!response.ok) throw new Error(data?.detail || "Unable to load department employees.");
+        if (requestId !== departmentRequest.current) return;
+        setDepartmentEmployeeIds(new Set((Array.isArray(data) ? data : []).map((item) => String(item.id))));
+      } catch (requestError) {
+        if (requestError.name === "AbortError" || requestId !== departmentRequest.current) return;
+        setDepartmentEmployeeIds(new Set());
+        setDepartmentError(requestError.message || "Unable to load department employees.");
+      } finally {
+        if (requestId === departmentRequest.current) setDepartmentLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [departmentFilter, getHeaders]);
 
   const count = (status) =>
     users.filter(
@@ -776,7 +826,7 @@ function Attendance({ session }) {
           </p>
         </div>
         <button type="button" className="btn btn-outline-primary" onClick={() => setShowHistoricalAttendance(true)}>
-          <i className="bi bi-pencil-square me-2" />Modify Historical Attendance
+          <i className="bi bi-pencil-square me-2" />Modify Previous Attendance
         </button>
       </div>
 
@@ -851,6 +901,25 @@ Daily Attendance manages today's records. Use Historical Attendance Modification
               </small>
             </div>
 
+              <div className="col-md-2">
+              <label className="form-label">Department</label>
+              <select
+                className="form-select"
+                value={departmentFilter}
+                onChange={(e) => { setDepartmentFilter(e.target.value); setSelectedEmployeeFilter("all"); }}
+              >
+                <option value="all">All departments</option>
+                {departments.map((department) => (
+                  <option key={department.id} value={department.id}>
+                    {department.name}
+                  </option>
+                ))}
+              </select>
+              {!isLoading && departments.length === 0 && <div className="small text-muted mt-1">No departments found.</div>}
+              {departmentLoading && <div className="small text-muted mt-1">Loading employees…</div>}
+              {departmentError && <div className="small text-danger mt-1">{departmentError}</div>}
+            </div>
+
             <div className="col-md-3">
               <label className="form-label">
                 Search Employee
@@ -865,6 +934,19 @@ Daily Attendance manages today's records. Use Historical Attendance Modification
                   setSearchTerm(e.target.value)
                 }
               />
+            </div>
+
+            <div className="col-md-2">
+              <label className="form-label">Employee</label>
+              <select
+                className="form-select"
+                value={selectedEmployeeFilter}
+                onChange={(e) => setSelectedEmployeeFilter(e.target.value)}
+              >
+                <option value="all">All employees</option>
+                {users.filter((user) => departmentFilter === "all" || Boolean(departmentEmployeeIds && departmentEmployeeIds.has(String(user.id))))
+                  .map((user) => <option key={user.id} value={user.id}>{user.name} ({user.employee_id || "No ID"})</option>)}
+              </select>
             </div>
 
             <div className="col-md-2">
@@ -932,22 +1014,6 @@ Daily Attendance manages today's records. Use Historical Attendance Modification
             </div>
 
             <div className="col-md-2">
-              <label className="form-label">Department</label>
-              <select
-                className="form-select"
-                value={departmentFilter}
-                onChange={(e) => setDepartmentFilter(e.target.value)}
-              >
-                <option value="all">All departments</option>
-                {departments.map((department) => (
-                  <option key={department} value={department}>
-                    {department}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="col-md-2">
               <label className="form-label">Source</label>
               <select
                 className="form-select"
@@ -971,6 +1037,7 @@ Daily Attendance manages today's records. Use Historical Attendance Modification
                   setAttendanceFilter("all");
                   setSourceFilter("all");
                   setDepartmentFilter("all");
+                  setSelectedEmployeeFilter("all");
                 }}
               >
                 <i className="bi bi-arrow-counterclockwise me-1"></i>
@@ -1320,8 +1387,6 @@ Daily Attendance manages today's records. Use Historical Attendance Modification
 
       {showHistoricalAttendance && (
         <HistoricalAttendanceModal
-          users={users}
-          departments={departmentOptions}
           getHeaders={getHeaders}
           onClose={() => setShowHistoricalAttendance(false)}
         />
