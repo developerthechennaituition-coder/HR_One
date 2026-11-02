@@ -122,6 +122,11 @@ def _company_snapshot(employee_id: str | None = None) -> dict:
                 "is_active": {"$ne": False},
             }) or {}
 
+    # Employees may not yet have an assigned company record. Keep payroll
+    # calculation resilient and use the standard company-name fallback below.
+    if not isinstance(company, dict):
+        company = {}
+
     branch = str(company.get("branch") or "").strip()
     location = str(company.get("location") or "").strip()
     # Payslip header shows location first; branch is shown only if location is blank.

@@ -1,6 +1,7 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
+import AttendanceExportModal from "../components/AttendanceExportModal";
 import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
 import { getEmployeeAttendanceCalendar } from "../services/attendanceRequestApi";
 import {
@@ -68,8 +69,10 @@ function UserAttendance({ session }) {
   const [monthlyDetailsLoading, setMonthlyDetailsLoading] = useState(false);
   const [monthlyDetailsError, setMonthlyDetailsError] = useState("");
   const [exportLoading, setExportLoading] = useState(false);
+  const [showAttendanceExport, setShowAttendanceExport] = useState(false);
 
   const headers = useMemo(() => ({ Authorization: `Bearer ${token}` }), [token]);
+  const getHeaders = useCallback(() => headers, [headers]);
 
   // ---- departments (Department master + departments found on employee records) ----
   useEffect(() => {
@@ -278,6 +281,9 @@ function UserAttendance({ session }) {
           <h2 className="mb-1">Employee Attendance</h2>
           <p className="text-muted mb-0">View any employee's monthly attendance calendar (read-only)</p>
         </div>
+        <button type="button" className="btn btn-primary" onClick={() => setShowAttendanceExport(true)}>
+          <i className="bi bi-file-earmark-excel me-2" />Export Attendance
+        </button>
       </div>
 
       <div className="card mb-4">
@@ -454,6 +460,9 @@ function UserAttendance({ session }) {
                 </div>
                 <div className="row g-2 mb-3 small">
                   {[
+                    ["Total Net Working Time", summary.total_working_duration || "0h 00m"],
+                    ["Total Break Time", summary.total_break_duration || "0h 00m"],
+                    ["Total Elapsed Duration", summary.total_elapsed_duration || "0h 00m"],
                     ["Monthly Permission Count", summary.permission_count ?? 0],
                     ["Monthly Permission Total Duration", summary.permission_total_text || "00 Hours 00 Minutes"],
                     ["Medical Leave (ML) Days", summary.medical_leave_days ?? 0],
@@ -474,13 +483,16 @@ function UserAttendance({ session }) {
                         <th>Status</th>
                         <th>Check-In</th>
                         <th>Check-Out</th>
+                        <th>Scheduled IN / OUT</th>
                         <th>Attendance Category</th>
                         <th>Source</th>
                         <th>Permission</th>
                         <th>Leave Details</th>
                         <th>Break Duration</th>
                         <th>Break Time List</th>
-                        <th>Net Working Time</th>
+                        <th>Working Duration</th>
+                        <th>Total Duration</th>
+                        <th>Half-Day Threshold</th>
                         <th>Request Status</th>
                         <th>Remarks</th>
                       </tr>
@@ -501,6 +513,7 @@ function UserAttendance({ session }) {
                           </td>
                           <td className="text-nowrap">{record.check_in_text}</td>
                           <td className="text-nowrap">{record.check_out_text}</td>
+                          <td className="text-nowrap">{record.scheduled_work_start_time || "—"} / {record.scheduled_work_end_time || "—"}</td>
                           <td>{record.attendance_category}</td>
                           <td>{record.attendance_source_label || record.attendance_source || "—"}</td>
                           <td style={{ minWidth: 200 }}>
@@ -538,6 +551,8 @@ function UserAttendance({ session }) {
                               : <span className="text-muted small">No qualifying breaks</span>}
                           </td>
                           <td className="text-nowrap">{record.working_duration || "0h 00m"}</td>
+                          <td className="text-nowrap">{record.total_duration || "0h 00m"}</td>
+                          <td className="text-nowrap">{record.half_day_working_duration_text || "—"}{record.half_day_threshold_met ? " ✓" : ""}</td>
                           <td>
                             {record.request_status
                               ? <span className={`badge ${["Pending", "Under Review"].includes(record.request_status) ? "text-bg-warning" : record.request_status === "Approved" ? "text-bg-success" : "text-bg-secondary"}`}>{record.request_status}</span>
@@ -547,7 +562,7 @@ function UserAttendance({ session }) {
                         </tr>
                       ))}
                       {!days.length && (
-                        <tr><td colSpan="14" className="text-center text-muted py-4">No dates found for this employee and month.</td></tr>
+                        <tr><td colSpan="17" className="text-center text-muted py-4">No dates found for this employee and month.</td></tr>
                       )}
                     </tbody>
                   </table>
@@ -603,6 +618,13 @@ function UserAttendance({ session }) {
             )}
           </div>
         </div>
+      )}
+      {showAttendanceExport && (
+        <AttendanceExportModal
+          departments={departments}
+          getHeaders={getHeaders}
+          onClose={() => setShowAttendanceExport(false)}
+        />
       )}
     </div>
   );

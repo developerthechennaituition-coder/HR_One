@@ -54,16 +54,18 @@ from zoneinfo import ZoneInfo
 from bson import ObjectId
 from fastapi import APIRouter, Header, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from dotenv import load_dotenv
 from pymongo import ReturnDocument
 from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import DuplicateKeyError
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from app.db.mongodb import db
 from app.session import active_sessions
+from app.working_details import applicable_schedule, format_hours_minutes
+from app.attendance_export import build_multi_employee_attendance_workbook
 
 load_dotenv()
 from app.wfh_biometrics import (
@@ -124,6 +126,15 @@ COMPANY_START_TIME = os.getenv(
     "COMPANY_START_TIME",
     "09:00",
 )
+
+
+def _schedule_fields_for_date(user_id: str, attendance_date: date) -> dict[str, Any]:
+    """Return the employee schedule applicable on an attendance date.
+
+    Keep this small adapter in the attendance module so all attendance API
+    responses use the shared, effective-date-aware schedule implementation.
+    """
+    return applicable_schedule(str(user_id), attendance_date)
 
 
 WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -3345,7 +3356,7 @@ def save_attendance(
 
 
 # ---------------------------------------------------------------------------
-# Historical attendance: read from joining month; modify previous three completed months and prior current-month dates
+# Historical attendance: read from joining month; modify previous three completed months and prior dates in the current month
 # ---------------------------------------------------------------------------
 
 class HistoricalAttendanceUpdate(BaseModel):
@@ -3426,10 +3437,10 @@ def _validate_historical_month(year: int, month: int) -> tuple[date, date]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid month or year.")
     start, current_start = _historical_month_window(today)
     selected_start = date(year, month, 1)
-    if selected_start < start or selected_start >= current_start:
+    if selected_start < start or selected_start > current_start:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Attendance modification is available only for the previous three completed months. The current month is view-only.",
+            "Attendance modification is available for previous dates in the current month and the previous three completed months. Today and future dates are view-only.",
         )
     end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
     return selected_start, end
@@ -3470,7 +3481,7 @@ def get_historical_attendance_month(
     payroll_status = (payroll or {}).get("status")
     payroll_locked = payroll_status in {"Approved", "Processed", "Paid"}
     modifiable_start, current_month_start = _historical_month_window(company_today())
-    month_in_edit_window = modifiable_start <= start < current_month_start
+    month_in_edit_window = modifiable_start <= start <= current_month_start
     today = company_today()
     cursor = start
     while cursor < end and cursor < today:
@@ -3493,6 +3504,12 @@ def get_historical_attendance_month(
             "permission_end_time": permission.get("end_time"),
             "permission_reason": permission.get("reason"),
             "working_duration": details.get("working_duration") or details.get("total_working_duration") or "0h 00m",
+            "working_minutes": int(details.get("working_minutes") or 0),
+            "total_duration": _format_duration(int(details.get("elapsed_minutes") or ((details.get("working_minutes") or 0) + (details.get("outside_minutes") or 0)))),
+            "scheduled_work_start_time": details.get("scheduled_work_start_time") or "",
+            "scheduled_work_end_time": details.get("scheduled_work_end_time") or "",
+            "half_day_working_duration_text": details.get("half_day_working_duration_text") or "",
+            "half_day_threshold_met": bool(details.get("half_day_working_duration") and int(details.get("working_minutes") or 0) >= int(details.get("half_day_working_duration") or 0)),
             "break_duration": details.get("break_duration") or "0h 00m",
             "outside_duration": details.get("outside_duration") or "0h 00m",
             "working_intervals": details.get("working_intervals") or [],
@@ -3970,7 +3987,7 @@ def _resolve_department_id(
     return ""
 
 
-def _load_department_employees() -> tuple[dict[str, str], list[dict[str, Any]]]:
+def _load_department_employees(include_inactive: bool = False) -> tuple[dict[str, str], list[dict[str, Any]]]:
     """Every active employee resolved to a department, plus the full department list.
 
     Departments come from the Department master (Organization Setup) *and* from
@@ -3979,7 +3996,7 @@ def _load_department_employees() -> tuple[dict[str, str], list[dict[str, Any]]]:
     otherwise be invisible. Those are listed under a ``name:<text>`` id.
     """
     names, aliases, canonical = _department_directory()
-    users = list(users_collection.find({"is_active": {"$ne": False}}))
+    users = list(users_collection.find({} if include_inactive else {"is_active": {"$ne": False}}))
     employee_codes = [str(user.get("employee_id") or "").strip() for user in users if user.get("employee_id")]
     master_by_code = {
         str(item.get("employee_id") or "").strip().casefold(): item
@@ -4030,6 +4047,8 @@ def _load_department_employees() -> tuple[dict[str, str], list[dict[str, Any]]]:
             "department_id": resolved_id,
             "department_name": departments.get(resolved_id, ""),
             "joining_date": joining.isoformat() if joining else None,
+            "relieving_date": next((str(user.get(key) or details.get(key) or "")[:10] for key in ("date_of_leaving", "relieving_date", "resignation_date", "last_working_date") if user.get(key) or details.get(key)), None),
+            "is_active": user.get("is_active") is not False,
         })
     return departments, rows
 
@@ -4229,6 +4248,19 @@ def _calculate_daily_attendance(
 
     start = datetime.combine(selected_date, time.min, tzinfo=COMPANY_TZ)
     end = start + timedelta(days=1)
+    # For an overnight employee schedule, include the following morning's
+    # punches in this attendance date. The cutoff is four hours after the
+    # scheduled end so a late checkout is retained without absorbing the
+    # next day's normal shift.
+    scheduled = applicable_schedule(user_id, selected_date)
+    schedule_start = _hhmm_minutes(scheduled.get("scheduled_work_start_time"))
+    schedule_end = _hhmm_minutes(scheduled.get("scheduled_work_end_time"))
+    if schedule_start is not None and schedule_end is not None and schedule_end <= schedule_start:
+        end = datetime.combine(
+            selected_date + timedelta(days=1),
+            time(schedule_end // 60, schedule_end % 60),
+            tzinfo=COMPANY_TZ,
+        ) + timedelta(hours=4)
     raw_records = list(essl_raw_punches_collection.find(
         {
             "user_id": user_id,
@@ -4321,6 +4353,20 @@ def _calculate_daily_attendance(
                 continue
             normalized_breaks.append((break_start, break_end))
         normalized_breaks.sort(key=lambda pair: pair[0])
+        # Merge overlapping WFH break events so a duplicated/overlapping
+        # interval is never subtracted from work or counted twice.
+        merged_breaks: list[tuple[datetime, datetime | None]] = []
+        for break_start, break_end in normalized_breaks:
+            if not merged_breaks:
+                merged_breaks.append((break_start, break_end))
+                continue
+            previous_start, previous_end = merged_breaks[-1]
+            if previous_end is None or break_start <= previous_end:
+                merged_end = None if previous_end is None or break_end is None else max(previous_end, break_end)
+                merged_breaks[-1] = (previous_start, merged_end)
+            else:
+                merged_breaks.append((break_start, break_end))
+        normalized_breaks = merged_breaks
 
         working_intervals: list[dict[str, Any]] = []
         break_intervals: list[dict[str, Any]] = []
@@ -4402,6 +4448,8 @@ def _calculate_daily_attendance(
             "attendance_state": "In Progress" if is_open else ("Completed" if first_in else "Not Marked"),
             "working_minutes": working_minutes,
             "working_duration": _format_duration(working_minutes),
+            "elapsed_minutes": elapsed_minutes,
+            **_schedule_fields_for_date(user_id, selected_date),
             "outside_minutes": outside_minutes,
             "outside_duration": _format_duration(outside_minutes),
             "visible_break_minutes": visible_break_minutes,
@@ -4494,6 +4542,8 @@ def _calculate_daily_attendance(
         "attendance_state": "In Progress" if open_interval else ("Completed" if punch_times else "Not Marked"),
         "working_minutes": working_minutes,
         "working_duration": _format_duration(working_minutes),
+        "elapsed_minutes": elapsed_minutes,
+        **_schedule_fields_for_date(user_id, selected_date),
         "outside_minutes": outside_minutes,
         "outside_duration": _format_duration(outside_minutes),
         "visible_break_minutes": sum(item["duration_minutes"] for item in break_intervals),
@@ -4651,6 +4701,12 @@ def _monthly_report_rows(user_id: str, employee: dict[str, Any], year: int, mont
             "last_check_out": details.get("last_check_out") if record else None,
             "working_minutes": int(details.get("working_minutes") or 0),
             "working_duration": details.get("working_duration") or "0h 00m",
+            "total_duration_minutes": int(details.get("elapsed_minutes") or ((details.get("working_minutes") or 0) + (details.get("outside_minutes") or 0))),
+            "total_duration": _format_duration(int(details.get("elapsed_minutes") or ((details.get("working_minutes") or 0) + (details.get("outside_minutes") or 0)))),
+            "scheduled_work_start_time": (details.get("scheduled_work_start_time") or _schedule_fields_for_date(user_id, selected_date).get("scheduled_work_start_time")),
+            "scheduled_work_end_time": (details.get("scheduled_work_end_time") or _schedule_fields_for_date(user_id, selected_date).get("scheduled_work_end_time")),
+            "scheduled_work_duration": int(details.get("scheduled_work_duration") or _schedule_fields_for_date(user_id, selected_date).get("scheduled_work_duration") or 0),
+            "half_day_working_duration": int(details.get("half_day_working_duration") or _schedule_fields_for_date(user_id, selected_date).get("half_day_working_duration") or 0),
             "break_minutes": int(details.get("visible_break_minutes") or 0),
             "break_duration": details.get("break_duration") or "0h 00m",
             "break_intervals": break_intervals,
@@ -5047,8 +5103,13 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
         check_out = base.get("last_check_out") or day.get("check_out_time")
         source = base.get("attendance_source") or "—"
         status_text = day.get("status_label") or day.get("status") or "Not Marked"
+        schedule = _schedule_fields_for_date(user_id, selected)
         rows.append({
             **{key: value for key, value in base.items() if key not in {"status"}},
+            **schedule,
+            "total_duration_minutes": int(base.get("total_duration_minutes") or (int(base.get("working_minutes") or 0) + int(base.get("outside_minutes") or 0))),
+            "total_duration": base.get("total_duration") or _format_duration(int(base.get("total_duration_minutes") or (int(base.get("working_minutes") or 0) + int(base.get("outside_minutes") or 0)))),
+            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and int(base.get("working_minutes") or 0) >= int(schedule.get("half_day_working_duration") or 0)),
             "day": selected.strftime("%A"),
             "status": status_text,
             "check_in_text": _clock_text(check_in),
@@ -5071,6 +5132,12 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
         "rows": rows,
         "summary": {
             "total_days": len(rows),
+            "total_working_minutes": sum(int(item.get("working_minutes") or 0) for item in rows),
+            "total_working_duration": _format_duration(sum(int(item.get("working_minutes") or 0) for item in rows)),
+            "total_break_minutes": sum(int(item.get("break_minutes") or 0) for item in rows),
+            "total_break_duration": _format_duration(sum(int(item.get("break_minutes") or 0) for item in rows)),
+            "total_elapsed_minutes": sum(int(item.get("total_duration_minutes") or 0) for item in rows),
+            "total_elapsed_duration": _format_duration(sum(int(item.get("total_duration_minutes") or 0) for item in rows)),
             "permission_count": permission_count,
             "permission_total_minutes": all_permission_intervals,
             "permission_total_text": _permission_duration_text(all_permission_intervals),
@@ -5409,6 +5476,184 @@ def export_user_monthly_attendance(
     safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", employee_id).strip("_") or "employee"
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", employee_name).strip("_") or "employee"
     filename = f"Attendance_{safe_name}_{safe_id}_{month_name}_{year}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-employee monthly attendance export (HR Admin / Administrator)
+# ---------------------------------------------------------------------------
+
+def _export_employee_directory() -> list[dict[str, Any]]:
+    _, rows = _load_department_employees(include_inactive=True)
+    by_id = {str(row["user_id"]): row for row in rows}
+    users = list(users_collection.find({}))
+    result = []
+    for user in users:
+        user_id = str(user.get("_id") or "")
+        row = by_id.get(user_id)
+        if not row:
+            continue
+        details = db["employee_details"].find_one({"user_id": user_id}) or {}
+        master = db["employees"].find_one({"employee_id": str(user.get("employee_id") or "")}) or {}
+        row = {
+            **row,
+            "name": str(user.get("name") or master.get("employee_name") or "").strip(),
+            "employee_id": str(user.get("employee_id") or ""),
+            "employee_code": str(user.get("essl_employee_id") or ""),
+            "department_id": row.get("department_id") or "",
+            "department_name": row.get("department_name") or str(user.get("department") or details.get("department") or ""),
+            "joining_date": row.get("joining_date") or str(details.get("date_of_joining") or user.get("date_of_joining") or "")[:10] or None,
+            "relieving_date": row.get("relieving_date") or next((str(details.get(key) or user.get(key) or "")[:10] for key in ("date_of_leaving", "relieving_date", "resignation_date", "last_working_date") if details.get(key) or user.get(key)), None),
+            "is_active": user.get("is_active") is not False,
+        }
+        result.append(row)
+    result.sort(key=lambda item: (str(item.get("name") or "").casefold(), str(item.get("employee_id") or "")))
+    return result
+
+
+def _export_month_window(year: int, month: int) -> tuple[date, date]:
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a valid attendance month and year.")
+    today = company_today()
+    if (year, month) > (today.year, today.month):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Future attendance months cannot be exported.")
+    start = date(year, month, 1)
+    end = date(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def _employee_month_eligibility(employee: dict[str, Any], start: date, end: date) -> tuple[bool, str]:
+    joining = date.fromisoformat(str(employee["joining_date"])[:10]) if employee.get("joining_date") else None
+    leaving = date.fromisoformat(str(employee["relieving_date"])[:10]) if employee.get("relieving_date") else None
+    if joining and joining > end:
+        return False, "Joined after the selected month."
+    if leaving and leaving < start:
+        return False, "Employment ended before the selected month."
+    if not joining:
+        # Legacy records with no joining date remain selectable; attendance is still
+        # constrained by actual attendance data and existing project rules.
+        return True, "Joining date not recorded."
+    return True, ""
+
+
+@router.get("/export-options")
+def get_attendance_export_options(
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    department_id: str = Query(default="all"),
+    authorization: str | None = Header(default=None),
+):
+    _require_hr_admin(authorization, "Only HR Admin or Administrator can export employee attendance.")
+    start, end = _export_month_window(year, month)
+    _, all_departments = _load_department_employees(include_inactive=True)
+    employees = _export_employee_directory()
+    if department_id and department_id != "all":
+        employees = [item for item in employees if str(item.get("department_id") or "") == department_id]
+    result = []
+    for employee in employees:
+        eligible, reason = _employee_month_eligibility(employee, start, end)
+        result.append({
+            "user_id": employee["user_id"],
+            "employee_id": employee.get("employee_id") or "",
+            "employee_code": employee.get("employee_code") or "",
+            "name": employee.get("name") or "",
+            "department_id": employee.get("department_id") or "",
+            "department_name": employee.get("department_name") or "",
+            "joining_date": employee.get("joining_date"),
+            "relieving_date": employee.get("relieving_date"),
+            "is_active": bool(employee.get("is_active")),
+            "eligible": eligible,
+            "eligibility_message": reason,
+        })
+    return {
+        "year": year,
+        "month": month,
+        "employees": result,
+        "selected_count": sum(1 for item in result if item["eligible"]),
+    }
+
+
+
+
+@router.post("/export.xlsx")
+def export_multiple_employee_attendance(
+    payload: dict[str, Any],
+    authorization: str | None = Header(default=None),
+):
+    _require_hr_admin(authorization, "Only HR Admin or Administrator can export employee attendance.")
+    try:
+        year = int(payload.get("year"))
+        month = int(payload.get("month"))
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a valid attendance month and year.")
+    start, end = _export_month_window(year, month)
+    employee_ids = list(dict.fromkeys(str(value).strip() for value in (payload.get("employee_ids") or []) if str(value).strip()))
+    department_id = str(payload.get("department_id") or "all")
+    if not employee_ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select at least one eligible employee.")
+    if len(employee_ids) > 500:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select no more than 500 employees per export.")
+    if any(not ObjectId.is_valid(value) for value in employee_ids):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "One or more selected employee IDs are invalid.")
+
+    directory = {item["user_id"]: item for item in _export_employee_directory()}
+    _, dept_rows = _load_department_employees(include_inactive=True)
+    dept_by_user = {str(item["user_id"]): item.get("department_id") or "" for item in dept_rows}
+    selected = []
+    for user_id in employee_ids:
+        employee_info = directory.get(user_id)
+        if not employee_info:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Employee {user_id} was not found.")
+        eligible, reason = _employee_month_eligibility(employee_info, start, end)
+        if not eligible:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{employee_info.get('name') or user_id}: {reason}")
+        if department_id != "all" and dept_by_user.get(user_id) != department_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{employee_info.get('name') or user_id} does not belong to the selected department.")
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Employee {user_id} was not found.")
+        master = db["employees"].find_one({"employee_id": str(user.get("employee_id") or "")}) or {}
+        details = db["employee_details"].find_one({"user_id": user_id}) or {}
+        employee = {
+            **user,
+            "department": employee_info.get("department_name") or details.get("department") or master.get("department") or "",
+            "designation": details.get("designation") or master.get("designation") or user.get("designation") or "",
+            "date_of_joining": employee_info.get("joining_date"),
+            "date_of_leaving": employee_info.get("relieving_date"),
+        }
+        selected.append((employee_info, employee))
+
+    month_name = date(year, month, 1).strftime("%B")
+    company = db["companies"].find_one({"is_active": {"$ne": False}}, {"company_name": 1, "name": 1}) or {}
+    company_name = company.get("company_name") or company.get("name") or "HRMS"
+    generated_on = company_now().strftime("%d-%b-%Y %I:%M %p")
+
+    employee_reports = []
+    for info, employee in selected:
+        legacy_rows = _monthly_report_rows(str(employee["_id"]), employee, year, month)
+        complete = _complete_monthly_report(str(employee["_id"]), employee, year, month, legacy_rows)
+        rows = complete["rows"]
+        joining = date.fromisoformat(str(info["joining_date"])[:10]) if info.get("joining_date") else None
+        leaving = date.fromisoformat(str(info["relieving_date"])[:10]) if info.get("relieving_date") else None
+        rows = [
+            item for item in rows
+            if (not joining or date.fromisoformat(item["attendance_date"]) >= joining)
+            and (not leaving or date.fromisoformat(item["attendance_date"]) <= leaving)
+        ]
+        employee_reports.append({"info": info, "employee": employee, "rows": rows})
+
+    output = build_multi_employee_attendance_workbook(
+        employee_reports,
+        company_name=company_name,
+        month=month,
+        year=year,
+        generated_on=generated_on,
+    )
+    filename = f"Daily_Attendance_Report_{month_name}_{year}.xlsx"
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

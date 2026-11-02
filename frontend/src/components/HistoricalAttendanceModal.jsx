@@ -38,7 +38,7 @@ function monthsFromJoining(joiningDate) {
 function editableMonthKeys() {
   const today = companyDateParts();
   const first = new Date(Number(today.year), Number(today.month) - 1, 1);
-  return new Set([1, 2, 3].map((offset) => {
+  return new Set([0, 1, 2, 3].map((offset) => {
     const date = new Date(first.getFullYear(), first.getMonth() - offset, 1);
     return monthKey(date.getFullYear(), date.getMonth() + 1);
   }));
@@ -322,7 +322,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose }) {
           <div className="modal-header">
             <div>
               <h5 className="modal-title" id="historicalAttendanceTitle">Modify the Previous Attendance</h5>
-              <small className="text-muted">History is available from the employee joining month through the current month. The current month is view-only. Only the previous three completed months can be modified, subject to payroll approval locks.</small>
+              <small className="text-muted">History is available from the employee joining month through the current month. Previous dates in the current month and previous three completed months can be modified, subject to payroll approval locks. Today and future dates are view-only.</small>
             </div>
             <button type="button" className="btn-close" aria-label="Close" onClick={onClose} />
           </div>
@@ -403,7 +403,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose }) {
                             <td>{row.payroll_status || "—"}</td>
                             <td className="text-end text-nowrap">
                               <button type="button" className="btn btn-sm btn-outline-secondary me-1" onClick={() => setExpandedDate(expandedDate === row.attendance_date ? "" : row.attendance_date)}><i className="bi bi-eye me-1" />View</button>
-                              <button type="button" className="btn btn-sm btn-outline-primary me-1" disabled={!rowCanEdit} title={!rowCanEdit ? (row.is_before_joining ? "Before employee joining date" : payrollLocked || row.payroll_locked ? "Payroll is approved/processed/paid; view only." : "Only the previous three completed months can be modified.") : "Modify attendance"} onClick={() => beginEdit(row)}><i className="bi bi-pencil-square me-1" />Edit</button>
+                              <button type="button" className="btn btn-sm btn-outline-primary me-1" disabled={!rowCanEdit} title={!rowCanEdit ? (row.is_before_joining ? "Before employee joining date" : payrollLocked || row.payroll_locked ? "Payroll is approved/processed/paid; view only." : "Previous dates in the current month and previous three completed months can be modified.") : "Modify attendance"} onClick={() => beginEdit(row)}><i className="bi bi-pencil-square me-1" />Edit</button>
                               <button type="button" className="btn btn-sm btn-outline-dark" onClick={() => loadHistory(row.attendance_date)} title="View modification history"><i className="bi bi-clock-history me-1" />History</button>
                             </td>
                           </tr>
@@ -413,6 +413,9 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose }) {
                                 <div className="row g-3 p-2">
                                   <div className="col-6 col-lg-3"><strong>Working duration</strong><div>{row.working_duration || "0h 00m"}</div></div>
                                   <div className="col-6 col-lg-3"><strong>Break duration</strong><div>{row.break_duration || "0h 00m"}</div></div>
+                                  <div className="col-6 col-lg-3"><strong>Total duration</strong><div>{row.total_duration || "0h 00m"}</div></div>
+                                  <div className="col-6 col-lg-3"><strong>Scheduled time</strong><div>{row.scheduled_work_start_time || "—"} – {row.scheduled_work_end_time || "—"}</div></div>
+                                  <div className="col-6 col-lg-3"><strong>Half-day threshold</strong><div>{row.half_day_working_duration_text || "—"}{row.half_day_threshold_met ? " · Reached" : ""}</div></div>
                                   <div className="col-6 col-lg-3"><strong>Outside duration</strong><div>{row.outside_duration || "0h 00m"}</div></div>
                                   <div className="col-6 col-lg-3"><strong>Attendance state</strong><div>{row.attendance_state || "—"}</div></div>
                                   <div className="col-12 col-lg-6"><strong className="d-block mb-1">Working intervals</strong>{renderIntervals(row.working_intervals, "Work", "text-success")}</div>

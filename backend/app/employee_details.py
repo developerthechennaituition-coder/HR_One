@@ -3,7 +3,7 @@ import re
 
 from bson import ObjectId
 from fastapi import APIRouter, Header, HTTPException, Query, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from app.db.mongodb import db
 
@@ -83,6 +83,13 @@ def serialize_details(record: dict | None) -> dict:
             "city": "",
             "state": "",
             "country": "",
+            "working_type": "",
+            "scheduled_work_start_time": "",
+            "scheduled_work_end_time": "",
+            "scheduled_work_duration": 0,
+            "half_day_working_duration": 0,
+            "schedule_effective_from": "",
+            "working_schedule_history": [],
         }
 
     return {
@@ -101,6 +108,13 @@ def serialize_details(record: dict | None) -> dict:
         "city": record.get("city") or "",
         "state": record.get("state") or "",
         "country": record.get("country") or "",
+        "working_type": record.get("working_type") or "",
+        "scheduled_work_start_time": record.get("scheduled_work_start_time") or "",
+        "scheduled_work_end_time": record.get("scheduled_work_end_time") or "",
+        "scheduled_work_duration": int(record.get("scheduled_work_duration") or 0),
+        "half_day_working_duration": int(record.get("half_day_working_duration") or 0),
+        "schedule_effective_from": serialize_date(record.get("schedule_effective_from")) or "",
+        "working_schedule_history": record.get("working_schedule_history") or [],
     }
 
 
@@ -188,6 +202,9 @@ class EmployeeExtraDetailsPayload(BaseModel):
     date_of_birth: date | None = None
     blood_group: str = ""
     date_of_joining: date | None = None
+    working_type: str = ""
+    scheduled_work_start_time: str = ""
+    scheduled_work_end_time: str = ""
     work_stage: str = "Employee"
     work_field: str = ""
     nationality: str = ""
@@ -200,6 +217,29 @@ class EmployeeExtraDetailsPayload(BaseModel):
     city: str = ""
     state: str = ""
     country: str = ""
+
+    @model_validator(mode="after")
+    def validate_work_schedule(self):
+        self.working_type = (self.working_type or "").strip()
+        if self.working_type and self.working_type not in {"Full Time", "Part Time"}:
+            raise ValueError("Working Type must be Full Time or Part Time.")
+        start = (self.scheduled_work_start_time or "").strip()
+        end = (self.scheduled_work_end_time or "").strip()
+        if bool(start) != bool(end):
+            raise ValueError("Scheduled Work Start Time and End Time must both be provided.")
+        if self.working_type and not (start and end):
+            raise ValueError("Scheduled Work Start Time and End Time are required when Working Type is selected.")
+        if (start or end) and not self.working_type:
+            raise ValueError("Select a Working Type before entering scheduled work times.")
+        if start and end:
+            from app.working_details import clock_minutes, schedule_duration
+            if clock_minutes(start) is None or clock_minutes(end) is None:
+                raise ValueError("Scheduled work times must use HH:MM format.")
+            if schedule_duration(start, end) <= 0:
+                raise ValueError("Scheduled Work End Time must differ from Start Time.")
+        self.scheduled_work_start_time = start
+        self.scheduled_work_end_time = end
+        return self
 
     @field_validator("work_stage")
     @classmethod
@@ -352,6 +392,20 @@ def save_employee_details(
     now = datetime.now(timezone.utc)
 
     values = payload.model_dump(mode="json")
+    from app.working_details import record_schedule_change
+    existing_details = employee_details_collection.find_one({"user_id": str(target_user["_id"])}) or {}
+    from app.attendance import company_today
+    schedule_effective_date = (
+        company_today()
+        if existing_details.get("schedule_effective_from")
+        else (payload.date_of_joining or company_today())
+    )
+    schedule_fields = record_schedule_change(
+        existing_details,
+        values,
+        schedule_effective_date,
+    )
+    values.update(schedule_fields)
     values["updated_at"] = now
 
     employee_details_collection.update_one(

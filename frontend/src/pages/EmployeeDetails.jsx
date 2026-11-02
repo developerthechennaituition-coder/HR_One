@@ -81,6 +81,51 @@ function formatDateTime(value) {
   }
 }
 
+/**
+ * Return the scheduled duration in minutes.
+ * Supports overnight schedules (for example, 22:00 to 06:00),
+ * matching the backend schedule_duration() calculation.
+ * Invalid or identical times return 0.
+ */
+function getScheduleMinutes(startTime, endTime) {
+  const toMinutes = (value) => {
+    if (typeof value !== "string") return null;
+    const match = value.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+    if (!match) return null;
+
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+
+    return hours * 60 + minutes;
+  };
+
+  const start = toMinutes(startTime);
+  const end = toMinutes(endTime);
+  if (start === null || end === null || start === end) return 0;
+
+  return (end - start + 1440) % 1440;
+}
+
+/**
+ * Format a duration in minutes for the Working Details section.
+ * Example: 570 -> "09 Hours 30 Minutes".
+ */
+function formatScheduleDuration(totalMinutes) {
+  const minutes = Number(totalMinutes);
+
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    return "0 Hours 00 Minutes";
+  }
+
+  const wholeMinutes = Math.floor(minutes);
+  const hours = Math.floor(wholeMinutes / 60);
+  const remainder = wholeMinutes % 60;
+
+  return `${String(hours).padStart(2, "0")} Hours ${String(remainder).padStart(2, "0")} Minutes`;
+}
+
 function getDisplayValue(value) {
   if (
     value === null ||
@@ -188,6 +233,12 @@ function normalizeEmployeeDetails(data) {
     date_of_joining:
       details?.date_of_joining ||
       "",
+
+    working_type: details?.working_type || "",
+    scheduled_work_start_time: details?.scheduled_work_start_time || "",
+    scheduled_work_end_time: details?.scheduled_work_end_time || "",
+    scheduled_work_duration: Number(details?.scheduled_work_duration || 0),
+    half_day_working_duration: Number(details?.half_day_working_duration || 0),
 
     work_stage:
       details?.work_stage ||
@@ -902,6 +953,10 @@ export default function EmployeeDetails({
         employee?.date_of_joining ||
         null,
 
+      working_type: employee?.working_type || "",
+      scheduled_work_start_time: employee?.scheduled_work_start_time || "",
+      scheduled_work_end_time: employee?.scheduled_work_end_time || "",
+
       work_stage:
         employee?.work_stage || "Employee",
 
@@ -1049,6 +1104,29 @@ export default function EmployeeDetails({
     }
 
     if (!canEditDetails) {
+      return;
+    }
+
+    const startTime = employee?.scheduled_work_start_time || "";
+    const endTime = employee?.scheduled_work_end_time || "";
+    if (Boolean(startTime) !== Boolean(endTime)) {
+      setError("Please enter both scheduled work start and end times.");
+      return;
+    }
+    if (employee?.working_type && !(startTime && endTime)) {
+      setError("Scheduled work start and end times are required when Working Type is selected.");
+      return;
+    }
+    if ((startTime || endTime) && !employee?.working_type) {
+      setError("Please select a Working Type before entering scheduled work times.");
+      return;
+    }
+    if (startTime && endTime && getScheduleMinutes(startTime, endTime) === 0) {
+      setError("Scheduled work start and end times cannot be identical.");
+      return;
+    }
+    if (employee?.working_type && !["Full Time", "Part Time"].includes(employee.working_type)) {
+      setError("Please select a valid Working Type.");
       return;
     }
 
@@ -1322,6 +1400,9 @@ export default function EmployeeDetails({
     value,
     label: value,
   }));
+
+  const scheduledMinutes = getScheduleMinutes(employee?.scheduled_work_start_time, employee?.scheduled_work_end_time);
+  const halfDayMinutes = Math.floor(scheduledMinutes / 2);
 
   /* =========================================================
      UI
@@ -1753,6 +1834,55 @@ export default function EmployeeDetails({
           />
         </div>
 
+      </section>
+
+      {/* =====================================================
+          WORKING DETAILS
+      ===================================================== */}
+      <section className="employee-details-section">
+        <div className="employee-details-section-header">
+          <div>
+            <h3>Working Details</h3>
+            <p>Employee working type and scheduled daily working hours</p>
+          </div>
+        </div>
+        <div className="employee-details-grid">
+          <SelectField
+            label="Working Type"
+            name="working_type"
+            value={employee.working_type || ""}
+            options={[
+              { value: "Full Time", label: "Full Time" },
+              { value: "Part Time", label: "Part Time" },
+            ]}
+            editing={isEditing}
+            onChange={handleChange}
+          />
+          <Field
+            label="Scheduled Work Start Time"
+            name="scheduled_work_start_time"
+            type="time"
+            value={employee.scheduled_work_start_time || ""}
+            editing={isEditing}
+            onChange={handleChange}
+          />
+          <Field
+            label="Scheduled Work End Time"
+            name="scheduled_work_end_time"
+            type="time"
+            value={employee.scheduled_work_end_time || ""}
+            editing={isEditing}
+            onChange={handleChange}
+          />
+          <div className="employee-details-field">
+            <label className="employee-details-label">Office Day Duration</label>
+            <div className="employee-details-value">{formatScheduleDuration(scheduledMinutes)}</div>
+          </div>
+          <div className="employee-details-field">
+            <label className="employee-details-label">Half-Day Working Duration</label>
+            <div className="employee-details-value">{formatScheduleDuration(halfDayMinutes)}</div>
+          </div>
+        </div>
       </section>
 
       {/* =====================================================

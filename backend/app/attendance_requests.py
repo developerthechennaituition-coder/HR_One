@@ -443,6 +443,8 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
     ctx = _month_context(user, year, month)
     user_id = str(user["_id"])
     employee_id = str(user.get("employee_id") or "")
+    from app.working_details import applicable_schedule
+    employee_working_details = db["employee_details"].find_one({"user_id": user_id}) or {}
     today = ctx["today"]
     period = f"{year:04d}-{month:02d}"
     claims = {
@@ -486,6 +488,11 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             }
 
         options, option_notes = _status_options(day_status, usage, weekly_limit)
+        schedule = applicable_schedule(user_id, current, details=employee_working_details)
+        daily_metrics = {}
+        if record:
+            from app.attendance import _calculate_daily_attendance
+            daily_metrics = _calculate_daily_attendance(user_id, current, user)
         reason = None
         if current >= today:
             reason = "Requests are for past dates only; today's attendance can still be marked."
@@ -511,6 +518,17 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             "attendance_source": record.get("attendance_source") if record else None,
             "check_in_time": record.get("check_in_time") if record else None,
             "check_out_time": record.get("check_out_time") if record else None,
+            "working_duration": daily_metrics.get("working_duration") or "0h 00m",
+            "working_minutes": int(daily_metrics.get("working_minutes") or 0),
+            "break_duration": daily_metrics.get("break_duration") or "0h 00m",
+            "break_minutes": int(daily_metrics.get("visible_break_minutes") or 0),
+            "working_type": schedule.get("working_type") or "",
+            "scheduled_work_start_time": schedule.get("scheduled_work_start_time") or "",
+            "scheduled_work_end_time": schedule.get("scheduled_work_end_time") or "",
+            "scheduled_work_duration": int(schedule.get("scheduled_work_duration") or 0),
+            "half_day_working_duration": int(schedule.get("half_day_working_duration") or 0),
+            "half_day_working_duration_text": schedule.get("half_day_working_duration_text") or "",
+            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and int(daily_metrics.get("working_minutes") or 0) >= int(schedule.get("half_day_working_duration") or 0)),
             "leave_type_code": record.get("leave_type_code") if record else (upcoming_leave or {}).get("leave_type_code"),
             "upcoming_leave": upcoming_leave if day_status == "Leave" else None,
             "permissions": permissions,

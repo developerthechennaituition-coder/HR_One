@@ -58,50 +58,54 @@ function CompanySetup({ currentUser }) {
     employee_ids: company.employee_ids || [],
   });
 
-  // Fetch active companies when this feature is opened.
-  useEffect(() => {
-    const loadCompanies = async () => {
-      try {
-        const [response, employeeResponse, usersResponse] = await Promise.all([
-          fetch(API_URL),
-          fetch(HRONE_API_BASE + "/api/employees"),
-          fetch(HRONE_API_BASE + "/api/users"),
-        ]);
-        if (!response.ok) {
-          throw new Error(await readError(response));
-        }
-        const data = await response.json();
-        const employeeData = employeeResponse.ok ? await employeeResponse.json() : [];
-        const userData = usersResponse.ok ? await usersResponse.json() : [];
-
-        // Employee Master stores user accounts, while some HRMS installations also
-        // maintain separate records in the employees collection. Include both sources.
-        // Use each record's Mongo id as the assignment key because the backend stores
-        // branch employee_ids against these stable record identifiers.
-        const employeeRecords = [
-          ...(Array.isArray(employeeData) ? employeeData : []),
-          ...(Array.isArray(userData) ? userData.filter((user) =>
+  // Refresh employee records whenever the assignment form is opened. Employee
+  // profiles are edited in User Management, so a page-level snapshot can become
+  // stale while Company Setup remains mounted.
+  const refreshEmployees = async () => {
+    const [employeeResponse, usersResponse] = await Promise.all([
+      fetch(HRONE_API_BASE + "/api/employees"),
+      fetch(HRONE_API_BASE + "/api/users"),
+    ]);
+    const employeeData = employeeResponse.ok ? await employeeResponse.json() : [];
+    const userData = usersResponse.ok ? await usersResponse.json() : [];
+    const employeeRecords = [
+      ...(Array.isArray(employeeData) ? employeeData : []),
+      ...(Array.isArray(userData)
+        ? userData.filter((user) =>
             user?.is_active !== false &&
             (user?.employee_id || String(user?.role || "").trim().toLowerCase() === "employee")
           ).map((user) => ({
             ...user,
             employee_name: user.employee_name || user.name,
             email: user.email || user.work_email,
-          })) : []),
-        ];
-        const uniqueEmployees = new Map();
-        employeeRecords.forEach((employee) => {
-          const id = String(employee.id || employee._id || "").trim();
-          if (!id) return;
-          const existing = uniqueEmployees.get(id);
-          uniqueEmployees.set(id, {
-            ...existing,
-            ...employee,
-            id,
-            employee_name: employee.employee_name || employee.name || existing?.employee_name || "Unnamed employee",
-          });
-        });
-        setEmployees([...uniqueEmployees.values()]);
+          }))
+        : []),
+    ];
+    const uniqueEmployees = new Map();
+    employeeRecords.forEach((employee) => {
+      if (employee?.is_active === false) return;
+      const id = String(employee.id || employee._id || "").trim();
+      if (!id) return;
+      const existing = uniqueEmployees.get(id);
+      uniqueEmployees.set(id, {
+        ...existing,
+        ...employee,
+        id,
+        employee_name: employee.employee_name || employee.name || existing?.employee_name || "Unnamed employee",
+      });
+    });
+    setEmployees([...uniqueEmployees.values()]);
+  };
+
+  // Fetch active companies when this feature is opened.
+  useEffect(() => {
+    const loadCompanies = async () => {
+      try {
+        const [response] = await Promise.all([fetch(API_URL), refreshEmployees()]);
+        if (!response.ok) {
+          throw new Error(await readError(response));
+        }
+        const data = await response.json();
         setCompanies(
           (Array.isArray(data) ? data : []).map((company) => ({
             ...company,
@@ -159,6 +163,7 @@ function CompanySetup({ currentUser }) {
     setEmployeeDropdownOpen(false);
     setFeedback({ type: "", message: "" });
     setIsFormOpen(true);
+    refreshEmployees().catch((error) => setError(error.message || "Unable to refresh employees."));
   };
 
   const openEditForm = (company) => {
@@ -168,6 +173,7 @@ function CompanySetup({ currentUser }) {
     setEmployeeDropdownOpen(false);
     setFeedback({ type: "", message: "" });
     setIsFormOpen(true);
+    refreshEmployees().catch((error) => setError(error.message || "Unable to refresh employees."));
   };
 
   const closeForm = () => {
@@ -424,7 +430,7 @@ function CompanySetup({ currentUser }) {
                   <div className="d-flex flex-wrap gap-2 mt-2">
                     {formValues.employee_ids.map((employeeId) => {
                       const employee = employees.find((item) => String(item.id || item._id || "") === String(employeeId));
-                      const name = employee?.employee_name || employee?.name || employee?.employee_id || "Selected employee";
+                      const name = employee?.employee_name || employee?.name || employee?.employee_id || `Employee (${String(employeeId).slice(-6)})`;
                       return (
                         <span key={employeeId} className="badge rounded-pill text-bg-light border d-inline-flex align-items-center gap-2 py-2 px-3">
                           {name}

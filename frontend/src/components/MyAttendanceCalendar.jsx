@@ -200,7 +200,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                       disabled={!clickable}
                       aria-pressed={selected}
                       aria-label={`${day.attendance_date}: ${label}${viewable ? " (upcoming, view details)" : readOnly ? " (upcoming, not selectable)" : ""}`}
-                      title={[label, day.check_in_time && `In ${day.check_in_time}`, day.check_out_time && `Out ${day.check_out_time}`, day.request && `Request ${day.request.request_number} ${day.request.status}`, ...(day.permissions || []).map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`), viewable ? "Upcoming date · click to view details" : readOnly && "Upcoming date · view only"].filter(Boolean).join(" · ")}
+                      title={[label, day.check_in_time && `In ${day.check_in_time}`, day.check_out_time && `Out ${day.check_out_time}`, day.working_duration && `Work ${day.working_duration}`, day.break_duration && `Break ${day.break_duration}`, day.request && `Request ${day.request.request_number} ${day.request.status}`, ...(day.permissions || []).map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`), viewable ? "Upcoming date · click to view details" : readOnly && "Upcoming date · view only"].filter(Boolean).join(" · ")}
                       style={{
                         minHeight: 64, minWidth: 0, textAlign: "left", padding: "6px 8px", borderRadius: 8,
                         border: selected ? "2px solid #0d6efd" : readOnly ? "1px dashed rgba(0,0,0,0.25)" : "1px solid rgba(0,0,0,0.12)",
@@ -216,6 +216,11 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                         </span>
                       </div>
                       <div style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</div>
+                      {day.has_record && day.working_duration && (
+                        <div className="text-success" style={{ fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          Work {day.working_duration}
+                        </div>
+                      )}
                       {day.permissions?.length > 0 && (
                         <div style={{ fontSize: 10, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           P {day.permissions[0].start_time}–{day.permissions[0].end_time}

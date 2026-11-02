@@ -764,6 +764,10 @@ def serialize_company(company: dict) -> dict:
 
 def serialize_employee(employee: dict) -> dict:
     employee["id"] = str(employee.pop("_id"))
+    # Older employee documents may not contain this field. Keep their API
+    # representation consistent with the assignment validator: absent means
+    # active, while an explicit False remains inactive.
+    employee.setdefault("is_active", True)
     return employee
 
 
@@ -778,6 +782,9 @@ def serialize_user(user: dict) -> dict:
         if isinstance(value, datetime) and value.tzinfo is None:
             safe_user[field] = value.replace(tzinfo=timezone.utc)
     safe_user["id"] = str(user["_id"])
+    # Legacy user records may predate the is_active field. Keep API output,
+    # selector behavior and branch-assignment validation consistent.
+    safe_user.setdefault("is_active", True)
     return safe_user
 
 
@@ -1051,18 +1058,43 @@ def validate_employee_reference(employee_id: str):
 
 
 def validate_company_employee_ids(employee_ids: list[str]) -> list[str]:
-    """Accept stable Mongo IDs from either Employee Master user records or legacy employees."""
-    normalized = list(dict.fromkeys(str(value).strip() for value in employee_ids if str(value).strip()))
+    """Validate stable Mongo document IDs from Employee Master or legacy employees.
+
+    Older HRMS records may predate the ``is_active`` field.  Those records are
+    treated as active unless they are explicitly marked inactive, matching the
+    employee list API and the Company Setup selector.  The employee code is
+    never used as a relationship key.
+    """
+    normalized = list(dict.fromkeys(
+        str(value).strip() for value in (employee_ids or []) if str(value).strip()
+    ))
     for employee_id in normalized:
         if not ObjectId.is_valid(employee_id):
-            raise HTTPException(status_code=422, detail=f"Invalid employee selection: {employee_id}")
-        object_id = ObjectId(employee_id)
-        employee_record = employees_collection.find_one({"_id": object_id, "is_active": True})
-        user_record = users_collection.find_one({"_id": object_id, "is_active": True})
-        if employee_record is None and user_record is None:
             raise HTTPException(
                 status_code=422,
-                detail=f"Selected employee {employee_id} does not exist or is inactive.",
+                detail=f"Invalid employee database ID '{employee_id}'. Select the employee again from the employee list.",
+            )
+
+        object_id = ObjectId(employee_id)
+        employee_record = employees_collection.find_one({"_id": object_id})
+        user_record = users_collection.find_one({"_id": object_id})
+
+        def is_assignable(record: dict | None) -> bool:
+            if record is None or record.get("is_active", True) is False:
+                return False
+            # Legacy employees use a text status as well as (or instead of)
+            # the boolean flag. Explicit Inactive must never be assignable.
+            return str(record.get("status", "Active")).strip().casefold() not in {
+                "inactive", "terminated", "deleted"
+            }
+
+        if not (is_assignable(employee_record) or is_assignable(user_record)):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Selected employee '{employee_id}' was not found in the employee records, "
+                    "or is inactive. Refresh the employee list and select an active employee."
+                ),
             )
     return normalized
 
@@ -2918,7 +2950,10 @@ def create_employee(payload: EmployeePayload):
 
 @router.get("/api/employees", response_model=list[EmployeeResponse])
 def list_employees():
-    employees = employees_collection.find({"is_active": True}).sort("created_at", -1)
+    employees = employees_collection.find({
+        "is_active": {"$ne": False},
+        "status": {"$not": {"$regex": "^(inactive|terminated|deleted)$", "$options": "i"}},
+    }).sort("created_at", -1)
     return [serialize_employee(employee) for employee in employees]
 
 

@@ -53,6 +53,11 @@ const EMPTY = {
   working_intervals: [],
   break_intervals: [],
   attendance_state: null,
+  scheduled_work_start_time: "",
+  scheduled_work_end_time: "",
+  half_day_working_duration_text: "",
+  half_day_threshold_met: false,
+  elapsed_minutes: 0,
   permission_start_time: "",
   permission_end_time: "",
   permission_reason: "",
@@ -84,6 +89,11 @@ const toState = (record) => ({
   working_intervals: record?.working_intervals || [],
   break_intervals: record?.break_intervals || [],
   attendance_state: record?.attendance_state || null,
+  scheduled_work_start_time: record?.scheduled_work_start_time || "",
+  scheduled_work_end_time: record?.scheduled_work_end_time || "",
+  half_day_working_duration_text: record?.half_day_working_duration_text || "",
+  half_day_threshold_met: Boolean(record?.half_day_threshold_met),
+  elapsed_minutes: Number(record?.elapsed_minutes || 0),
   permission_start_time: record?.approved_permission?.start_time || record?.permission_start_time || "",
   permission_end_time: record?.approved_permission?.end_time || record?.permission_end_time || "",
   permission_reason: record?.approved_permission?.reason || "",
@@ -897,7 +907,7 @@ function Attendance({ session }) {
               />
 
               <small className="text-muted">
-Daily Attendance manages today's records. Use Historical Attendance Modification for eligible previous three completed months.
+Daily Attendance manages today's records. Historical Attendance Modification supports previous dates in the current month and previous three completed months, subject to payroll locks.
               </small>
             </div>
 
@@ -1295,9 +1305,12 @@ Daily Attendance manages today's records. Use Historical Attendance Modification
 
                         <td>
                           <div className="small">
+                            <div><span className="text-muted">Scheduled:</span> <strong>{current.scheduled_work_start_time || "—"} – {current.scheduled_work_end_time || "—"}</strong></div>
                             <div><span className="text-muted">Work:</span> <strong className="text-success">{current.working_duration}</strong></div>
+                            <div><span className="text-muted">Total:</span> <strong>{Math.floor(current.elapsed_minutes / 60)}h {String(current.elapsed_minutes % 60).padStart(2, "0")}m</strong></div>
                             <div><span className="text-muted">Outside:</span> <strong>{current.outside_duration}</strong></div>
                             <div><span className="text-muted">Breaks &gt;10m:</span> <strong>{current.break_duration}</strong></div>
+                            {current.half_day_working_duration_text && <div><span className="text-muted">Half-day threshold:</span> <strong>{current.half_day_working_duration_text}{current.half_day_threshold_met ? " · Reached" : ""}</strong></div>}
                           </div>
                           {(current.working_intervals?.length > 0 || current.break_intervals?.length > 0) && (
                             <details className="small mt-1">
