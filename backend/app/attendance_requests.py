@@ -38,8 +38,12 @@ from app.attendance import (
     company_today,
     users_collection,
     validate_calendar_month,
+    _calculate_daily_attendance,
+    _going_by_minutes,
+    _format_duration,
 )
 from app.db.mongodb import db
+from app.attendance_calculations import classify_half_day, select_weekly_off_dates, effective_working_minutes, attendance_issue, union_interval_minutes, permission_minutes_outside_total_duration
 
 router = APIRouter(prefix="/api/attendance-requests", tags=["Attendance Requests"])
 logger = logging.getLogger(__name__)
@@ -96,6 +100,29 @@ def ensure_attendance_request_indexes() -> None:
 @router.on_event("startup")
 def startup_attendance_requests() -> None:
     ensure_attendance_request_indexes()
+
+
+@router.on_event("startup")
+def startup_finalize_completed_month_weekly_offs() -> None:
+    """Catch up the last completed month for every active employee on startup.
+
+    Month views also run the same idempotent finalizer lazily, so employees are
+    still processed if the server was offline at the month boundary.
+    """
+    today = company_today()
+    previous_month_end = today.replace(day=1) - timedelta(days=1)
+    year, month = previous_month_end.year, previous_month_end.month
+    start = date(year, month, 1).isoformat()
+    end = (previous_month_end + timedelta(days=1)).isoformat()
+    for employee in users_collection.find({"is_active": {"$ne": False}}):
+        user_id = str(employee.get("_id") or "")
+        if not user_id:
+            continue
+        try:
+            _sync_leave_for_user_range(user_id, start, previous_month_end.isoformat())
+            _ensure_monthly_auto_weekly_offs(employee, year, month)
+        except Exception:
+            logger.exception("Automatic weekly-off finalization failed for employee %s", user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -250,31 +277,214 @@ def _permissions_by_date(user_id: str, start: date, end: date) -> dict[date, lis
     return result
 
 
+def _ensure_monthly_auto_weekly_offs(user: dict[str, Any], year: int, month: int) -> int:
+    """Finalize up to the policy limit of weekly offs after a month is complete.
+
+    Only absent/Not Marked dates are candidates. Existing attendance, approved
+    leave, holidays and HR-edited rows are never replaced. The selection is
+    deterministic and spread across distinct calendar weeks where possible.
+    """
+    start = date(year, month, 1)
+    end = date(year, month, monthrange(year, month)[1])
+    today = company_today()
+    if end >= today:
+        return 0
+
+    user_id = str(user.get("_id") or "")
+    if not user_id:
+        return 0
+    employee_id = str(user.get("employee_id") or "")
+    if employee_id:
+        payroll = db["monthly_payroll_records"].find_one(
+            {"employee_id": employee_id, "period": f"{year:04d}-{month:02d}"},
+            {"status": 1},
+        ) or {}
+        if payroll.get("status") in PAYROLL_FINALIZED_STATUSES:
+            return 0
+
+    period_start, period_end = start.isoformat(), (end + timedelta(days=1)).isoformat()
+    existing_records = list(attendance_collection.find({
+        "user_id": user_id,
+        "attendance_date": {"$gte": period_start, "$lt": period_end},
+    }))
+    records = {str(row.get("attendance_date") or "")[:10]: row for row in existing_records}
+    pending_claim_dates = {
+        str(item.get("attendance_date") or "")[:10]
+        for item in attendance_request_date_claims_collection.find({
+            "user_id": user_id,
+            "attendance_date": {"$gte": period_start, "$lt": period_end},
+        })
+    }
+    hr_admin_modified_dates = {
+        str(item.get("attendance_date") or "")[:10]
+        for item in db["attendance_modification_history"].find({
+            "user_id": user_id,
+            "attendance_date": {"$gte": period_start, "$lt": period_end},
+            "modified_by_role": {"$in": ["HR Admin", "hr_admin", "hr-admin"]},
+        }, {"attendance_date": 1})
+    }
+    existing_weekly = [
+        iso for iso, row in records.items()
+        if str(row.get("status") or "").strip().casefold() in {"weekly off", "weekly-off", "week off"}
+    ]
+    limit = min(4, _weekly_off_limit())
+    slots = max(0, limit - len(existing_weekly))
+    if slots <= 0:
+        return 0
+
+    holidays = leave._holiday_names(user, start, end)
+    joining = leave._joining_date(user)
+    preferred_weekdays = company_weekly_off_weekdays()
+    candidates: list[date] = []
+    cursor = start
+    while cursor <= end:
+        iso = cursor.isoformat()
+        record = records.get(iso)
+        if iso in pending_claim_dates or iso in hr_admin_modified_dates:
+            cursor += timedelta(days=1)
+            continue
+        if joining and cursor < joining:
+            cursor += timedelta(days=1)
+            continue
+        if cursor in holidays:
+            cursor += timedelta(days=1)
+            continue
+        if record:
+            status_text = str(record.get("status") or "Not Marked").strip().casefold()
+            if status_text != "not marked":
+                cursor += timedelta(days=1)
+                continue
+            if (
+                record.get("check_in_time") or record.get("check_out_time")
+                or record.get("hr_admin_modified")
+                or str(record.get("attendance_source") or "").upper() in {"ADMIN", "MANUAL", "ATTENDANCE_REQUEST"}
+            ):
+                cursor += timedelta(days=1)
+                continue
+        candidates.append(cursor)
+        cursor += timedelta(days=1)
+
+    if not candidates:
+        return 0
+
+    existing_weeks = {date.fromisoformat(iso).isocalendar()[:2] for iso in existing_weekly if iso}
+    candidates_for_selection = [
+        candidate for candidate in candidates
+        if candidate.isocalendar()[:2] not in existing_weeks
+    ]
+    selected_dates = select_weekly_off_dates(candidates_for_selection, slots, preferred_weekdays)
+
+    created = 0
+    for selected in sorted(selected_dates):
+        iso = selected.isoformat()
+        record = records.get(iso)
+        update = {
+            "employee_id": employee_id,
+            "status": "Weekly Off",
+            "attendance_source": "AUTO_WEEKLY_OFF",
+            "is_auto_generated_weekly_off": True,
+            "auto_weekly_off_period": f"{year:04d}-{month:02d}",
+            "auto_weekly_off_generated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        try:
+            did_create = False
+            if record:
+                result = attendance_collection.update_one(
+                    {"_id": record["_id"], "status": {"$in": [None, "Not Marked"]}, "check_in_time": {"$in": [None, ""]}, "check_out_time": {"$in": [None, ""]}},
+                    {"$set": update},
+                )
+                if result.modified_count:
+                    created += 1
+                    did_create = True
+            else:
+                result = attendance_collection.update_one(
+                    {
+                        "user_id": user_id,
+                        "attendance_date": iso,
+                        "status": {"$in": [None, "Not Marked"]},
+                        "check_in_time": {"$in": [None, ""]},
+                        "check_out_time": {"$in": [None, ""]},
+                    },
+                    {"$setOnInsert": {
+                        "user_id": user_id,
+                        "attendance_date": iso,
+                        "created_at": datetime.now(timezone.utc),
+                    }, "$set": update},
+                    upsert=True,
+                )
+                if result.upserted_id or result.modified_count:
+                    created += 1
+                    did_create = True
+            if did_create:
+                db["attendance_modification_history"].insert_one({
+                    "user_id": user_id,
+                    "attendance_date": iso,
+                    "modified_by": "SYSTEM",
+                    "modified_by_role": "System",
+                    "action": "AUTO_WEEKLY_OFF_GENERATED",
+                    "new_status": "Weekly Off",
+                    "reason": "Automatically generated after monthly attendance completion.",
+                    "modified_at": datetime.now(timezone.utc),
+                })
+        except DuplicateKeyError:
+            # Another concurrent request created this date. Never overwrite it.
+            continue
+    return created
+
+
 def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
     """Attendance data shared by the calendar, request creation and HR review."""
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     user_id = str(user["_id"])
     today = company_today()
-    # Holiday, leave and permission details are shown only up to the 90th day.
-    window_end = today + timedelta(days=CALENDAR_FORWARD_DAYS)
-    # Same lazy approved-leave sync as GET /api/attendance/my (idempotent).
     _sync_leave_for_user_range(user_id, start.isoformat(), end.isoformat())
+    _ensure_monthly_auto_weekly_offs(user, year, month)
+    window_end = today + timedelta(days=CALENDAR_FORWARD_DAYS)
+    records = {
+        str(record.get("attendance_date"))[:10]: record
+        for record in attendance_collection.find(
+            {"user_id": user_id, "attendance_date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
+        )
+    }
+    holidays = leave._holiday_names(user, start, end)
+    joining = leave._joining_date(user)
+    upcoming_leave = _upcoming_leave(user_id, start, min(end, window_end), today)
+    configured_weekdays = company_weekly_off_weekdays()
+    limit = min(4, _weekly_off_limit())
+    existing_weekly_dates = {
+        date.fromisoformat(iso) for iso, record in records.items()
+        if str(record.get("status") or "").casefold() == "weekly off"
+    }
+    scheduled_weekly_off_dates = set(existing_weekly_dates)
+    if end >= today:
+        candidates = []
+        cursor = start
+        while cursor <= end:
+            iso = cursor.isoformat()
+            record = records.get(iso)
+            if (cursor.weekday() in configured_weekdays
+                    and cursor not in holidays
+                    and cursor not in upcoming_leave
+                    and (not joining or cursor >= joining)
+                    and (not record or str(record.get("status") or "").casefold() in {"not marked", "weekly off"})):
+                candidates.append(cursor)
+            cursor += timedelta(days=1)
+        remaining = max(0, limit - len(scheduled_weekly_off_dates))
+        scheduled_weekly_off_dates.update(select_weekly_off_dates(candidates, remaining, configured_weekdays))
     return {
         "start": start,
         "end": end,
-        "records": {
-            str(record.get("attendance_date"))[:10]: record
-            for record in attendance_collection.find(
-                {"user_id": user_id, "attendance_date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}
-            )
-        },
-        "holidays": leave._holiday_names(user, start, end),
-        "weekly_offs": company_weekly_off_weekdays(),
-        "joining": leave._joining_date(user),
+        "records": records,
+        "holidays": holidays,
+        "weekly_offs": configured_weekdays,
+        "scheduled_weekly_off_dates": scheduled_weekly_off_dates,
+        "joining": joining,
         "today": today,
+        "month_completed": end < today,
         "window_end": window_end,
-        "upcoming_leave": _upcoming_leave(user_id, start, min(end, window_end), today),
+        "upcoming_leave": upcoming_leave,
         "permissions": _permissions_by_date(user_id, start, min(end, window_end)),
     }
 
@@ -292,12 +502,12 @@ def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any
             return "Holiday"
         if current in ctx.get("upcoming_leave", {}):
             return "Leave"
-        if current.weekday() in ctx["weekly_offs"]:
+        if current in ctx.get("scheduled_weekly_off_dates", set()):
             return "Weekly Off"
         return "Upcoming"
     if current in ctx["holidays"]:
         return "Holiday"
-    if current.weekday() in ctx["weekly_offs"]:
+    if current in ctx.get("scheduled_weekly_off_dates", set()):
         return "Weekly Off"
     if ctx["joining"] and current < ctx["joining"]:
         return BEFORE_JOINING
@@ -307,7 +517,7 @@ def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any
 def _weekly_off_limit() -> int:
     """Weekly Offs per Month from the HR-managed company policy."""
     try:
-        return int(leave._company_policy().get("weekly_offs_per_month") or DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT)
+        return min(4, int(leave._company_policy().get("weekly_offs_per_month") or DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT))
     except (TypeError, ValueError):
         return DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT
 
@@ -489,10 +699,47 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
 
         options, option_notes = _status_options(day_status, usage, weekly_limit)
         schedule = applicable_schedule(user_id, current, details=employee_working_details)
-        daily_metrics = {}
-        if record:
-            from app.attendance import _calculate_daily_attendance
-            daily_metrics = _calculate_daily_attendance(user_id, current, user)
+        daily_metrics = _calculate_daily_attendance(user_id, current, user)
+        day_check_in = daily_metrics.get("first_check_in") or (record or {}).get("check_in_time")
+        day_check_out = daily_metrics.get("last_check_out") or (record or {}).get("check_out_time")
+        day_total_minutes = int(daily_metrics.get("elapsed_minutes") or 0)
+        approved_permission_intervals = [
+            (item.get("start_time"), item.get("end_time"))
+            for item in permissions if str(item.get("status") or "").casefold() == "approved"
+        ]
+        permission_minutes = union_interval_minutes(approved_permission_intervals)
+        permission_additional_minutes = permission_minutes_outside_total_duration(approved_permission_intervals, day_check_in, day_check_out)
+        effective_minutes = effective_working_minutes(day_total_minutes, permission_additional_minutes)
+        day_completed = bool(current < today or (current == today and day_check_out and daily_metrics.get("attendance_state") != "In Progress"))
+        leave_part = (record or {}).get("leave_day_part") or (upcoming_leave or {}).get("day_part")
+        half_day = classify_half_day(
+            total_duration_minutes=effective_minutes,
+            half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
+            scheduled_start=schedule.get("scheduled_work_start_time"),
+            scheduled_end=schedule.get("scheduled_work_end_time"),
+            check_in=day_check_in,
+            check_out=day_check_out,
+            day_completed=day_completed,
+            base_status=day_status,
+            leave_day_part=leave_part,
+            leave_is_full_day=bool(day_status == "Leave" and (not leave_part or leave_part == "full_day")),
+            working_intervals=daily_metrics.get("working_intervals") or [],
+        )
+        issue = attendance_issue(day_check_in, day_check_out, daily_metrics.get("working_intervals") or [])
+        early_minutes, late_minutes = _going_by_minutes(day_check_out, schedule.get("scheduled_work_end_time"))
+        resolved_day_status = day_status
+        if not day_check_in and not day_check_out and day_status == "Absent":
+            resolved_day_status = "Not Marked"
+            half_day["first_half_status"] = "Not Marked"
+            half_day["second_half_status"] = "Not Marked"
+        if day_status not in {"Holiday", "Weekly Off", "Leave", "Medical Leave", BEFORE_JOINING} and not (not day_check_in and not day_check_out and day_status == "Absent"):
+            # Missing both punches is Not Marked. Do not infer Absent solely
+            # because a scheduled date has passed without an attendance record.
+            if not issue["has_attendance_issue"] and day_completed:
+                if str(half_day.get("half_day_present") or "No").startswith("Yes"):
+                    resolved_day_status = "Half-Day Present"
+                elif effective_minutes < int(schedule.get("half_day_working_duration") or 0) * 0.80 and day_check_in and day_check_out:
+                    resolved_day_status = "Absent"
         reason = None
         if current >= today:
             reason = "Requests are for past dates only; today's attendance can still be marked."
@@ -512,29 +759,41 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
 
         days.append({
             "attendance_date": iso,
-            "status": day_status,
-            "status_label": "Medical Leave" if record and record.get("medical_leave") else day_status,
+            "status": resolved_day_status,
+            "status_label": "Medical Leave" if record and record.get("medical_leave") else resolved_day_status,
             "attendance_category": _attendance_category(record),
             "attendance_source": record.get("attendance_source") if record else None,
-            "check_in_time": record.get("check_in_time") if record else None,
-            "check_out_time": record.get("check_out_time") if record else None,
+            "check_in_time": day_check_in,
+            "check_out_time": day_check_out,
             "working_duration": daily_metrics.get("working_duration") or "0h 00m",
             "working_minutes": int(daily_metrics.get("working_minutes") or 0),
+            "total_duration": _format_duration(effective_minutes),
+            "total_duration_minutes": effective_minutes,
+            "actual_elapsed_minutes": day_total_minutes,
             "break_duration": daily_metrics.get("break_duration") or "0h 00m",
-            "break_minutes": int(daily_metrics.get("visible_break_minutes") or 0),
+            "break_minutes": int(daily_metrics.get("break_minutes", daily_metrics.get("visible_break_minutes", 0)) or 0),
             "working_type": schedule.get("working_type") or "",
             "scheduled_work_start_time": schedule.get("scheduled_work_start_time") or "",
             "scheduled_work_end_time": schedule.get("scheduled_work_end_time") or "",
             "scheduled_work_duration": int(schedule.get("scheduled_work_duration") or 0),
             "half_day_working_duration": int(schedule.get("half_day_working_duration") or 0),
             "half_day_working_duration_text": schedule.get("half_day_working_duration_text") or "",
-            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and int(daily_metrics.get("working_minutes") or 0) >= int(schedule.get("half_day_working_duration") or 0)),
+            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and effective_minutes >= int(schedule.get("half_day_working_duration") or 0)),
+            "effective_working_minutes": effective_minutes,
+            "permission_total_minutes": permission_minutes,
+            "working_intervals": daily_metrics.get("working_intervals") or [],
+            "early_going_by_minutes": early_minutes,
+            "late_going_by_minutes": late_minutes,
+            "early_going_by": _format_duration(early_minutes) if early_minutes is not None else "—",
+            "late_going_by": _format_duration(late_minutes) if late_minutes is not None else "—",
+            **issue,
+            **half_day,
             "leave_type_code": record.get("leave_type_code") if record else (upcoming_leave or {}).get("leave_type_code"),
             "upcoming_leave": upcoming_leave if day_status == "Leave" else None,
             "permissions": permissions,
             "is_holiday": current in ctx["holidays"] and in_window,
             "holiday_name": ctx["holidays"].get(current) if day_status == "Holiday" else None,
-            "is_weekly_off": current.weekday() in ctx["weekly_offs"],
+            "is_weekly_off": day_status == "Weekly Off",
             "is_future": current > today,
             "is_after_window": not in_window,
             # Upcoming holiday / leave / permission dates open a read-only detail view.

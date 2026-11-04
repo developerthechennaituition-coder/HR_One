@@ -2,7 +2,7 @@
 
 The HRMS frontend is a React single-page application for employee self-service and HR administration. It communicates with the Python FastAPI backend and uses MongoDB-backed APIs for authentication, organization, employee, attendance, leave, notification, payroll, and related workflows.
 
-For the complete application architecture, backend setup, role descriptions, business workflows, and deployment guidance, see the repository-root [`README.md`](../README.md).
+For the complete application architecture, backend setup, environment configuration, role descriptions, business workflows, and deployment guidance, see the repository-root [`README.md`](../README.md).
 
 ## Contents
 
@@ -13,6 +13,7 @@ For the complete application architecture, backend setup, role descriptions, bus
 - [API configuration](#api-configuration)
 - [Available scripts](#available-scripts)
 - [Application areas](#application-areas)
+- [Attendance UI behavior](#attendance-ui-behavior)
 - [Authentication and API requests](#authentication-and-api-requests)
 - [Build and deployment](#build-and-deployment)
 - [Development conventions](#development-conventions)
@@ -62,6 +63,7 @@ frontend/
     │   └── notification.wav
     ├── components/
     │   ├── AttendanceDayBreakdown.jsx
+    │   ├── AttendanceExportModal.jsx
     │   ├── AttendanceRequestInbox.jsx
     │   ├── AuthLayout.jsx
     │   ├── EsslAdminSettings.jsx
@@ -115,7 +117,7 @@ frontend/
         └── weeklyOff.js
 ```
 
-The tree highlights the principal modules. Refer to the checked-out source for the complete and current file list.
+This tree highlights principal modules. Refer to the checked-out source for the complete and current file list.
 
 ## Prerequisites
 
@@ -204,23 +206,56 @@ A successful Vite build confirms that the frontend bundles. It does not confirm 
 
 | Area | Main page/component files | Purpose |
 |---|---|---|
-| App shell and navigation | `App.jsx`, `MainLayout.jsx`, `Header.jsx`, `Sidebar.jsx` | Application routing/layout/navigation |
+| App shell and navigation | `App.jsx`, `MainLayout.jsx`, `Header.jsx`, `Sidebar.jsx` | Application routing, layout, and navigation |
 | Authentication | `Login.jsx`, `AuthLayout.jsx`, `ActivateAccount.jsx`, `ForgotPassword.jsx`, `VerifyResetOTP.jsx`, `ResetPassword.jsx`, `ChangePassword.jsx` | Sign-in and account lifecycle |
 | Dashboard | `Dashboard.jsx` | HRMS landing/dashboard view |
 | Organization | `CompanySetup.jsx`, `OrganizationSetup.jsx`, `HolidayCalendarSetup.jsx` | Company structure and holiday setup |
 | Employee administration | `EmployeeMaster.jsx`, `EmployeeDetails.jsx`, `UserManagement.jsx` | Employee and user records |
 | Attendance | `Attendance.jsx`, `EmployeeAttendance.jsx`, `UserAttendance.jsx`, `AttendanceDayBreakdown.jsx`, `MyAttendanceCalendar.jsx` | Daily/monthly attendance and employee attendance details |
+| Attendance export | `AttendanceExportModal.jsx` | Employee/month selection for attendance export |
 | Attendance requests | `MyAttendanceRequests.jsx`, `AttendanceRequestInbox.jsx` | Employee requests and HR review |
 | Historical attendance | `HistoricalAttendanceModal.jsx` | Historical attendance review/edit interface exposed by the attendance page |
 | WFH | `WfhAttendance.jsx`, `WfhAdminSettings.jsx`, `WfhEmailVerification.jsx` | Work-from-home attendance and administration |
 | ESSL | `EsslSetup.jsx`, `EsslAdminSettings.jsx` | Device integration setup and administration |
 | Leave | `Leave.jsx` | Leave and permission workflows |
 | Notifications | `NotificationBell.jsx`, `NotificationPanel.jsx`, `NotificationManagement.jsx` | In-app notification experience |
-| Payroll | `PayrollWorkspace.jsx`, `EmployeeSalarySetup.jsx`, `EmployeePayslips.jsx`, `PayslipViewer.jsx` | Salary, payroll and payslip screens |
+| Payroll | `PayrollWorkspace.jsx`, `EmployeeSalarySetup.jsx`, `EmployeePayslips.jsx`, `PayslipViewer.jsx` | Salary, payroll, and payslip screens |
 | Team | `TeamMembers.jsx`, `TeamMemberDetails.jsx` | Team-member views |
 | Profile | `Profile.jsx` | Employee profile/self-service |
 
 Feature availability is controlled by backend permissions, role assignments, and business data. A visible frontend control does not replace backend authorization.
+
+## Attendance UI behavior
+
+The frontend attendance experience is backed by shared backend attendance calculations. The UI should present the status and time information returned by the backend rather than independently reimplementing attendance policy.
+
+### Attendance statuses
+
+The attendance calendar and attendance detail components distinguish the relevant attendance states, including:
+
+- Present.
+- Half-Day Present, including First Half Present and Second Half Present classifications where returned by the backend.
+- Absent.
+- Leave and Medical Leave.
+- Holiday and Weekly Off.
+- Not Marked.
+- Attendance issue indicators for incomplete or inconsistent punch records.
+
+`Not Marked` must not be displayed as `Absent` merely because both check-in and check-out are empty. The final status depends on the backend's date eligibility and attendance-generation rules. Do not infer absence in a frontend component from empty time fields alone.
+
+An attendance issue is separate from an attendance status. For example, a date may contain a partial punch record and an issue indicator. The issue detail should identify the missing/inconsistent punch while retaining the actual attendance information. After a punch is corrected, refreshed attendance data should remove the resolved issue indicator.
+
+### Half-Day presentation
+
+The UI displays the Half-Day classification and uses separate visual distinctions for First Half Present and Second Half Present where those classifications are supplied. Calendar symbols and legends should remain consistent across employee attendance, self-service attendance, team attendance, and attendance-day breakdown views.
+
+The configured Half-Day Working Duration and the 80%–150% threshold policy are calculated by the backend. Frontend code should not hardcode employee working-hour thresholds. For the authoritative business rules and examples, see the root [`README.md`](../README.md#working-details-and-half-day-calculation).
+
+### Time and interval details
+
+Attendance detail views can present check-in/check-out times, working intervals, break details, permission information, and early/late checkout values. A missing check-in or check-out should be displayed as unavailable rather than fabricated.
+
+Excel formatting is generated by the backend. The frontend export UI initiates the existing export workflow and should pass the selected employee/month filters without changing report calculations.
 
 ## Authentication and API requests
 
@@ -230,6 +265,7 @@ Feature availability is controlled by backend permissions, role assignments, and
 - `src/services/notificationApi.js`, `payrollApi.js`, and `attendanceRequestApi.js` group related API operations.
 - `src/services/roleLabels.js` contains role display-name helpers.
 - `src/services/attendanceCalendarRange.js` and `weeklyOff.js` hold shared attendance/calendar utilities.
+- `src/services/attendanceHistoryFormat.js` formats attendance history information.
 
 When adding an API request:
 
@@ -268,6 +304,7 @@ Do not deploy `.env.local`, `node_modules/`, or development-only files as static
 - Use accessible labels for inputs, clear validation messages, keyboard-operable controls, and visible focus states.
 - Avoid hardcoding role names or permission assumptions in multiple components; use the existing role/permission helpers and backend authorization.
 - Preserve existing API contracts unless backend and frontend changes are coordinated.
+- Keep attendance status and duration policy in shared backend calculations; avoid creating a second, conflicting frontend calculation.
 - Do not commit generated build output, dependencies, local secrets, or employee data.
 
 ## Troubleshooting
@@ -292,6 +329,13 @@ The Vite server uses `strictPort: true`. Stop the process using the port or upda
 - Confirm that the running frontend was rebuilt/restarted after source changes.
 - Remember that frontend visibility and backend authorization are separate checks.
 
+### Attendance status or calendar symbol looks incorrect
+
+- Refresh the attendance data and inspect the API response for the affected date.
+- Confirm the backend status and issue fields rather than deriving status from empty time fields in the UI.
+- Check employee joining date, scheduled working details, weekly-off/holiday/leave status, and payroll-lock rules.
+- Check the backend attendance calculation and date/timezone handling before changing frontend presentation.
+
 ### Production build fails
 
 ```powershell
@@ -299,15 +343,4 @@ npm ci
 npm run build
 ```
 
-Read the first Vite/JavaScript error. Do not use `npm audit fix --force` as a generic build fix; it can upgrade dependencies across breaking versions. Review `npm audit` findings and update dependencies deliberately.
-
-### Styles or assets appear stale
-
-- Hard-refresh the browser.
-- Confirm the latest `dist/` output is deployed.
-- Clear only the relevant browser/site cache if required.
-- Check asset paths and browser network responses.
-
----
-
-For backend setup, MongoDB configuration, role hierarchy, attendance/leave/payroll business rules, API documentation, and production deployment, see the root [`README.md`](../README.md).
+Read the first Vite/JavaScript error. Confirm the Node.js version is compatible with the Vite version in the lockfile and that dependencies installed successfully.

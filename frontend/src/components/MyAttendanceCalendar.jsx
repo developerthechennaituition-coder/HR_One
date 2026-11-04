@@ -5,6 +5,7 @@ const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 const CALENDAR_LEGEND = [
   { key: "present", label: "Present", background: "#d1e7dd", text: "#0f5132" },
+  { key: "halfday", label: "Half-Day Present", background: "#dbeafe", text: "#1e40af" },
   { key: "wfh", label: "Work From Home", background: "#cff4fc", text: "#055160" },
   { key: "absent", label: "Absent", background: "#f8d7da", text: "#842029" },
   { key: "holiday", label: "Holiday", background: "#e2d9f3", text: "#432874" },
@@ -18,6 +19,7 @@ const LEGEND_BY_KEY = Object.fromEntries(CALENDAR_LEGEND.map((item) => [item.key
 
 const dayStyleKey = (day) => {
   const value = String(day?.status || "").toLowerCase();
+  if (String(day?.half_day_present || "No").startsWith("Yes") || value === "half-day present") return "halfday";
   if (value === "present") return day.attendance_category === "Work From Home" ? "wfh" : "present";
   if (value === "absent") return "absent";
   if (value === "holiday") return "holiday";
@@ -148,6 +150,15 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
             </div>
           ))}
           <div className="d-flex align-items-center gap-2">
+            <span className="fw-bold" style={{ color: "#1e40af" }}>◐</span><span className="text-muted">First Half Present</span>
+          </div>
+          <div className="d-flex align-items-center gap-2">
+            <span className="fw-bold" style={{ color: "#1e40af" }}>◑</span><span className="text-muted">Second Half Present</span>
+          </div>
+          <div className="d-flex align-items-center gap-2">
+            <span className="fw-bold text-warning">⚠</span><span className="text-muted">Attendance issue</span>
+          </div>
+          <div className="d-flex align-items-center gap-2">
             <span className="badge text-bg-warning">Req</span><span className="text-muted">Attendance request pending</span>
           </div>
           <div className="d-flex align-items-center gap-2">
@@ -178,7 +189,13 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                   if (state.hidden) return <div key={day.attendance_date} aria-hidden="true" />;
                   const colors = LEGEND_BY_KEY[dayStyleKey(day)];
                   const leaveLabel = colors.key === "leave" && day.leave_type_code ? `Leave · ${day.leave_type_code}` : null;
-                  const label = day.holiday_name || leaveLabel || (day.status_label && day.status_label !== day.status ? day.status_label : colors.key === "other" ? day.status : colors.label);
+                  const hasSplitHalfStatus = Boolean(day.first_half_status && day.second_half_status && day.first_half_status !== day.second_half_status);
+                  const isHalfDayPresent = String(day.half_day_present || "No").startsWith("Yes");
+                  const halfDayLabel = hasSplitHalfStatus
+                    ? `1st: ${day.first_half_status || "Not Marked"} · 2nd: ${day.second_half_status || "Not Marked"}`
+                    : null;
+                  const label = halfDayLabel || day.holiday_name || leaveLabel || (day.status_label && day.status_label !== day.status ? day.status_label : colors.key === "other" ? day.status : colors.label);
+                  const halfSymbol = String(day.half_day_present || "").endsWith("First Half") ? "◐" : String(day.half_day_present || "").endsWith("Second Half") ? "◑" : "◒";
                   // Upcoming holiday / leave / permission dates (within the 90 days) open details only.
                   const viewable = state.isFuture && !state.afterWindow && Boolean(day.has_upcoming_details);
                   const readOnly = !state.selectable;
@@ -200,7 +217,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                       disabled={!clickable}
                       aria-pressed={selected}
                       aria-label={`${day.attendance_date}: ${label}${viewable ? " (upcoming, view details)" : readOnly ? " (upcoming, not selectable)" : ""}`}
-                      title={[label, day.check_in_time && `In ${day.check_in_time}`, day.check_out_time && `Out ${day.check_out_time}`, day.working_duration && `Work ${day.working_duration}`, day.break_duration && `Break ${day.break_duration}`, day.request && `Request ${day.request.request_number} ${day.request.status}`, ...(day.permissions || []).map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`), viewable ? "Upcoming date · click to view details" : readOnly && "Upcoming date · view only"].filter(Boolean).join(" · ")}
+                      title={[label, isHalfDayPresent && day.half_day_present, day.has_attendance_issue && (day.attendance_issue_details || []).join(", "), day.total_duration && `Total ${day.total_duration}`, day.check_in_time && `In ${day.check_in_time}`, day.check_out_time && `Out ${day.check_out_time}`, day.working_duration && `Net Work ${day.working_duration}`, day.break_duration && `Break ${day.break_duration}`, day.request && `Request ${day.request.request_number} ${day.request.status}`, ...(day.permissions || []).map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`), viewable ? "Upcoming date · click to view details" : readOnly && "Upcoming date · view only"].filter(Boolean).join(" · ")}
                       style={{
                         minHeight: 64, minWidth: 0, textAlign: "left", padding: "6px 8px", borderRadius: 8,
                         border: selected ? "2px solid #0d6efd" : readOnly ? "1px dashed rgba(0,0,0,0.25)" : "1px solid rgba(0,0,0,0.12)",
@@ -211,6 +228,8 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                       <div className="d-flex justify-content-between align-items-start gap-1">
                         <span className="fw-semibold">{Number(day.attendance_date.slice(8, 10))}</span>
                         <span className="d-flex gap-1">
+                          {isHalfDayPresent && <span className="fw-bold" aria-label={day.half_day_present} title={day.half_day_present} style={{ fontSize: 16, lineHeight: 1 }}>{halfSymbol}</span>}
+                          {day.has_attendance_issue && <span className="fw-bold text-warning" aria-label="Attendance issue" title={(day.attendance_issue_details || []).join(", ")}>⚠</span>}
                           {day.permissions?.length > 0 && <span className="badge text-bg-info" style={{ fontSize: 9 }}>P</span>}
                           {day.request && <span className="badge text-bg-warning" style={{ fontSize: 9 }}>Req</span>}
                         </span>

@@ -2,7 +2,7 @@
 
 A full-stack Human Resource Management System built with a React 19 + Vite frontend, a Python FastAPI backend, and MongoDB. The application brings employee administration, organization setup, attendance, leave and permission workflows, notifications, payroll, and payslip access into one role-aware system.
 
-This README describes the source supplied in the current project archives. Integrations such as ESSL devices, SMTP delivery, and WFH biometric verification require the corresponding external configuration and should be validated in the target environment before production use.
+This README describes the supplied project source. Integrations such as ESSL devices, SMTP delivery, and WFH biometric verification require corresponding external configuration and must be validated in the target environment before production use.
 
 ## Contents
 
@@ -16,7 +16,7 @@ This README describes the source supplied in the current project archives. Integ
 - [API documentation and health checks](#api-documentation-and-health-checks)
 - [Roles and access](#roles-and-access)
 - [Functional modules](#functional-modules)
-- [Attendance and ESSL integration](#attendance-and-essl-integration)
+- [Attendance, half-day rules, and ESSL integration](#attendance-half-day-rules-and-essl-integration)
 - [Leave, holidays, and permissions](#leave-holidays-and-permissions)
 - [Payroll and payslips](#payroll-and-payslips)
 - [Tests and quality checks](#tests-and-quality-checks)
@@ -27,43 +27,58 @@ This README describes the source supplied in the current project archives. Integ
 ## Features
 
 ### Authentication and user administration
+
 - Login, logout, session-aware frontend behavior, and password change.
 - Account activation and password recovery/OTP routes.
 - User administration, account status, roles, and permissions.
 - Role-aware navigation and backend authorization checks.
 
 ### Organization and employee administration
+
 - Company and organization setup.
 - Business units, departments, teams, and designations.
 - Employee master records and extended employee details.
 - Reporting-manager/HOD assignment and team-member views.
 - Religion-based holiday calendar workflows.
+- Employee working details, including working type and scheduled working times.
 
 ### Attendance
+
 - Daily and monthly attendance views, employee attendance details, and Excel export.
-- Employee attendance calendar and daily working-time/break details.
+- Employee attendance calendar and attendance-day breakdowns.
 - Attendance requests for corrections, with review/approval workflow.
 - Work-from-home check-in/check-out and related controls.
-- Attendance history and administrative attendance tools present in the supplied frontend/backend source.
-- Joining-date and date-window rules are enforced in relevant attendance workflows; confirm exact rules in the current implementation before changing business policy.
+- Attendance history and administrative attendance tools.
+- Employee-specific scheduled working times and working-duration calculations.
+- Half-Day Present classification using the configured Half-Day Working Duration.
+- First Half Present and Second Half Present classification where supported by the attendance interval data and applicable rules.
+- Permission-aware effective working-duration calculations designed to avoid counting permission time twice.
+- Attendance issue indicators for incomplete or inconsistent punch records.
+- Working intervals, break durations/details, permission information, and early/late checkout calculations in attendance reporting and Excel exports.
+- `Not Marked` is distinct from `Absent`: an eligible date with no check-in and no check-out may remain Not Marked according to the attendance-generation rules. Absent is applied only when the applicable attendance-generation/business rules determine that status.
+- Joining-date, employee schedule, weekly-off, holiday, attendance-correction, and payroll-lock rules are enforced in relevant workflows.
 
 ### ESSL attendance integration
+
 - ESSL configuration and administration screens.
 - Backend endpoints and import/synchronization workflows for attendance data.
 - Device connectivity, credentials, network reachability, device model compatibility, and vendor API/SDK access must be configured and tested separately. The presence of integration code does not mean a physical device is already connected.
 
 ### Leave, holidays, and permissions
+
 - Leave types, policies, balances, requests, approvals, rejections, and cancellations.
 - Holiday calendar management and employee holiday views.
 - Permission request and approval workflows.
 - Leave and attendance integration implemented in backend business logic.
 
 ### Notifications
+
 - In-app notification APIs and frontend notification components.
 - Notification list/panel and notification sound asset.
 - Email notifications depend on SMTP configuration and the specific workflow.
 
 ### Payroll and payslips
+
 - Employee salary setup and payroll workspace.
 - Payroll calculation/review APIs and records.
 - Payslip PDF generation and employee payslip viewing.
@@ -80,7 +95,7 @@ This README describes the source supplied in the current project archives. Integ
 | Backend | Python, FastAPI, Pydantic, Uvicorn |
 | Database | MongoDB via PyMongo |
 | Reports/documents | openpyxl, xlrd, ReportLab |
-| Optional WFH biometric packages | face-recognition, MediaPipe (see `requirements-wfh.txt`) |
+| Optional WFH biometric packages | face-recognition, MediaPipe (see `backend/requirements-wfh.txt`) |
 
 ```text
 Web browser
@@ -101,8 +116,6 @@ MongoDB
 
 ## Repository layout
 
-The Git repository should contain both application folders and the root README:
-
 ```text
 HRMS-Project/
 ├── README.md
@@ -115,8 +128,11 @@ HRMS-Project/
 │   │   ├── core_routes.py
 │   │   ├── db/mongodb.py
 │   │   ├── attendance.py
+│   │   ├── attendance_calculations.py
+│   │   ├── attendance_export.py
 │   │   ├── attendance_requests.py
 │   │   ├── employee_details.py
+│   │   ├── working_details.py
 │   │   ├── essl.py
 │   │   ├── leave.py
 │   │   ├── notifications.py
@@ -147,12 +163,14 @@ HRMS-Project/
         └── config/
 ```
 
+The tree highlights principal modules. Refer to the checked-out source for the complete and current file list.
+
 ## Prerequisites
 
 Install the following:
 
 1. Python 3.12 is the version used by the supplied project environment; check compatibility with `backend/requirements.txt` before selecting another Python version.
-2. Node.js compatible with Vite 8 and npm.
+2. Node.js compatible with the Vite version pinned by `frontend/package-lock.json`.
 3. A reachable MongoDB instance (local or hosted).
 4. Git.
 5. Optional SMTP account for configured email delivery.
@@ -303,15 +321,68 @@ The backend is the authorization source of truth. Hiding a button in the fronten
 |---|---|---|
 | Authentication | `Login.jsx`, `ActivateAccount.jsx`, `ForgotPassword.jsx`, `VerifyResetOTP.jsx`, `ResetPassword.jsx`, `ChangePassword.jsx` | `main.py`, `activation.py`, `password_reset.py`, `security.py`, `session.py` |
 | Organization setup | `CompanySetup.jsx`, `OrganizationSetup.jsx`, `HolidayCalendarSetup.jsx` | `core_routes.py`, `religion_holidays.py`, `db/mongodb.py` |
-| Employee management | `EmployeeMaster.jsx`, `EmployeeDetails.jsx`, `UserManagement.jsx` | `employee_details.py`, `core_routes.py`, `reporting_manager.py` |
-| Attendance | `Attendance.jsx`, `EmployeeAttendance.jsx`, `UserAttendance.jsx`, `WfhAttendance.jsx` | `attendance.py`, `attendance_requests.py` |
+| Employee management | `EmployeeMaster.jsx`, `EmployeeDetails.jsx`, `UserManagement.jsx` | `employee_details.py`, `working_details.py`, `core_routes.py`, `reporting_manager.py` |
+| Attendance | `Attendance.jsx`, `EmployeeAttendance.jsx`, `UserAttendance.jsx`, `WfhAttendance.jsx` | `attendance.py`, `attendance_calculations.py`, `attendance_export.py`, `attendance_requests.py` |
 | ESSL | `EsslSetup.jsx`, `EsslAdminSettings.jsx` | `essl.py` |
 | Leave and permissions | `Leave.jsx` | `leave.py`, `attendance_requests.py` |
 | Notifications | `NotificationManagement.jsx`, `NotificationBell.jsx`, `NotificationPanel.jsx` | `notifications.py` |
 | Payroll | `PayrollWorkspace.jsx`, `EmployeeSalarySetup.jsx`, `EmployeePayslips.jsx` | `payroll.py`, `payslip_pdf.py` |
 | Team views | `TeamMembers.jsx`, `TeamMemberDetails.jsx` | `reporting_manager.py` |
 
-## Attendance and ESSL integration
+## Attendance, half-day rules, and ESSL integration
+
+Attendance logic is shared across attendance APIs, attendance calculations, attendance requests, payroll, and Excel export. The principal backend files are:
+
+- `backend/app/attendance.py` — attendance endpoints and attendance view data.
+- `backend/app/attendance_calculations.py` — shared attendance duration/status calculation helpers.
+- `backend/app/attendance_requests.py` — attendance correction/request workflows.
+- `backend/app/attendance_export.py` — attendance Excel generation.
+- `backend/app/working_details.py` and `backend/app/employee_details.py` — employee working schedule details.
+- `backend/app/payroll.py` — payroll calculations that consume attendance results.
+
+### Working details and Half-Day calculation
+
+Employee working details include the employee's working type and scheduled work times. The configured Half-Day Working Duration is used as the reference duration for Half-Day classification; it must not be replaced with a fixed company-wide number.
+
+The implemented Half-Day threshold policy is:
+
+- Let `H` be the configured Half-Day Working Duration.
+- Let `T` be effective working duration after applying the approved-permission adjustment only when permission time is not already included in the attendance duration.
+- Below `80% × H`: do not classify the day as Half-Day Present; apply the applicable absence/status rules.
+- From `80% × H` through `150% × H`, inclusive: classify as Half-Day Present and determine the applicable first-half/second-half classification from the attendance intervals and schedule.
+- Above `150% × H`: evaluate the existing full-day eligibility/business rules. Do not automatically assume that every value above the upper threshold is a full day.
+
+The calculation must respect employee-specific schedules, actual attendance intervals, approved permissions, breaks, joining-date eligibility, weekly offs, holidays, leave, and payroll locks. Permission must never be counted twice. A permission interval overlapping time already represented by a working/attendance interval must not be added again.
+
+`Half Day Time` is the employee working-details value representing the configured half-day duration. If an older record or integration still contains the legacy `Off Day Time` field, retain compatibility while records are migrated or mapped to the current field.
+
+### Attendance statuses and incomplete punches
+
+`Not Marked`, `Absent`, and an attendance issue are different concepts:
+
+- `Not Marked` means no attendance status/punch has been recorded for the date and the attendance-generation rules have not classified it as Absent.
+- `Absent` is a business attendance status generated only when the applicable date eligibility and attendance rules determine absence.
+- An attendance issue indicates incomplete or inconsistent punch/interval data (for example, a missing required check-in or check-out). An issue indicator should not erase the underlying punch data or be confused with the Absent status.
+
+When a missing punch is corrected, attendance issue validation should be refreshed so resolved issue indicators do not remain in calendar, attendance details, or newly generated exports.
+
+### Attendance views and Excel exports
+
+Attendance views and exports include working-time and status information such as:
+
+- Check-in and check-out times.
+- Total/net working duration and break duration.
+- Break details and working intervals, where available.
+- Permission duration and permission count.
+- Half-Day Present and first-half/second-half breakdowns.
+- Early Going By and Late Going By, calculated against the employee's scheduled check-out time.
+- Attendance source and attendance issue indicators.
+
+In the detailed Excel report, each working interval is intended to be displayed on its own line using a `WI` sequence label, and each break on its own line using a `B` sequence label. Example labels are `WI1`, `WI2`, `B1`, and `B2`; actual times and durations come from the attendance records. Break Duration remains a separate duration value and should not be redundantly prefixed with a “Total Break Duration” label.
+
+Excel summaries are generated from the attendance data for the selected employee/period. Always reconcile exported values with the corresponding attendance screen and source records before using them for payroll.
+
+### ESSL integration
 
 Attendance data can originate from application attendance workflows and configured device import/synchronization workflows. The ESSL module includes configuration and synchronization code, but successful live device integration depends on the exact device model/firmware, vendor interface or SDK, network configuration, credentials, and mapping of device user identifiers to HRMS employees.
 
@@ -433,7 +504,7 @@ Review `.gitignore` before committing. If a secret was previously committed, rem
 
 - Read the backend traceback and identify the first application-code frame.
 - Confirm report dependencies such as `openpyxl` are installed.
-- Fix missing imports or data assumptions in the named endpoint; do not treat every HTTP 500 as a database problem.
+- Check the failing export endpoint's data assumptions and traceback before changing code.
 
 ### ESSL sync returns no records
 
@@ -451,12 +522,10 @@ Review `.gitignore` before committing. If a secret was previously committed, rem
 - [ ] CORS restricted to trusted frontend origins.
 - [ ] SMTP tested if email workflows are enabled.
 - [ ] HR Admin, Administrator, HOD, and Employee permissions tested.
-- [ ] Attendance, leave, holidays, and payroll reconciled with business owners.
+- [ ] Attendance, Half-Day, permission, leave, holidays, and payroll calculations reconciled with business owners.
 - [ ] ESSL integration tested against the actual device and vendor interface.
 - [ ] Database backups and restore procedure tested.
 - [ ] Backend tests, frontend lint/build, and end-to-end workflows passed.
 - [ ] Monitoring and error logging configured without exposing sensitive employee data.
-
----
 
 For frontend-specific setup, page structure, scripts, and development details, see [`frontend/README.md`](frontend/README.md).

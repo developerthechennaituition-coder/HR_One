@@ -58,6 +58,17 @@ const EMPTY = {
   half_day_working_duration_text: "",
   half_day_threshold_met: false,
   elapsed_minutes: 0,
+  total_duration: "0h 00m",
+  total_duration_minutes: 0,
+  half_day_present: "No",
+  calculated_attendance_status: "",
+  first_half_status: "Not Marked",
+  second_half_status: "Not Marked",
+  half_day_review_required: false,
+  has_attendance_issue: false,
+  attendance_issue_details: [],
+  early_going_by: "—",
+  late_going_by: "—",
   permission_start_time: "",
   permission_end_time: "",
   permission_reason: "",
@@ -72,8 +83,8 @@ const PART_LABEL = {
 
 const toState = (record) => ({
   status: record?.status || "Not Marked",
-  check_in_time: record?.check_in_time || "",
-  check_out_time: record?.check_out_time || "",
+  check_in_time: record?.check_in_time || record?.first_check_in || "",
+  check_out_time: record?.check_out_time || record?.last_check_out || "",
   attendance_source: record?.attendance_source || null,
   attendance_type: record?.attendance_type || null,
   leave_request_id: record?.leave_request_id || null,
@@ -94,6 +105,17 @@ const toState = (record) => ({
   half_day_working_duration_text: record?.half_day_working_duration_text || "",
   half_day_threshold_met: Boolean(record?.half_day_threshold_met),
   elapsed_minutes: Number(record?.elapsed_minutes || 0),
+  total_duration: record?.total_duration || "0h 00m",
+  total_duration_minutes: Number(record?.total_duration_minutes ?? record?.elapsed_minutes ?? 0),
+  half_day_present: record?.half_day_present || "No",
+  calculated_attendance_status: record?.calculated_attendance_status || "",
+  first_half_status: record?.first_half_status || record?.status || "Not Marked",
+  second_half_status: record?.second_half_status || record?.status || "Not Marked",
+  half_day_review_required: Boolean(record?.half_day_review_required),
+  has_attendance_issue: Boolean(record?.has_attendance_issue),
+  attendance_issue_details: record?.attendance_issue_details || [],
+  early_going_by: record?.early_going_by || "—",
+  late_going_by: record?.late_going_by || "—",
   permission_start_time: record?.approved_permission?.start_time || record?.permission_start_time || "",
   permission_end_time: record?.approved_permission?.end_time || record?.permission_end_time || "",
   permission_reason: record?.approved_permission?.reason || "",
@@ -1074,6 +1096,8 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                   </th>
                   <th>Check-in</th>
                   <th>Check-out</th>
+                  <th>Early Going By</th>
+                  <th>Late Going By</th>
                   <th>Working / Break</th>
                   <th>Permission</th>
                   <th>Source</th>
@@ -1087,7 +1111,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                 {filteredUsers.length === 0 ? (
                   <tr>
                     <td
-                      colSpan="12"
+                      colSpan="14"
                       className="text-center py-5 text-muted"
                     >
                       No employees found.
@@ -1170,7 +1194,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                             "-"}
                         </td>
 
-                        <td>{selectedDate}</td>
+                        <td>{selectedDate}{current.has_attendance_issue && <span className="ms-2 text-warning fw-bold" title={(current.attendance_issue_details || []).join(", ")}>⚠</span>}</td>
 
                         <td>
                           {current.attendance_type === "OFFICE" ||
@@ -1204,6 +1228,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                             <option value="Present">
                               Present
                             </option>
+                            {current.calculated_attendance_status === "Half-Day Present" && <option value="Half-Day Present" disabled>Half-Day Present (Calculated)</option>}
 
                             <option value="Absent">
                               Absent
@@ -1303,13 +1328,20 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                           />
                         </td>
 
+                        <td className="text-nowrap">{current.early_going_by || "—"}</td>
+                        <td className="text-nowrap">{current.late_going_by || "—"}</td>
                         <td>
                           <div className="small">
                             <div><span className="text-muted">Scheduled:</span> <strong>{current.scheduled_work_start_time || "—"} – {current.scheduled_work_end_time || "—"}</strong></div>
-                            <div><span className="text-muted">Work:</span> <strong className="text-success">{current.working_duration}</strong></div>
-                            <div><span className="text-muted">Total:</span> <strong>{Math.floor(current.elapsed_minutes / 60)}h {String(current.elapsed_minutes % 60).padStart(2, "0")}m</strong></div>
-                            <div><span className="text-muted">Outside:</span> <strong>{current.outside_duration}</strong></div>
-                            <div><span className="text-muted">Breaks &gt;10m:</span> <strong>{current.break_duration}</strong></div>
+                            <div><span className="text-muted">Total Duration:</span> <strong>{current.total_duration || `${Math.floor(current.elapsed_minutes / 60)}h ${String(current.elapsed_minutes % 60).padStart(2, "0")}m`}</strong></div>
+                            <div><span className="text-muted">Net Working Time:</span> <strong className="text-success">{current.working_duration}</strong></div>
+                            <div><span className="text-muted">Break Time:</span> <strong>{current.break_duration}</strong></div>
+                            {current.half_day_present !== "No" && <div><span className="text-muted">Half-Day Present:</span> <strong>{current.half_day_present}</strong></div>}
+                            {current.calculated_attendance_status && <div><span className="text-muted">Calculated Status:</span> <strong>{current.calculated_attendance_status}</strong></div>}
+                            <div><span className="text-muted">First Half:</span> <strong>{current.first_half_status}</strong> · <span className="text-muted">Second Half:</span> <strong>{current.second_half_status}</strong></div>
+                            {current.half_day_review_required && <div className="text-warning">Half-day attendance requires HR Admin review.</div>}
+                            <div><span className="text-muted">Early Going By:</span> <strong>{current.early_going_by || "—"}</strong> · <span className="text-muted">Late Going By:</span> <strong>{current.late_going_by || "—"}</strong></div>
+                            {current.has_attendance_issue && <div className="alert alert-warning py-1 px-2 mt-1 mb-0 small">⚠ {(current.attendance_issue_details || []).join(", ")}</div>}
                             {current.half_day_working_duration_text && <div><span className="text-muted">Half-day threshold:</span> <strong>{current.half_day_working_duration_text}{current.half_day_threshold_met ? " · Reached" : ""}</strong></div>}
                           </div>
                           {(current.working_intervals?.length > 0 || current.break_intervals?.length > 0) && (

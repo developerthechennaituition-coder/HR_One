@@ -1063,48 +1063,30 @@ function Profile({ onNavigate }) {
     calendarRange,
   ]);
 
-  const presentCount =
-    monthDateKeys.filter((dateString) => {
-      const record =
-        getAttendanceForDate(dateString);
+  const countHalfStatus = (record, targetStatus) => {
+    if (!record) return 0;
+    const first = String(record.first_half_status || "").toLowerCase();
+    const second = String(record.second_half_status || "").toLowerCase();
+    if (first && second) {
+      return (first === targetStatus ? 0.5 : 0) + (second === targetStatus ? 0.5 : 0);
+    }
+    return String(record.status || "").toLowerCase() === targetStatus ? 1 : 0;
+  };
 
-      return (
-        record?.status?.toLowerCase() ===
-        "present"
-      );
-    }).length;
+  const presentCount = monthDateKeys.reduce((total, dateString) => {
+    return total + countHalfStatus(getAttendanceForDate(dateString), "present");
+  }, 0);
 
-  const absentCount =
-    monthDateKeys.filter((dateString) => {
-      const record =
-        getAttendanceForDate(dateString);
+  const absentCount = monthDateKeys.reduce((total, dateString) => {
+    return total + countHalfStatus(getAttendanceForDate(dateString), "absent");
+  }, 0);
 
-      return (
-        record?.status?.toLowerCase() ===
-        "absent"
-      );
-    }).length;
-
-  const leaveCount =
-    monthDateKeys.filter((dateString) => {
-      const attendanceRecord =
-        getAttendanceForDate(
-          dateString,
-        );
-
-      if (
-        attendanceRecord?.status?.toLowerCase() ===
-        "leave"
-      ) {
-        return true;
-      }
-
-      return Boolean(
-        getApprovedLeaveForDate(
-          dateString,
-        ),
-      );
-    }).length;
+  const leaveCount = monthDateKeys.reduce((total, dateString) => {
+    const record = getAttendanceForDate(dateString);
+    const recordedLeave = countHalfStatus(record, "leave");
+    if (recordedLeave) return total + recordedLeave;
+    return total + (getApprovedLeaveForDate(dateString) ? 1 : 0);
+  }, 0);
 
   /*
    * ============================================================
@@ -1195,8 +1177,10 @@ function Profile({ onNavigate }) {
     const shortDay =
       getShortDayName(day);
 
-    const calendarLabel =
-      getCalendarLabel(record);
+    const halfDayLabel = record && record.first_half_status && record.second_half_status && record.first_half_status !== record.second_half_status
+      ? `1st: ${record.first_half_status || "Not Marked"} · 2nd: ${record.second_half_status || "Not Marked"}`
+      : "";
+    const calendarLabel = halfDayLabel || getCalendarLabel(record);
 
     const dayPermissions =
       permissionsByDate[dateString] || [];
@@ -1291,7 +1275,7 @@ function Profile({ onNavigate }) {
         )}
 
         {/* ----------------------------------------------------
-            Show Leave Type Code on approved leave calendar day
+            Show the two half-day statuses when a date is half-day present.
         ---------------------------------------------------- */}
 
         {calendarLabel && (
@@ -2447,6 +2431,34 @@ function Profile({ onNavigate }) {
                           </div>
                         </div>
                       )}
+
+                    {selectedRecord && (
+                      (String(selectedRecord.half_day_present || "No").startsWith("Yes") ||
+                        (selectedRecord.first_half_status && selectedRecord.second_half_status && selectedRecord.first_half_status !== selectedRecord.second_half_status)) && (
+                        <div className="card border-info mb-3">
+                          <div className="card-body">
+                            <h6 className="text-info mb-3">Half-Day Attendance Details</h6>
+                            <div className="row g-3">
+                              <div className="col-md-4">
+                                <small className="text-muted d-block">Half-Day Present</small>
+                                <strong>{selectedRecord.half_day_present || "No"}</strong>
+                              </div>
+                              <div className="col-md-4">
+                                <small className="text-muted d-block">First Half</small>
+                                <strong>{selectedRecord.first_half_status || selectedRecord.status || "Not Marked"}</strong>
+                              </div>
+                              <div className="col-md-4">
+                                <small className="text-muted d-block">Second Half</small>
+                                <strong>{selectedRecord.second_half_status || selectedRecord.status || "Not Marked"}</strong>
+                              </div>
+                              {selectedRecord.total_duration && <div className="col-md-4"><small className="text-muted d-block">Total Duration</small><strong>{selectedRecord.total_duration}</strong></div>}
+                              {selectedRecord.working_duration && <div className="col-md-4"><small className="text-muted d-block">Net Working Time</small><strong>{selectedRecord.working_duration}</strong></div>}
+                              {selectedRecord.break_duration && <div className="col-md-4"><small className="text-muted d-block">Break Time</small><strong>{selectedRecord.break_duration}</strong></div>}
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    )}
 
                     {/* ==================================================
                         WEEKLY OFF / NOT APPLICABLE

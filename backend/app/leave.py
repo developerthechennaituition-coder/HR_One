@@ -206,7 +206,7 @@ class LeavePolicyUpdate(BaseModel):
 
 
 class LeaveCompanyPolicy(BaseModel):
-    weekly_offs_per_month: int = Field(default=4, ge=1, le=10)
+    weekly_offs_per_month: int = Field(default=4, ge=1, le=4)
     # Configured by HR Admin; no weekday is a weekly off until HR selects one.
     weekly_off_weekdays: list[str] = Field(default_factory=list, max_length=6)
     probation_period_months: int = Field(default=3, ge=0, le=24)

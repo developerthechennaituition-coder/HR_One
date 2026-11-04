@@ -539,6 +539,27 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
 
     # -- Monthly limits -----------------------------------------------------
 
+    def test_automatic_weekly_off_upsert_does_not_conflict_on_employee_id(self):
+        # The no-existing-record path performs an upsert. employee_id is set
+        # through $set (for both inserts and updates), never again in
+        # $setOnInsert, which would trigger MongoDB ConflictingUpdateOperators.
+        created = ar._ensure_monthly_auto_weekly_offs(self.employee, 2026, 9)
+        self.assertGreater(created, 0)
+        generated = list(db["attendance"].find({
+            "user_id": str(self.employee["_id"]),
+            "attendance_source": "AUTO_WEEKLY_OFF",
+            "attendance_date": {"$gte": "2026-09-01", "$lte": "2026-09-30"},
+        }))
+        self.assertLessEqual(len(generated), 4)
+        self.assertTrue(all(row.get("employee_id") == "E-201" for row in generated))
+        # Finalization is idempotent and must not create duplicates on restart.
+        self.assertEqual(ar._ensure_monthly_auto_weekly_offs(self.employee, 2026, 9), 0)
+        self.assertEqual(db["attendance"].count_documents({
+            "user_id": str(self.employee["_id"]),
+            "attendance_source": "AUTO_WEEKLY_OFF",
+            "attendance_date": {"$gte": "2026-09-01", "$lte": "2026-09-30"},
+        }), len(generated))
+
     def test_weekly_off_limit_of_four_per_month(self):
         self.set_weekly_offs([])
         auth = self.other["auth"]

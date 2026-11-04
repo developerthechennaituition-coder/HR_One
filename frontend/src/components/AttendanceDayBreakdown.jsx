@@ -107,6 +107,9 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
                 <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" ? "Attendance request (no punch recorded)" : data.attendance_source || "—"}</div></div>
                 <div><span className="text-muted">Scheduled time</span><div className="fw-semibold fs-6">{data.scheduled_work_start_time || "—"} – {data.scheduled_work_end_time || "—"}</div></div>
                 <div><span className="text-muted">Working type</span><div className="fw-semibold fs-6">{data.working_type || "—"}</div></div>
+                <div><span className="text-muted">Early Going By</span><div className="fw-semibold fs-6">{data.early_going_by || "—"}</div></div>
+                <div><span className="text-muted">Late Going By</span><div className="fw-semibold fs-6">{data.late_going_by || "—"}</div></div>
+                {data.has_attendance_issue && <div className="col-12"><div className="alert alert-warning py-2 mb-0"><strong>⚠ Attendance issue:</strong> {(data.attendance_issue_details || []).join(", ")}. Correct the missing or invalid punch to clear this issue.</div></div>}
                 {calendarDay?.attendance_date === selectedDate && calendarDay.permissions?.length > 0 && (
                   <div><span className="text-muted">Permission</span><div className="fw-semibold fs-6">{calendarDay.permissions.map((item) => `${item.start_time}–${item.end_time} (${item.status === "approved" ? "Approved" : "Pending"})`).join(", ")}</div></div>
                 )}
@@ -118,37 +121,51 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
             <div className="row g-3 mb-3">
               <div className="col-6 col-xl-3">
                 <div className="rounded border p-3 h-100">
-                  <div className="small text-muted">First check-in</div>
-                  <div className="fs-5 fw-semibold">{formatClock(data.first_check_in)}</div>
+                  <div className="small text-muted">Total Duration</div>
+                  <div className="fs-5 fw-semibold">{data.total_duration || duration(data.total_duration_minutes ?? data.elapsed_minutes)}</div>
                 </div>
               </div>
               <div className="col-6 col-xl-3">
                 <div className="rounded border p-3 h-100">
-                  <div className="small text-muted">Last check-out</div>
-                  <div className="fs-5 fw-semibold">{data.attendance_state === "In Progress" ? "In Progress" : formatClock(data.last_check_out)}</div>
-                </div>
-              </div>
-              <div className="col-6 col-xl-3">
-                <div className="rounded border p-3 h-100">
-                  <div className="small text-muted">Net working time</div>
+                  <div className="small text-muted">Net Working Time</div>
                   <div className="fs-5 fw-semibold text-success">{data.working_duration}</div>
                   {data.attendance_state === "In Progress" && <div className="small text-success">Live estimate</div>}
                 </div>
               </div>
               <div className="col-6 col-xl-3">
                 <div className="rounded border p-3 h-100">
-                  <div className="small text-muted">Break duration</div>
+                  <div className="small text-muted">Break Time</div>
                   <div className="fs-5 fw-semibold">{data.break_duration || "0h 00m"}</div>
-                  <div className="small text-muted">Only gaps over 10m appear below as breaks</div>
                 </div>
               </div>
               <div className="col-6 col-xl-3">
                 <div className="rounded border p-3 h-100">
-                  <div className="small text-muted">Half-day threshold</div>
-                  <div className="fs-5 fw-semibold">{data.half_day_working_duration_text || "—"}</div>
-                  <div className="small text-muted">{data.half_day_working_duration && data.working_minutes >= data.half_day_working_duration ? "Threshold reached" : "Threshold not reached"}</div>
+                  <div className="small text-muted">Half-Day Present</div>
+                  <div className="fs-6 fw-semibold">{data.half_day_present || "No"}</div>
                 </div>
               </div>
+              <div className="col-6 col-xl-3">
+                <div className="rounded border p-3 h-100">
+                  <div className="small text-muted">First Half Status</div>
+                  <div className="fs-6 fw-semibold">{data.first_half_status || data.status || "Not Marked"}</div>
+                </div>
+              </div>
+              <div className="col-6 col-xl-3">
+                <div className="rounded border p-3 h-100">
+                  <div className="small text-muted">Second Half Status</div>
+                  <div className="fs-6 fw-semibold">{data.second_half_status || data.status || "Not Marked"}</div>
+                </div>
+              </div>
+              <div className="col-6 col-xl-3">
+                <div className="rounded border p-3 h-100">
+                  <div className="small text-muted">Half Day Time</div>
+                  <div className="fs-5 fw-semibold">{data.half_day_working_duration_text || "—"}</div>
+                  <div className="small text-muted">Effective time: {duration(data.effective_working_minutes || 0)}</div>
+                </div>
+              </div>
+              {data.half_day_review_required && (
+                <div className="col-12"><div className="alert alert-warning py-2 mb-0 small">Half-day attendance is not finalized or requires HR Admin review.</div></div>
+              )}
             </div>
 
             <div className="row g-3">
@@ -171,7 +188,7 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
               </div>
               <div className="col-lg-5">
                 <div className="d-flex align-items-center justify-content-between mb-2">
-                  <h6 className="mb-0">Breaks over 10 minutes</h6>
+                  <h6 className="mb-0">Break Details</h6>
                   <span className="badge text-bg-warning">{data.break_duration}</span>
                 </div>
                 <div className="table-responsive border rounded">
@@ -180,10 +197,10 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
                     <tbody>
                       {data.break_intervals?.map((item, index) => (
                         <tr key={`${item.from_time}-${index}`}>
-                          <td>{formatClock(item.from_time)}</td><td>{formatClock(item.to_time)}</td><td>{duration(item.duration_minutes)}</td>
+                          <td>{item.name || `Break ${index + 1}`} · {formatClock(item.from_time)}</td><td>{formatClock(item.to_time)}</td><td>{duration(item.duration_minutes)}</td>
                         </tr>
                       ))}
-                      {!data.break_intervals?.length && <tr><td colSpan="3" className="text-center text-muted py-3">No break over 10 minutes.</td></tr>}
+                      {!data.break_intervals?.length && <tr><td colSpan="3" className="text-center text-muted py-3">No break intervals recorded.</td></tr>}
                     </tbody>
                   </table>
                 </div>

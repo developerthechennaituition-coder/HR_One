@@ -57,6 +57,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 from pymongo import ReturnDocument
 from pydantic import BaseModel, Field, field_validator
@@ -65,6 +66,7 @@ from pymongo.errors import DuplicateKeyError
 from app.db.mongodb import db
 from app.session import active_sessions
 from app.working_details import applicable_schedule, format_hours_minutes
+from app.attendance_calculations import classify_half_day, effective_working_minutes, attendance_issue, permission_minutes_outside_total_duration
 from app.attendance_export import build_multi_employee_attendance_workbook
 
 load_dotenv()
@@ -288,12 +290,31 @@ class AttendanceResponse(BaseModel):
     attendance_state: str | None = None
     working_minutes: int | None = None
     working_duration: str | None = None
+    total_duration_minutes: int | None = None
+    actual_elapsed_minutes: int | None = None
+    total_duration: str | None = None
+    permission_total_minutes: int | None = None
     outside_minutes: int | None = None
     outside_duration: str | None = None
     visible_break_minutes: int | None = None
     break_duration: str | None = None
     working_intervals: list[dict[str, Any]] | None = None
     break_intervals: list[dict[str, Any]] | None = None
+    half_day_present: str | None = None
+    calculated_attendance_status: str | None = None
+    half_day_present_side: str | None = None
+    first_half_status: str | None = None
+    second_half_status: str | None = None
+    half_day_review_required: bool | None = None
+    half_day_working_duration: int | None = None
+    half_day_working_duration_text: str | None = None
+    effective_working_minutes: int | None = None
+    has_attendance_issue: bool | None = None
+    attendance_issue_details: list[str] | None = None
+    early_going_by: str | None = None
+    late_going_by: str | None = None
+    early_going_by_minutes: int | None = None
+    late_going_by_minutes: int | None = None
     check_in_latitude: float | None = None
     check_in_longitude: float | None = None
     check_in_distance: float | None = None
@@ -2768,6 +2789,52 @@ def list_attendance(
             users[record_user_id],
         )
         row.update(daily)
+        permission_map = _collect_permissions(record_user_id, selected.isoformat(), (selected + timedelta(days=1)).isoformat(), {selected.isoformat(): record})
+        permission_entries = permission_map.get(selected.isoformat(), [])
+        permission_minutes = _union_minutes([entry["_interval"] for entry in permission_entries])
+        check_in = daily.get("first_check_in") or record.get("check_in_time")
+        check_out = daily.get("last_check_out") or record.get("check_out_time")
+        # Add only approved permission minutes outside the actual check-in/out
+        # span. Permission already covered by the attendance duration must not
+        # be counted a second time.
+        permission_additional = permission_minutes_outside_total_duration(
+            [entry["_interval"] for entry in permission_entries],
+            check_in,
+            check_out,
+        )
+        effective_minutes = effective_working_minutes(
+            daily.get("working_minutes"), permission_additional
+        )
+        completed = bool(check_in and check_out and daily.get("attendance_state") != "In Progress")
+        half = classify_half_day(
+            total_duration_minutes=effective_minutes,
+            half_day_threshold_minutes=int(daily.get("half_day_working_duration") or 0),
+            scheduled_start=daily.get("scheduled_work_start_time"),
+            scheduled_end=daily.get("scheduled_work_end_time"),
+            check_in=check_in, check_out=check_out, day_completed=completed,
+            base_status=record.get("status") or "Not Marked",
+            leave_day_part=record.get("leave_day_part"),
+            leave_is_full_day=bool(record.get("status") == "Leave" and (record.get("leave_day_part") or "full_day") == "full_day"),
+            working_intervals=daily.get("working_intervals") or [],
+        )
+        issue = attendance_issue(check_in, check_out, daily.get("working_intervals") or [])
+        early, late = _going_by_minutes(check_out, daily.get("scheduled_work_end_time"))
+        row.update({**half, **issue,
+            "actual_elapsed_minutes": int(daily.get("elapsed_minutes") or 0),
+            "total_duration_minutes": effective_minutes,
+            "total_duration": _format_duration(effective_minutes),
+            "effective_working_minutes": effective_minutes,
+            "permission_total_minutes": permission_minutes,
+            "early_going_by_minutes": early, "late_going_by_minutes": late,
+            "early_going_by": _format_duration(early) if early is not None else "—",
+            "late_going_by": _format_duration(late) if late is not None else "—",
+        })
+        calculated_status = row.get("status") or "Not Marked"
+        if str(half.get("half_day_present") or "No").startswith("Yes"):
+            calculated_status = "Half-Day Present"
+        elif completed and effective_minutes < int(daily.get("half_day_working_duration") or 0) * 0.80 and calculated_status not in {"Leave", "Holiday", "Weekly Off"}:
+            calculated_status = "Absent"
+        row["calculated_attendance_status"] = calculated_status
         response_rows.append(row)
     return response_rows
 
@@ -3461,6 +3528,9 @@ def get_historical_attendance_month(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
     start, end = _validate_historical_read_month(employee, year, month)
     _sync_leave_for_user_range(user_id, start.isoformat(), (end - timedelta(days=1)).isoformat())
+    # Finalize automatic weekly offs for completed months using the same calendar policy.
+    from app.attendance_requests import _ensure_monthly_auto_weekly_offs
+    _ensure_monthly_auto_weekly_offs(employee, year, month)
     records = {
         str(item.get("attendance_date", ""))[:10]: item
         for item in attendance_collection.find({
@@ -3854,13 +3924,16 @@ def get_my_attendance(
         )
     )
 
-    return [
-        _to_response(
-            record,
-            user,
-        )
-        for record in records
-    ]
+    response_rows = []
+    for record in records:
+        row = _to_response(record, user)
+        # Empty punch pairs are Not Marked in the employee-facing attendance view.
+        # This also normalizes legacy auto-generated Absent rows without altering
+        # explicit attendance records in the database.
+        if not row.get("check_in_time") and not row.get("check_out_time") and str(row.get("status") or "").casefold() == "absent":
+            row["status"] = "Not Marked"
+        response_rows.append(row)
+    return response_rows
 
 # ---------------------------------------------------------------------------
 # GET /api/attendance/employees  (HR Admin / Administrator)
@@ -4400,8 +4473,9 @@ def _calculate_daily_attendance(
                 if actual_break_end is None:
                     active_break = True
                     current_break_minutes = _duration_minutes(break_start, now) if now > break_start else 0
-                    if current_break_minutes > 10:
+                    if current_break_minutes > 0:
                         break_intervals.append({
+                            "name": str(item.get("name") or item.get("break_name") or item.get("type") or "Break"),
                             "from_time": break_start.isoformat(),
                             "to_time": now.isoformat(),
                             "duration_minutes": current_break_minutes,
@@ -4413,10 +4487,9 @@ def _calculate_daily_attendance(
                 if end_of_day is not None:
                     actual_break_end = min(actual_break_end, end_of_day)
                 break_minutes = _duration_minutes(break_start, actual_break_end)
-                # Keep the ESSL report's existing rule: only breaks strictly
-                # greater than 10 minutes appear in the named break list.
-                if break_minutes > 10:
+                if break_minutes > 0:
                     break_intervals.append({
+                        "name": str(item.get("name") or item.get("break_name") or item.get("type") or "Break"),
                         "from_time": break_start.isoformat(),
                         "to_time": actual_break_end.isoformat(),
                         "duration_minutes": break_minutes,
@@ -4449,11 +4522,14 @@ def _calculate_daily_attendance(
             "working_minutes": working_minutes,
             "working_duration": _format_duration(working_minutes),
             "elapsed_minutes": elapsed_minutes,
+            "total_duration_minutes": elapsed_minutes,
+            "total_duration": _format_duration(elapsed_minutes),
             **_schedule_fields_for_date(user_id, selected_date),
             "outside_minutes": outside_minutes,
             "outside_duration": _format_duration(outside_minutes),
-            "visible_break_minutes": visible_break_minutes,
-            "break_duration": _format_duration(visible_break_minutes),
+            "visible_break_minutes": max(0, elapsed_minutes - working_minutes),
+            "break_minutes": max(0, elapsed_minutes - working_minutes),
+            "break_duration": _format_duration(max(0, elapsed_minutes - working_minutes)),
             "working_intervals": working_intervals,
             "break_intervals": break_intervals,
             "event_count": 1 + len(normalized_breaks) * 2 + (1 if last_out else 0),
@@ -4495,8 +4571,9 @@ def _calculate_daily_attendance(
             continue
         minutes = _duration_minutes(check_out, next_check_in)
         all_gap_minutes += minutes
-        if minutes > 10:
+        if minutes > 0:
             break_intervals.append({
+                "name": f"Break {len(break_intervals) + 1}",
                 "from_time": check_out.isoformat(),
                 "to_time": next_check_in.isoformat(),
                 "duration_minutes": minutes,
@@ -4543,11 +4620,14 @@ def _calculate_daily_attendance(
         "working_minutes": working_minutes,
         "working_duration": _format_duration(working_minutes),
         "elapsed_minutes": elapsed_minutes,
+        "total_duration_minutes": elapsed_minutes,
+        "total_duration": _format_duration(elapsed_minutes),
         **_schedule_fields_for_date(user_id, selected_date),
         "outside_minutes": outside_minutes,
         "outside_duration": _format_duration(outside_minutes),
-        "visible_break_minutes": sum(item["duration_minutes"] for item in break_intervals),
-        "break_duration": _format_duration(sum(item["duration_minutes"] for item in break_intervals)),
+        "visible_break_minutes": max(0, elapsed_minutes - working_minutes),
+        "break_minutes": max(0, elapsed_minutes - working_minutes),
+        "break_duration": _format_duration(max(0, elapsed_minutes - working_minutes)),
         "working_intervals": working_intervals,
         "break_intervals": break_intervals,
         "event_count": len(punch_times),
@@ -4590,7 +4670,52 @@ def get_daily_attendance_breakdown(
         else:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "You can view only your own attendance or authorized team members.")
 
-    return _calculate_daily_attendance(target_id, selected, target)
+    daily = _calculate_daily_attendance(target_id, selected, target)
+    record = attendance_collection.find_one({"user_id": target_id, "attendance_date": selected.isoformat()}) or {}
+    check_in = daily.get("first_check_in") or record.get("check_in_time")
+    check_out = daily.get("last_check_out") or record.get("check_out_time")
+    total_minutes = int(daily.get("elapsed_minutes") or 0)
+    permission_map = _collect_permissions(target_id, selected.isoformat(), (selected + timedelta(days=1)).isoformat(), {selected.isoformat(): record})
+    permission_entries = permission_map.get(selected.isoformat(), [])
+    permission_minutes = _union_minutes([entry["_interval"] for entry in permission_entries])
+    permission_additional_minutes = permission_minutes_outside_total_duration(
+        [entry["_interval"] for entry in permission_entries], check_in, check_out
+    )
+    effective_minutes = effective_working_minutes(total_minutes, permission_additional_minutes)
+    day_completed = bool(check_in and check_out and daily.get("attendance_state") != "In Progress" and selected <= company_today())
+    half_day = classify_half_day(
+        total_duration_minutes=effective_minutes,
+        half_day_threshold_minutes=int(daily.get("half_day_working_duration") or 0),
+        scheduled_start=daily.get("scheduled_work_start_time"),
+        scheduled_end=daily.get("scheduled_work_end_time"),
+        check_in=check_in,
+        check_out=check_out,
+        day_completed=day_completed,
+        base_status=record.get("status") or daily.get("status") or "Not Marked",
+        leave_day_part=record.get("leave_day_part"),
+        leave_is_full_day=bool(record.get("status") == "Leave" and (record.get("leave_day_part") or "full_day") == "full_day"),
+        working_intervals=daily.get("working_intervals") or [],
+    )
+    issue = attendance_issue(check_in, check_out, daily.get("working_intervals") or [])
+    scheduled_out = daily.get("scheduled_work_end_time")
+    early_going_by, late_going_by = _going_by_minutes(check_out, scheduled_out)
+    return {
+        **daily,
+        **half_day,
+        **issue,
+        "permission_total_minutes": permission_minutes,
+        "permission_additional_minutes": permission_additional_minutes,
+        "effective_working_minutes": effective_minutes,
+        "early_going_by_minutes": early_going_by,
+        "late_going_by_minutes": late_going_by,
+        "early_going_by": _format_duration(early_going_by) if early_going_by is not None else "—",
+        "late_going_by": _format_duration(late_going_by) if late_going_by is not None else "—",
+        "status": ("Half-Day Present" if str(half_day.get("half_day_present") or "No").startswith("Yes") else ("Absent" if day_completed and check_in and check_out and effective_minutes < int(daily.get("half_day_working_duration") or 0) * 0.80 else (record.get("status") or daily.get("status") or "Not Marked"))),
+        "actual_elapsed_minutes": total_minutes,
+        "total_duration_minutes": effective_minutes,
+        "total_duration": _format_duration(effective_minutes),
+        "half_day_threshold_met": bool(daily.get("half_day_working_duration") and effective_minutes >= int(daily.get("half_day_working_duration") or 0)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4692,7 +4817,7 @@ def _monthly_report_rows(user_id: str, employee: dict[str, Any], year: int, mont
                 end_text = _local_punch(datetime.fromisoformat(end)).strftime("%I:%M %p") if end else "In progress"
             except (TypeError, ValueError):
                 end_text = "In progress"
-            break_lines.append(f"{start_text} – {end_text} ({duration})")
+            break_lines.append(f"B{len(break_lines) + 1}: {start_text} – {end_text} ({duration})")
 
         rows.append({
             "attendance_date": date_iso[:10],
@@ -4703,14 +4828,16 @@ def _monthly_report_rows(user_id: str, employee: dict[str, Any], year: int, mont
             "working_duration": details.get("working_duration") or "0h 00m",
             "total_duration_minutes": int(details.get("elapsed_minutes") or ((details.get("working_minutes") or 0) + (details.get("outside_minutes") or 0))),
             "total_duration": _format_duration(int(details.get("elapsed_minutes") or ((details.get("working_minutes") or 0) + (details.get("outside_minutes") or 0)))),
+            "working_type": details.get("working_type") or _schedule_fields_for_date(user_id, selected_date).get("working_type") or "",
             "scheduled_work_start_time": (details.get("scheduled_work_start_time") or _schedule_fields_for_date(user_id, selected_date).get("scheduled_work_start_time")),
             "scheduled_work_end_time": (details.get("scheduled_work_end_time") or _schedule_fields_for_date(user_id, selected_date).get("scheduled_work_end_time")),
             "scheduled_work_duration": int(details.get("scheduled_work_duration") or _schedule_fields_for_date(user_id, selected_date).get("scheduled_work_duration") or 0),
             "half_day_working_duration": int(details.get("half_day_working_duration") or _schedule_fields_for_date(user_id, selected_date).get("half_day_working_duration") or 0),
-            "break_minutes": int(details.get("visible_break_minutes") or 0),
+            "break_minutes": int(details.get("break_minutes", details.get("visible_break_minutes", 0)) or 0),
             "break_duration": details.get("break_duration") or "0h 00m",
             "break_intervals": break_intervals,
-            "break_details": "\n".join(break_lines) if break_lines else "No qualifying breaks recorded",
+            "break_details": "\n".join(break_lines) if break_lines else "No break intervals recorded",
+            "working_intervals": details.get("working_intervals") or [],
             "attendance_type": details.get("attendance_type") or record.get("attendance_type") or (
                 "WFH" if record.get("attendance_source") == "WFH_FACE_GPS" else ("Office" if record else "—")
             ),
@@ -4750,15 +4877,37 @@ SOURCE_LABELS = {
     "MANUAL": "Manual",
     "ATTENDANCE_REQUEST": "Attendance Request",
     "WFH_FACE_GPS": "WFH (Face + GPS)",
+    "AUTO_WEEKLY_OFF": "Automatic Weekly Off",
 }
 
 
+def _going_by_minutes(check_out: Any, scheduled_out: Any) -> tuple[int | None, int | None]:
+    """Return mutually exclusive early/late checkout minutes; None for missing values."""
+    actual = _hhmm_minutes(check_out)
+    scheduled = _hhmm_minutes(scheduled_out)
+    if actual is None or scheduled is None:
+        return None, None
+    difference = actual - scheduled
+    if difference > 720:
+        difference -= 1440
+    elif difference < -720:
+        difference += 1440
+    return (abs(difference), 0) if difference < 0 else (0, difference)
+
+
 def _hhmm_minutes(value: Any) -> int | None:
-    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})(?::\d{2})?\s*", str(value or ""))
-    if not match:
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", raw)
+    if match:
+        hours, minutes = int(match.group(1)), int(match.group(2))
+        return hours * 60 + minutes if hours < 24 and minutes < 60 else None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(COMPANY_TZ)
+        return parsed.hour * 60 + parsed.minute
+    except (TypeError, ValueError):
         return None
-    hours, minutes = int(match.group(1)), int(match.group(2))
-    return hours * 60 + minutes if hours < 24 and minutes < 60 else None
 
 
 def _clock_text(value: Any) -> str:
@@ -5093,25 +5242,100 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
             "first_check_in": None, "last_check_out": None,
             "working_minutes": 0, "working_duration": "0h 00m",
             "break_minutes": 0, "break_duration": "0h 00m", "break_intervals": [],
-            "break_details": "No qualifying breaks recorded",
+            "break_details": "No break intervals recorded",
             "attendance_type": (record or {}).get("attendance_type") or "—",
             "attendance_source": (record or {}).get("attendance_source") or "—",
             "leave_type_code": (record or {}).get("leave_type_code") or "",
             "remarks": (record or {}).get("remarks") or "",
         }
-        check_in = base.get("first_check_in") or day.get("check_in_time")
-        check_out = base.get("last_check_out") or day.get("check_out_time")
-        source = base.get("attendance_source") or "—"
+        # Use the same daily calculation for every date, including punch-only days
+        # and dates without a persisted attendance document.
+        day_metrics = _calculate_daily_attendance(user_id, selected, employee)
+        check_in = base.get("first_check_in") or day_metrics.get("first_check_in") or day.get("check_in_time")
+        check_out = base.get("last_check_out") or day_metrics.get("last_check_out") or day.get("check_out_time")
+        source = base.get("attendance_source") or day_metrics.get("attendance_source") or "—"
         status_text = day.get("status_label") or day.get("status") or "Not Marked"
+        if status_text == "Not Marked" and day_metrics.get("first_check_in") and day_metrics.get("last_check_out"):
+            status_text = "Present"
         schedule = _schedule_fields_for_date(user_id, selected)
+        total_duration_minutes = int(
+            base.get("total_duration_minutes")
+            if base.get("total_duration_minutes") is not None
+            else day_metrics.get("elapsed_minutes") or 0
+        )
+        attendance_state = day_metrics.get("attendance_state") or "Not Marked"
+        today_for_completion = company_today()
+        day_completed = bool(selected < today_for_completion or (selected == today_for_completion and check_out and attendance_state != "In Progress"))
+        effective_permission_minutes = permission_minutes_outside_total_duration(
+            [entry["_interval"] for entry in entries], check_in, check_out
+        )
+        effective_minutes = effective_working_minutes(
+            total_duration_minutes, effective_permission_minutes,
+            permission_already_included=bool(base.get("permission_included_in_working_duration")),
+        )
+        half_day = classify_half_day(
+            total_duration_minutes=effective_minutes,
+            half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
+            scheduled_start=schedule.get("scheduled_work_start_time"),
+            scheduled_end=schedule.get("scheduled_work_end_time"),
+            check_in=check_in,
+            check_out=check_out,
+            day_completed=day_completed,
+            base_status=status_text,
+            leave_day_part=(leave_info or {}).get("day_part"),
+            leave_is_full_day=bool(leave_info and (leave_info.get("day_part") or "full_day") == "full_day"),
+            working_intervals=(base.get("working_intervals") if legacy is not None else day_metrics.get("working_intervals")) or [],
+        )
+        effective_break_intervals = base.get("break_intervals") if legacy is not None else (day_metrics.get("break_intervals") or [])
+        effective_break_minutes = int(base.get("break_minutes") or 0) if legacy is not None else int(day_metrics.get("break_minutes", day_metrics.get("visible_break_minutes", 0)) or 0)
+        if legacy is not None:
+            effective_break_details = base.get("break_details") or "No break intervals recorded"
+        else:
+            break_lines = []
+            for index, interval in enumerate(effective_break_intervals, 1):
+                break_lines.append(
+                    f"B{index}: {_clock_text(interval.get('from_time'))} – {_clock_text(interval.get('to_time'))} ({interval.get('duration') or _format_duration(interval.get('duration_minutes') or 0)})"
+                )
+            effective_break_details = "\n".join(break_lines) if break_lines else "No break intervals recorded"
+        resolved_status = status_text
+        protected_statuses = {"holiday", "weekly off", "leave", "medical leave", "not applicable", "before joining"}
+        if not check_in and not check_out and status_text.casefold() == "absent":
+            resolved_status = "Not Marked"
+            half_day["first_half_status"] = "Not Marked"
+            half_day["second_half_status"] = "Not Marked"
+        if status_text.casefold() not in protected_statuses and not (not check_in and not check_out and status_text.casefold() == "absent"):
+            if str(half_day.get("half_day_present") or "No").startswith("Yes"):
+                resolved_status = "Half-Day Present"
+            elif day_completed and check_in and check_out and effective_minutes < int(schedule.get("half_day_working_duration") or 0) * 0.80:
+                resolved_status = "Absent"
+            # No punches means Not Marked, not Absent. Absent is assigned only
+            # when a completed attendance interval falls below the half-day threshold
+            # or an explicit HR/admin attendance record already says Absent.
         rows.append({
             **{key: value for key, value in base.items() if key not in {"status"}},
             **schedule,
-            "total_duration_minutes": int(base.get("total_duration_minutes") or (int(base.get("working_minutes") or 0) + int(base.get("outside_minutes") or 0))),
-            "total_duration": base.get("total_duration") or _format_duration(int(base.get("total_duration_minutes") or (int(base.get("working_minutes") or 0) + int(base.get("outside_minutes") or 0)))),
-            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and int(base.get("working_minutes") or 0) >= int(schedule.get("half_day_working_duration") or 0)),
+            "working_type": schedule.get("working_type") or base.get("working_type") or "",
+            "working_minutes": int(base.get("working_minutes") if legacy is not None else day_metrics.get("working_minutes") or 0),
+            "working_duration": base.get("working_duration") if legacy is not None else (day_metrics.get("working_duration") or "0h 00m"),
+            "break_minutes": effective_break_minutes,
+            "break_duration": base.get("break_duration") if legacy is not None else (day_metrics.get("break_duration") or "0h 00m"),
+            "break_intervals": effective_break_intervals,
+            "break_details": effective_break_details,
+            "actual_elapsed_minutes": total_duration_minutes,
+            "total_duration_minutes": effective_minutes,
+            "total_duration": _format_duration(effective_minutes),
+            "effective_working_minutes": effective_minutes,
+            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and effective_minutes >= int(schedule.get("half_day_working_duration") or 0)),
+            "working_intervals": (base.get("working_intervals") if legacy is not None else day_metrics.get("working_intervals")) or [],
+            **attendance_issue(check_in, check_out, (base.get("working_intervals") if legacy is not None else day_metrics.get("working_intervals")) or []),
+            "early_going_by_minutes": _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[0],
+            "late_going_by_minutes": _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[1],
+            "early_going_by": _format_duration(_going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[0]) if _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[0] is not None else "—",
+            "late_going_by": _format_duration(_going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[1]) if _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[1] is not None else "—",
+            **half_day,
+            "attendance_state": attendance_state,
             "day": selected.strftime("%A"),
-            "status": status_text,
+            "status": resolved_status,
             "check_in_text": _clock_text(check_in),
             "check_out_text": _clock_text(check_out),
             "attendance_category": day.get("attendance_category") or "—",
@@ -5128,10 +5352,29 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
             "in_legacy": legacy is not None,
         })
 
+    first_half_present_days = sum(1 for item in rows if str(item.get("half_day_present") or "").endswith("First Half"))
+    second_half_present_days = sum(1 for item in rows if str(item.get("half_day_present") or "").endswith("Second Half"))
+    half_day_present_days = sum(1 for item in rows if str(item.get("half_day_present") or "No").startswith("Yes"))
+    half_status_counts = {"Present": 0.0, "Absent": 0.0, "Leave": 0.0, "Holiday": 0.0, "Weekly Off": 0.0}
+    for item in rows:
+        for key in ("first_half_status", "second_half_status"):
+            half_status = str(item.get(key) or "").strip().casefold()
+            for label in half_status_counts:
+                if half_status == label.casefold():
+                    half_status_counts[label] += 0.5
+                    break
     return {
         "rows": rows,
         "summary": {
             "total_days": len(rows),
+            "present_days": half_status_counts["Present"],
+            "absent_days": half_status_counts["Absent"],
+            "leave_days": half_status_counts["Leave"],
+            "holiday_days": half_status_counts["Holiday"],
+            "weekly_off_days": half_status_counts["Weekly Off"],
+            "half_day_present_days": half_day_present_days,
+            "first_half_present_days": first_half_present_days,
+            "second_half_present_days": second_half_present_days,
             "total_working_minutes": sum(int(item.get("working_minutes") or 0) for item in rows),
             "total_working_duration": _format_duration(sum(int(item.get("working_minutes") or 0) for item in rows)),
             "total_break_minutes": sum(int(item.get("break_minutes") or 0) for item in rows),
@@ -5235,6 +5478,23 @@ def export_user_monthly_attendance(
                 cell.fill = PatternFill("solid", fgColor="F7F9FB")
         summary.row_dimensions[r].height = 24
 
+    employee_schedule = _schedule_fields_for_date(user_id, date(year, month, 1))
+    schedule_text = f"{employee_schedule.get('scheduled_work_start_time') or '—'} - {employee_schedule.get('scheduled_work_end_time') or '—'}"
+    working_meta = [
+        (1, "Half Day Time"), (2, format_hours_minutes(employee_schedule.get("half_day_working_duration") or 0)),
+        (3, "Scheduled In / Out"), (4, schedule_text), (5, "Working Type"),
+        (6, employee_schedule.get("working_type") or "—"),
+    ]
+    for column, value in working_meta:
+        cell = summary.cell(6, column, value)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        if column in (1, 3, 5):
+            cell.font = Font(bold=True, color=navy)
+            cell.fill = PatternFill("solid", fgColor=blue)
+        else:
+            cell.fill = PatternFill("solid", fgColor="F7F9FB")
+    summary.row_dimensions[6].height = 24
+
     counts: dict[str, int] = {}
     for row in rows:
         status_name = str(row.get("status") or "Not Marked")
@@ -5260,6 +5520,7 @@ def export_user_monthly_attendance(
         ("Not Marked", sum(v for k, v in counts.items() if k.casefold() == "not marked")),
         ("Total Net Working Time", _format_duration(total_work_minutes)),
         ("Total Qualifying Break Time", _format_duration(total_break_minutes)),
+        ("Pending Attendance / Permission Requests", report_summary["pending_request_count"]),
     ]
     for r, (label, value) in enumerate(metrics, start=8):
         summary.cell(r, 1, label)
@@ -5270,36 +5531,47 @@ def export_user_monthly_attendance(
         for cell in summary[r][:2]:
             cell.border = Border(bottom=thin_grey)
             cell.alignment = Alignment(vertical="center")
-    # Separate blocks to the right of Attendance Metrics (column C is a spacer);
-    # the Attendance Metrics themselves are untouched.
-    def side_block(top_row: int, title: str, items: list[tuple[str, Any]]) -> None:
-        for col, text in ((4, title), (5, "Value")):
-            cell = summary.cell(top_row, col, text)
-            cell.font = Font(bold=True, color=white)
-            cell.fill = PatternFill("solid", fgColor=navy)
-            cell.alignment = Alignment(horizontal="center")
-        for offset, (label, value) in enumerate(items, start=1):
-            label_cell = summary.cell(top_row + offset, 4, label)
-            value_cell = summary.cell(top_row + offset, 5, value)
+    # Four clear monthly-summary groups to the right of the attendance metrics.
+    summary.merge_cells("D7:K7")
+    summary["D7"] = "MONTHLY ATTENDANCE SUMMARY"
+    summary["D7"].font = Font(bold=True, color=white)
+    summary["D7"].fill = PatternFill("solid", fgColor=navy)
+    summary["D7"].alignment = Alignment(horizontal="center", vertical="center")
+    summary_groups = [
+        [("Net Working Time", report_summary["total_working_duration"]),
+         ("Break Time", report_summary["total_break_duration"]),
+         ("Total Duration", report_summary["total_elapsed_duration"])],
+        [("Present Days", report_summary["present_days"]),
+         ("Absent Days", report_summary["absent_days"]),
+         ("Leave Days", report_summary["leave_days"]),
+         ("Holidays", report_summary["holiday_days"])],
+        [("Weekly Off", report_summary["weekly_off_days"]),
+         ("Medical Leave", report_summary["medical_leave_days"]),
+         ("Permission Count", report_summary["permission_count"]),
+         ("Permission Duration", report_summary["permission_total_text"])],
+        [("Half-Day Present", report_summary["half_day_present_days"]),
+         ("First Half Present", report_summary["first_half_present_days"]),
+         ("Second Half Present", report_summary["second_half_present_days"])],
+    ]
+    for group_index, group in enumerate(summary_groups):
+        group_col = 4 + group_index * 2
+        for offset, (label, value) in enumerate(group, start=1):
+            row_number = 7 + offset
+            label_cell = summary.cell(row_number, group_col, label)
+            value_cell = summary.cell(row_number, group_col + 1, value)
             label_cell.font = Font(bold=True, color=navy)
             label_cell.fill = PatternFill("solid", fgColor=light_blue)
             value_cell.fill = PatternFill("solid", fgColor="F7F9FB")
             for cell in (label_cell, value_cell):
                 cell.border = Border(bottom=thin_grey)
-                cell.alignment = Alignment(vertical="center", horizontal="left" if cell is label_cell else "center")
-
-    side_block(7, "Permission Summary", [
-        ("Monthly Permission Count", report_summary["permission_count"]),
-        ("Monthly Permission Total Duration", report_summary["permission_total_text"]),
-    ])
-    side_block(11, "Leave Breakdown", [
-        ("Medical Leave Days (ML)", f"{report_summary['medical_leave_days']:g}"),
-        ("Normal Leave Days", f"{report_summary['normal_leave_days']:g}"),
-        ("Pending Requests", report_summary["pending_request_count"]),
-    ])
+                cell.alignment = Alignment(vertical="center", horizontal="left" if cell is label_cell else "center", wrap_text=True)
+    summary.row_dimensions[8].height = 26
+    summary.row_dimensions[9].height = 26
+    summary.row_dimensions[10].height = 26
+    summary.row_dimensions[11].height = 26
     edited_dates = report_summary.get("hr_admin_edited_dates", [])
     for col, text in ((1, "HR Admin Edited Attendance Summary"), (2, "Value")):
-        cell = summary.cell(20, col, text)
+        cell = summary.cell(22, col, text)
         cell.font = Font(bold=True, color=white)
         cell.fill = PatternFill("solid", fgColor=navy)
         cell.alignment = Alignment(horizontal="center")
@@ -5307,7 +5579,7 @@ def export_user_monthly_attendance(
         ("Total HR Admin Edited Attendance", len(edited_dates)),
         ("HR Admin Edited Dates", ", ".join(date_text[8:10] for date_text in edited_dates) if edited_dates else "No HR Admin edited attendance dates"),
     ]
-    for row_number, (label, value) in enumerate(edited_summary_rows, start=21):
+    for row_number, (label, value) in enumerate(edited_summary_rows, start=23):
         summary.cell(row_number, 1, label)
         summary.cell(row_number, 2, value)
         summary.cell(row_number, 1).font = Font(bold=True, color=navy)
@@ -5325,17 +5597,21 @@ def export_user_monthly_attendance(
     summary.column_dimensions["C"].width = 20
     summary.column_dimensions["D"].width = 36
     summary.column_dimensions["E"].width = 30
+    for col_letter in ("F", "H", "J"):
+        summary.column_dimensions[col_letter].width = 24
+    for col_letter in ("G", "I", "K"):
+        summary.column_dimensions[col_letter].width = 16
     summary.freeze_panes = "A7"
     summary.sheet_view.showGridLines = False
     summary.page_setup.orientation = "portrait"
     summary.page_setup.fitToWidth = 1
     summary.sheet_properties.pageSetUpPr.fitToPage = True
-    summary.print_area = f"A1:E{max(22, 7 + len(metrics))}"
+    summary.print_area = f"A1:K{max(24, 7 + len(metrics))}"
 
     headers = [
         "Attendance Date", "Day", "Status", "First Check-In", "Last Check-Out",
-        "Break Duration", "Break Time List", "Net Working Duration",
-        "Attendance Type", "Source", "Leave Type", "Remarks",
+        "Break Duration", "Working Intervals", "Break Details", "Net Working Duration",
+        "Early Going By", "Late Going By", "Attendance Type", "Source", "Leave Type", "Remarks",
         "Permission Start Time", "Permission End Time", "Permission Duration", "Permission Reason",
         "Leave Details", "Request Status", "Pending Request Details", "HR Admin Edited",
     ]
@@ -5366,25 +5642,43 @@ def export_user_monthly_attendance(
 
     for idx, row in enumerate(all_rows, start=4):
         attendance_date = date.fromisoformat(row["attendance_date"])
+        permission_items = row.get("permissions", [])
+        permission_duration_text = "\n".join(entry["duration_text"] for entry in permission_items) or "—"
+        if permission_items:
+            permission_duration_text += f"\nPermission Count: {len(permission_items)}"
+        working_interval_text = "\\n".join(
+            f"WI{interval_index}: {local_clock(item.get('from_time'))} - {local_clock(item.get('to_time'))} "
+            f"({item.get('duration') or _format_duration(item.get('duration_minutes') or 0)})"
+            for interval_index, item in enumerate((row.get("working_intervals") or []), 1)
+            if item.get("from_time") or item.get("to_time")
+        ) or "—"
+        date_value = attendance_date.strftime("%d-%b-%Y") + (" ⚠" if row.get("has_attendance_issue") else "")
+        break_details_text = "\n".join(
+            line for line in str(row.get("break_details") or "No qualifying breaks recorded").splitlines()
+            if "total break duration:" not in line.casefold()
+        ) or "No qualifying breaks recorded"
         values = [
-            attendance_date,
+            date_value,
             attendance_date.strftime("%A"),
             row.get("status") or "Not Marked",
             row.get("check_in_text") or "—",
             row.get("check_out_text") or "—",
             row.get("break_duration") or "0h 00m",
-            row.get("break_details") or "No qualifying breaks recorded",
+            working_interval_text,
+            break_details_text,
             row.get("working_duration") or "0h 00m",
+            row.get("early_going_by") or "—",
+            row.get("late_going_by") or "—",
             row.get("attendance_category") if row.get("attendance_category") not in (None, "—") else (
                 {"WFH": "Work From Home", "OFFICE": "Office", "Office": "Office"}.get(str(row.get("attendance_type")), row.get("attendance_type") or "—")
             ),
             row.get("attendance_source_label") or row.get("attendance_source") or "—",
             (row.get("leave") or {}).get("leave_type") or "—",
             row.get("remarks") or "—",
-            "\n".join(entry["start_text"] for entry in row.get("permissions", [])) or "—",
-            "\n".join(entry["end_text"] for entry in row.get("permissions", [])) or "—",
-            "\n".join(entry["duration_text"] for entry in row.get("permissions", [])) or "—",
-            "\n".join(entry["reason"] or "—" for entry in row.get("permissions", [])) or "—",
+            "\n".join(entry["start_text"] for entry in permission_items) or "—",
+            "\n".join(entry["end_text"] for entry in permission_items) or "—",
+            permission_duration_text,
+            "\n".join(entry["reason"] or "—" for entry in permission_items) or "—",
             (row.get("leave") or {}).get("details") or "—",
             row.get("request_status") or "—",
             _pending_request_text(row.get("pending_requests", [])) or "—",
@@ -5394,8 +5688,8 @@ def export_user_monthly_attendance(
             cell = detail.cell(idx, col, value)
             cell.alignment = Alignment(
                 vertical="top",
-                wrap_text=col in (7, 12, 13, 14, 15, 16, 17, 19),
-                horizontal="left" if col in (7, 12, 16, 17, 19) else "center",
+                wrap_text=col in (7, 8, 15, 18, 19, 20, 22),
+                horizontal="left" if col in (7, 8, 15, 19, 20, 22) else "center",
             )
             cell.border = Border(bottom=thin_grey)
             if idx % 2 == 0:
@@ -5404,7 +5698,9 @@ def export_user_monthly_attendance(
                 cell.number_format = "DD-MMM-YYYY"
             if col == 3:
                 normalized = str(value).casefold()
-                if normalized == "present":
+                if normalized == "half-day present":
+                    cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                elif normalized == "present":
                     cell.fill = PatternFill("solid", fgColor=green)
                 elif normalized == "absent":
                     cell.fill = PatternFill("solid", fgColor="F4CCCC")
@@ -5416,7 +5712,7 @@ def export_user_monthly_attendance(
                     cell.fill = PatternFill("solid", fgColor="EDEDED")
                 elif normalized == "not marked":
                     cell.fill = PatternFill("solid", fgColor="FFF2CC")
-            if col == 18 and str(value).casefold() in {"pending", "under review"}:
+            if col == 21 and str(value).casefold() in {"pending", "under review"}:
                 cell.fill = PatternFill("solid", fgColor="FFF2CC")
         # Size each row for BOTH the break list and the complete remark.
         # Excel does not always auto-fit row heights in generated workbooks,
@@ -5432,31 +5728,32 @@ def export_user_monthly_attendance(
             )
 
         estimated_lines = max(
-            _wrapped_line_count(break_text, 40),
+            _wrapped_line_count(str(values[6]), 38),
+            _wrapped_line_count(break_text, 22),
             _wrapped_line_count(remark_text, 43),
-            _wrapped_line_count(str(values[18]), 60),
-            _wrapped_line_count(str(values[15]), 28),
+            _wrapped_line_count(str(values[21]), 60),
+            _wrapped_line_count(str(values[17]), 26),
             len(row.get("permissions", [])),
         )
         # Keep ordinary rows compact while allowing long remarks to expand.
         detail.row_dimensions[idx].height = min(300, max(24, 15 * estimated_lines + 6))
 
     if all_rows:
-        table = Table(displayName="MonthlyAttendance", ref=f"A3:T{3 + len(all_rows)}")
+        table = Table(displayName="MonthlyAttendance", ref=f"A3:W{3 + len(all_rows)}")
         table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
         detail.add_table(table)
     else:
         detail.cell(4, 1, "No attendance records were found for this employee and month.")
-        detail.merge_cells("A4:T4")
+        detail.merge_cells("A4:W4")
         detail["A4"].font = Font(italic=True, color="666666")
 
     # A wider Remarks column plus wrapped text and dynamic row heights keeps
     # long employee remarks readable without truncating the exported value.
-    widths = [17, 15, 16, 18, 18, 18, 42, 22, 22, 20, 22, 45, 20, 20, 24, 30, 30, 16, 60, 18]
+    widths = [17, 15, 18, 18, 18, 18, 38, 22, 32, 17, 17, 22, 20, 22, 45, 20, 20, 26, 30, 30, 16, 60, 18]
     for idx, width in enumerate(widths, start=1):
-        detail.column_dimensions[chr(64 + idx)].width = width
+        detail.column_dimensions[get_column_letter(idx)].width = width
     detail.freeze_panes = "A4"
-    detail.auto_filter.ref = f"A3:T{max(3, 3 + len(all_rows))}"
+    detail.auto_filter.ref = f"A3:W{max(3, 3 + len(all_rows))}"
     detail.sheet_view.showGridLines = False
     detail.page_setup.orientation = "landscape"
     detail.page_setup.fitToWidth = 1
@@ -5468,7 +5765,7 @@ def export_user_monthly_attendance(
     detail.page_margins.right = 0.25
     detail.page_margins.top = 0.5
     detail.page_margins.bottom = 0.5
-    detail.print_area = f"A1:T{max(4, 3 + len(all_rows))}"
+    detail.print_area = f"A1:W{max(4, 3 + len(all_rows))}"
 
     output = BytesIO()
     workbook.save(output)
@@ -5625,7 +5922,7 @@ def export_multiple_employee_attendance(
             "date_of_joining": employee_info.get("joining_date"),
             "date_of_leaving": employee_info.get("relieving_date"),
         }
-        selected.append((employee_info, employee))
+        selected.append((employee_info, employee, details))
 
     month_name = date(year, month, 1).strftime("%B")
     company = db["companies"].find_one({"is_active": {"$ne": False}}, {"company_name": 1, "name": 1}) or {}
@@ -5633,7 +5930,7 @@ def export_multiple_employee_attendance(
     generated_on = company_now().strftime("%d-%b-%Y %I:%M %p")
 
     employee_reports = []
-    for info, employee in selected:
+    for info, employee, working_details in selected:
         legacy_rows = _monthly_report_rows(str(employee["_id"]), employee, year, month)
         complete = _complete_monthly_report(str(employee["_id"]), employee, year, month, legacy_rows)
         rows = complete["rows"]
@@ -5644,7 +5941,7 @@ def export_multiple_employee_attendance(
             if (not joining or date.fromisoformat(item["attendance_date"]) >= joining)
             and (not leaving or date.fromisoformat(item["attendance_date"]) <= leaving)
         ]
-        employee_reports.append({"info": info, "employee": employee, "rows": rows})
+        employee_reports.append({"info": info, "employee": employee, "working_details": working_details, "rows": rows})
 
     output = build_multi_employee_attendance_workbook(
         employee_reports,

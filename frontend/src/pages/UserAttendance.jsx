@@ -437,6 +437,7 @@ function UserAttendance({ session }) {
               const pendingRequests = days.flatMap((day) => day.pending_requests || []);
               const badgeClass = (status) => {
                 const key = String(status || "").toLowerCase();
+                if (key === "half-day present") return "text-bg-info";
                 if (key === "present") return "text-bg-success";
                 if (key === "absent") return "text-bg-danger";
                 if (["leave", "medical leave"].includes(key)) return "text-bg-primary";
@@ -460,9 +461,15 @@ function UserAttendance({ session }) {
                 </div>
                 <div className="row g-2 mb-3 small">
                   {[
-                    ["Total Net Working Time", summary.total_working_duration || "0h 00m"],
-                    ["Total Break Time", summary.total_break_duration || "0h 00m"],
-                    ["Total Elapsed Duration", summary.total_elapsed_duration || "0h 00m"],
+                    ["Total Duration", summary.total_elapsed_duration || "0h 00m"],
+                    ["Net Working Time", summary.total_working_duration || "0h 00m"],
+                    ["Break Time", summary.total_break_duration || "0h 00m"],
+                    ["Half-Day Present", summary.half_day_present_days ?? 0],
+                    ["Present Days", summary.present_days ?? 0],
+                    ["Absent Days", summary.absent_days ?? 0],
+                    ["Leave Days", summary.leave_days ?? 0],
+                    ["Weekly Off Days", summary.weekly_off_days ?? 0],
+                    ["Holiday Days", summary.holiday_days ?? 0],
                     ["Monthly Permission Count", summary.permission_count ?? 0],
                     ["Monthly Permission Total Duration", summary.permission_total_text || "00 Hours 00 Minutes"],
                     ["Medical Leave (ML) Days", summary.medical_leave_days ?? 0],
@@ -488,11 +495,18 @@ function UserAttendance({ session }) {
                         <th>Source</th>
                         <th>Permission</th>
                         <th>Leave Details</th>
-                        <th>Break Duration</th>
-                        <th>Break Time List</th>
-                        <th>Working Duration</th>
                         <th>Total Duration</th>
+                        <th>Net Working Time</th>
+                        <th>Break Time</th>
+                        <th>Break Details</th>
+                        <th>Half-Day Present</th>
+                        <th>First Half Status</th>
+                        <th>Second Half Status</th>
                         <th>Half-Day Threshold</th>
+                        <th>Working Intervals</th>
+                        <th>Early Going By</th>
+                        <th>Late Going By</th>
+                        <th>Attendance Issue</th>
                         <th>Request Status</th>
                         <th>Remarks</th>
                       </tr>
@@ -504,6 +518,7 @@ function UserAttendance({ session }) {
                             {new Date(`${record.attendance_date}T00:00:00`).toLocaleDateString("en-IN", {
                               timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric",
                             })}
+                            {record.has_attendance_issue && <span className="ms-2 text-warning fw-bold" title={(record.attendance_issue_details || []).join(", ")} aria-label="Attendance issue">⚠</span>}
                           </td>
                           <td>{record.day}</td>
                           <td>
@@ -539,20 +554,27 @@ function UserAttendance({ session }) {
                               </>
                             ) : "—"}
                           </td>
+                          <td className="text-nowrap">{record.total_duration || "0h 00m"}</td>
+                          <td className="text-nowrap">{record.working_duration || "0h 00m"}</td>
                           <td className="text-nowrap">{record.break_duration || "0h 00m"}</td>
-                          <td style={{ minWidth: 220, whiteSpace: "pre-line" }}>
+                          <td style={{ minWidth: 240, whiteSpace: "pre-line" }}>
                             {record.break_intervals?.length
                               ? record.break_intervals.map((item, index) => (
                                 <div key={`${item.from_time}-${index}`} className="small mb-1">
-                                  <span className="fw-semibold">{formatLocalDateTime(item.from_time)} – {formatLocalDateTime(item.to_time)}</span>
+                                  <span className="fw-semibold">{item.name || `Break ${index + 1}`}: {formatLocalDateTime(item.from_time)} – {formatLocalDateTime(item.to_time)}</span>
                                   <span className="text-muted"> ({item.duration || `${Math.floor((item.duration_minutes || 0) / 60)}h ${String((item.duration_minutes || 0) % 60).padStart(2, "0")}m`})</span>
                                 </div>
                               ))
-                              : <span className="text-muted small">No qualifying breaks</span>}
+                              : <span className="text-muted small">No break intervals recorded</span>}
                           </td>
-                          <td className="text-nowrap">{record.working_duration || "0h 00m"}</td>
-                          <td className="text-nowrap">{record.total_duration || "0h 00m"}</td>
+                          <td className="text-nowrap">{record.half_day_present || "No"}</td>
+                          <td><span className="badge text-bg-light border">{record.first_half_status || record.status || "Not Marked"}</span></td>
+                          <td><span className="badge text-bg-light border">{record.second_half_status || record.status || "Not Marked"}</span></td>
                           <td className="text-nowrap">{record.half_day_working_duration_text || "—"}{record.half_day_threshold_met ? " ✓" : ""}</td>
+                          <td style={{ minWidth: 180, whiteSpace: "pre-line" }}>{(record.working_intervals || []).map((interval) => `${interval.from_time?.slice(11, 16) || "—"} - ${interval.to_time?.slice(11, 16) || "—"}`).join("\n") || "—"}</td>
+                          <td className="text-nowrap">{record.early_going_by || "—"}</td>
+                          <td className="text-nowrap">{record.late_going_by || "—"}</td>
+                          <td style={{ minWidth: 180 }}>{record.has_attendance_issue ? <span className="text-warning fw-semibold" title={(record.attendance_issue_details || []).join(", ")}>⚠ {(record.attendance_issue_details || []).join(", ")}</span> : "—"}</td>
                           <td>
                             {record.request_status
                               ? <span className={`badge ${["Pending", "Under Review"].includes(record.request_status) ? "text-bg-warning" : record.request_status === "Approved" ? "text-bg-success" : "text-bg-secondary"}`}>{record.request_status}</span>
@@ -562,7 +584,7 @@ function UserAttendance({ session }) {
                         </tr>
                       ))}
                       {!days.length && (
-                        <tr><td colSpan="17" className="text-center text-muted py-4">No dates found for this employee and month.</td></tr>
+                        <tr><td colSpan="24" className="text-center text-muted py-4">No dates found for this employee and month.</td></tr>
                       )}
                     </tbody>
                   </table>

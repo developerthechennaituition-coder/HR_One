@@ -412,30 +412,125 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     attendance_collection = db["attendance"]
     leave_types_collection = db["leave_types"]
     leave_requests_collection = db["leave_requests"]
+    employee_user = users_collection.find_one({"employee_id": employee_id})
+    from app.attendance import company_today
+    if employee_user and end_date < company_today():
+        # Ensure payroll sees the same finalized weekly-off records as calendars
+        # and reports, even if no employee opened the month view first.
+        from app.attendance import _sync_leave_for_user_range
+        from app.attendance_requests import _ensure_monthly_auto_weekly_offs
+        _sync_leave_for_user_range(str(employee_user["_id"]), start, end)
+        _ensure_monthly_auto_weekly_offs(employee_user, year, month)
 
     records = list(attendance_collection.find({
         "employee_id": employee_id,
         "attendance_date": {"$gte": start, "$lte": end},
-    }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1, "medical_leave": 1}))
+    }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1, "medical_leave": 1,
+        "first_half_status": 1, "second_half_status": 1, "check_in_time": 1, "check_out_time": 1}))
 
     leave_codes = {
         str(row.get("leave_type_code") or "").upper()
         for row in records
         if str(row.get("status", "")).casefold() == "leave"
     }
+    leave_type_docs = list(leave_types_collection.find(
+        {"code": {"$in": list(leave_codes)}}, {"code": 1, "is_paid": 1, "name": 1}
+    ))
     leave_types = {
         str(item.get("code", "")).upper(): bool(item.get("is_paid", True))
-        for item in leave_types_collection.find({"code": {"$in": list(leave_codes)}})
+        for item in leave_type_docs
+    }
+    medical_leave_codes = {
+        str(item.get("code") or "").upper()
+        for item in leave_type_docs
+        if str(item.get("code") or "").upper() == "ML"
+        or "medical" in str(item.get("name") or "").casefold()
     }
 
     # Keep one payroll category per date to prevent duplicate attendance rows
-    # from inflating paid days. Present/Holiday records take precedence over leave.
+    # from inflating paid days. Half-day attendance is represented as two 0.5-day
+    # portions so a Present + Absent/Leave day is never counted as a full Present.
     day_status: dict[str, tuple[str, bool, float]] = {}
+    half_day_parts_by_date: dict[str, list[tuple[str, bool, float]]] = {}
+    half_status_values = {"present", "absent", "leave", "medical leave", "holiday", "weekly off", "not applicable", "not marked"}
     for row in records:
         day = str(row.get("attendance_date") or "")
         if not day:
             continue
         status_value = str(row.get("status") or "").strip().casefold()
+        first_half = str(row.get("first_half_status") or "").strip().casefold()
+        second_half = str(row.get("second_half_status") or "").strip().casefold()
+        if employee_user:
+            try:
+                from app.attendance import (
+                    _calculate_daily_attendance, _collect_permissions,
+                    company_today,
+                )
+                from app.attendance_calculations import (
+                    classify_half_day, effective_working_minutes,
+                    permission_minutes_outside_total_duration,
+                )
+                from app.working_details import applicable_schedule
+                selected_date = date.fromisoformat(day[:10])
+                user_id = str(employee_user.get("_id") or "")
+                daily = _calculate_daily_attendance(user_id, selected_date, employee_user)
+                schedule = applicable_schedule(user_id, selected_date)
+                check_in = daily.get("first_check_in") or row.get("check_in_time")
+                check_out = daily.get("last_check_out") or row.get("check_out_time")
+                raw_total_minutes = int(daily.get("elapsed_minutes") or 0)
+                permission_map = _collect_permissions(
+                    user_id, selected_date.isoformat(), (selected_date + timedelta(days=1)).isoformat(),
+                    {selected_date.isoformat(): row},
+                )
+                permission_entries = permission_map.get(selected_date.isoformat(), [])
+                permission_minutes = permission_minutes_outside_total_duration(
+                    [item["_interval"] for item in permission_entries], check_in, check_out
+                )
+                effective_minutes = effective_working_minutes(raw_total_minutes, permission_minutes)
+                today = company_today()
+                completed = bool(selected_date < today or (selected_date == today and check_out and daily.get("attendance_state") != "In Progress"))
+                half = classify_half_day(
+                    total_duration_minutes=effective_minutes,
+                    half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
+                    scheduled_start=schedule.get("scheduled_work_start_time"),
+                    scheduled_end=schedule.get("scheduled_work_end_time"),
+                    check_in=check_in, check_out=check_out, day_completed=completed,
+                    base_status=row.get("status") or "Not Marked",
+                    leave_day_part=row.get("leave_day_part"),
+                    leave_is_full_day=bool(status_value in {"leave", "medical leave"} and (row.get("leave_day_part") or "full_day") == "full_day"),
+                    working_intervals=daily.get("working_intervals") or [],
+                )
+                first_half = str(half.get("first_half_status") or "").casefold()
+                second_half = str(half.get("second_half_status") or "").casefold()
+            except Exception:
+                # Payroll retains the legacy full-day status if schedule/punch
+                # data cannot be resolved; a calculation failure must not block payroll.
+                first_half = second_half = ""
+        if first_half in half_status_values and second_half in half_status_values:
+            parts: list[tuple[str, bool, float]] = []
+            for half_status in (first_half, second_half):
+                if half_status == "present":
+                    parts.append(("present", True, 0.5))
+                elif half_status == "absent":
+                    parts.append(("absent", False, 0.5))
+                elif half_status == "holiday":
+                    parts.append(("holiday", True, 0.5))
+                elif half_status == "weekly off":
+                    parts.append(("weekly_off", True, 0.5))
+                elif half_status == "not applicable":
+                    parts.append(("not_applicable", False, 0.5))
+                elif half_status == "medical leave" or (half_status == "leave" and (row.get("medical_leave") or str(row.get("leave_type_code") or "").upper() in medical_leave_codes)):
+                    parts.append(("medical_leave", True, 0.5))
+                elif half_status == "leave":
+                    code = str(row.get("leave_type_code") or "").upper()
+                    is_paid = leave_types.get(code, code != "LOP")
+                    parts.append(("paid_leave" if is_paid else "unpaid_leave", is_paid, 0.5))
+            # Ignore a live, unfinished day whose half statuses are explicitly
+            # Not Finalized; it must not become a half-day payroll decision.
+            if parts and len(parts) == 2:
+                half_day_parts_by_date[day] = parts
+                day_status[day] = ("split", False, 1.0)
+                continue
         if status_value == "present":
             day_status[day] = ("present", True, 1.0)
         elif status_value == "holiday":
@@ -448,8 +543,8 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
         elif status_value == "weekly off":
             if day_status.get(day, ("absent",))[0] == "absent":
                 day_status[day] = ("weekly_off", True, 1.0)
-        elif status_value == "leave" and row.get("medical_leave"):
-            # Monthly Medical Leave granted through an attendance request is paid.
+        elif status_value == "leave" and (row.get("medical_leave") or str(row.get("leave_type_code") or "").upper() in medical_leave_codes):
+            # Medical Leave is paid and remains distinct from normal paid leave.
             day_status[day] = ("medical_leave", True, 1.0)
         elif status_value == "leave":
             code = str(row.get("leave_type_code") or "").upper()
@@ -506,14 +601,24 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     weekly_off_weekdays = company_weekly_off_weekdays()
     if weekly_off_weekdays:
         from app import leave as leave_module
-        employee_user = users_collection.find_one({"employee_id": employee_id})
         joining = leave_module._joining_date(employee_user) if employee_user else None
         current = max(start_date, joining) if joining else start_date
-        last = min(end_date, company_today())
-        while current <= last:
-            if current.weekday() in weekly_off_weekdays and current.isoformat() not in day_status:
-                day_status[current.isoformat()] = ("weekly_off", True, 1.0)
-            current += timedelta(days=1)
+        today = company_today()
+        last = min(end_date, today)
+        # A completed month has already been finalized into at most four
+        # persisted Weekly Off attendance records by attendance_requests.
+        # For an in-progress month, preview no more than four configured days.
+        if end_date >= today:
+            candidates = []
+            while current <= last:
+                if current.weekday() in weekly_off_weekdays and current.isoformat() not in day_status:
+                    candidates.append(current)
+                current += timedelta(days=1)
+            from app.attendance_calculations import select_weekly_off_dates
+            existing_weekly_count = sum(1 for value in day_status.values() if value[0] == "weekly_off")
+            selected_weekly_dates = select_weekly_off_dates(candidates, max(0, 4 - existing_weekly_count), weekly_off_weekdays)
+            for weekly_date in selected_weekly_dates:
+                day_status[weekly_date.isoformat()] = ("weekly_off", True, 1.0)
 
     # Approved leave requests are the source of truth for approved leave. Use
     # them to fill dates not already represented by a higher-priority attendance
@@ -568,15 +673,20 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
                     category = "paid_leave" if is_paid else "unpaid_leave"
                     day_status[day] = (category, is_paid, fraction)
 
-    present = sum(value[2] for value in day_status.values() if value[0] == "present")
-    paid_leave = sum(value[2] for value in day_status.values() if value[0] == "paid_leave")
-    unpaid_leave = sum(value[2] for value in day_status.values() if value[0] == "unpaid_leave")
-    absent = sum(value[2] for value in day_status.values() if value[0] == "absent")
-    holiday = sum(value[2] for value in day_status.values() if value[0] == "holiday")
-    weekly_off = sum(value[2] for value in day_status.values() if value[0] == "weekly_off")
-    medical_leave = sum(value[2] for value in day_status.values() if value[0] == "medical_leave")
+    def _portion_total(category: str) -> float:
+        return sum(value[2] for value in day_status.values() if value[0] == category) + sum(
+            part[2] for parts in half_day_parts_by_date.values() for part in parts if part[0] == category
+        )
+
+    present = _portion_total("present")
+    paid_leave = _portion_total("paid_leave")
+    unpaid_leave = _portion_total("unpaid_leave")
+    absent = _portion_total("absent")
+    holiday = _portion_total("holiday")
+    weekly_off = _portion_total("weekly_off")
+    medical_leave = _portion_total("medical_leave")
     payable_days = min(float(days_in_month), present + paid_leave + holiday + weekly_off + medical_leave)
-    not_applicable = sum(value[2] for value in day_status.values() if value[0] == "not_applicable")
+    not_applicable = _portion_total("not_applicable")
     lop = absent + unpaid_leave + not_applicable
 
     return {

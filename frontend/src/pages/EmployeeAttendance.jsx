@@ -20,9 +20,25 @@ const companyDateParts = (date = new Date()) => {
 };
 
 const formatTime = (time) => {
-  if (!time) return "Not Marked";
-  const [hourText, minute] = time.split(":");
-  const hour = Number(hourText);
+  if (!time) return "—";
+  const value = String(time).trim();
+  const clockMatch = value.match(/^(\\d{1,2}):(\\d{2})(?::\\d{2})?$/);
+  let hour;
+  let minute;
+  if (clockMatch) {
+    hour = Number(clockMatch[1]);
+    minute = clockMatch[2];
+  } else {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    // Attendance API timestamps are rendered in the company's IST timezone.
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(parsed);
+    hour = Number(parts.find((part) => part.type === "hour")?.value);
+    minute = parts.find((part) => part.type === "minute")?.value || "00";
+  }
+  if (!Number.isFinite(hour) || hour < 0 || hour > 23) return value;
   return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 };
 
@@ -329,6 +345,8 @@ function EmployeeAttendance({ session, onNavigate }) {
                   <th>Status</th>
                   <th>Check-In</th>
                   <th>Check-Out</th>
+                  <th>Early Going By</th>
+                  <th>Late Going By</th>
                   <th>Source</th>
                   <th>Remark</th>
                 </tr>
@@ -336,17 +354,19 @@ function EmployeeAttendance({ session, onNavigate }) {
               <tbody>
                 {[...records].reverse().map((record) => (
                   <tr key={record.id}>
-                    <td>{record.attendance_date}</td>
+                    <td>{record.attendance_date}{calendar?.days?.find((day) => day.attendance_date === record.attendance_date)?.has_attendance_issue && <span className="ms-2 text-warning fw-bold" title={(calendar.days.find((day) => day.attendance_date === record.attendance_date)?.attendance_issue_details || []).join(", ")}>⚠</span>}</td>
                     <td>{getAttendanceType(record)}</td>
-                    <td>{record.status}</td>
+                    <td>{calendar?.days?.find((day) => day.attendance_date === record.attendance_date)?.status || record.status}{calendar?.days?.find((day) => day.attendance_date === record.attendance_date)?.has_attendance_issue && <span className="ms-2 text-warning fw-bold" title={(calendar.days.find((day) => day.attendance_date === record.attendance_date)?.attendance_issue_details || []).join(", ")}>⚠</span>}</td>
                     <td>{formatTime(record.check_in_time)}</td>
                     <td>{formatTime(record.check_out_time)}</td>
+                    <td>{calendar?.days?.find((day) => day.attendance_date === record.attendance_date)?.early_going_by || "—"}</td>
+                    <td>{calendar?.days?.find((day) => day.attendance_date === record.attendance_date)?.late_going_by || "—"}</td>
                     <td>{getSource(record)}</td>
                     <td>{record.attendance_date === todayDate ? (todayRemark || "—") : "—"}</td>
                   </tr>
                 ))}
                 {records.length === 0 && (
-                  <tr><td colSpan="7" className="text-center text-muted py-4">No attendance records for this month.</td></tr>
+                  <tr><td colSpan="9" className="text-center text-muted py-4">No attendance records for this month.</td></tr>
                 )}
               </tbody>
             </table>
