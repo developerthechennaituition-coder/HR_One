@@ -1,531 +1,601 @@
-# HRMS — Human Resource Management System
+# HRMS – Human Resource Management System
 
-A full-stack Human Resource Management System built with a React 19 + Vite frontend, a Python FastAPI backend, and MongoDB. The application brings employee administration, organization setup, attendance, leave and permission workflows, notifications, payroll, and payslip access into one role-aware system.
+HRMS is a web-based Human Resource Management System with a **React** single-page frontend and a **Python FastAPI** backend backed by **MongoDB**. It covers account and organization administration, employee records, attendance (manual, ESSL biometric device/file import, and face-verified work-from-home), leave and permission workflows, notifications, holiday calendars, and payroll with PDF payslips.
 
-This README describes the supplied project source. Integrations such as ESSL devices, SMTP delivery, and WFH biometric verification require corresponding external configuration and must be validated in the target environment before production use.
+This document describes the system as implemented in the repository. For frontend-only details (pages, components, build configuration) see [`frontend/README.md`](frontend/README.md).
 
 ## Contents
 
-- [Features](#features)
-- [Technology and architecture](#technology-and-architecture)
-- [Repository layout](#repository-layout)
+- [Features and modules](#features-and-modules)
+- [Architecture](#architecture)
+- [Technology stack](#technology-stack)
+- [Repository structure](#repository-structure)
 - [Prerequisites](#prerequisites)
+- [Installation and execution](#installation-and-execution)
 - [Configuration](#configuration)
-- [Run locally on Windows](#run-locally-on-windows)
-- [Run locally on macOS or Linux](#run-locally-on-macos-or-linux)
-- [API documentation and health checks](#api-documentation-and-health-checks)
 - [Roles and access](#roles-and-access)
-- [Functional modules](#functional-modules)
-- [Attendance, half-day rules, and ESSL integration](#attendance-half-day-rules-and-essl-integration)
-- [Leave, holidays, and permissions](#leave-holidays-and-permissions)
-- [Payroll and payslips](#payroll-and-payslips)
-- [Tests and quality checks](#tests-and-quality-checks)
-- [Git and environment-file guidance](#git-and-environment-file-guidance)
+- [Authentication and sessions](#authentication-and-sessions)
+- [Database](#database)
+- [API reference](#api-reference)
+- [Business rules](#business-rules)
+- [Scripts and tests](#scripts-and-tests)
+- [Deployment notes](#deployment-notes)
+- [Known limitations and security notes](#known-limitations-and-security-notes)
 - [Troubleshooting](#troubleshooting)
-- [Production-readiness checklist](#production-readiness-checklist)
 
-## Features
+## Features and modules
 
-### Authentication and user administration
+| Module | What it provides | Main backend file(s) |
+|---|---|---|
+| Authentication and accounts | Login with work email or employee ID, email activation links, change password, OTP-based forgot/reset password, login lockout, user management | `core_routes.py`, `activation.py`, `password_reset.py`, `security.py` |
+| Organization setup | Companies / legal entities / branches, business units, departments, teams, designations, organization hierarchy | `core_routes.py` |
+| Holiday calendars | Calendars and holidays with Draft/Published status, audit history, publish action, religion-based calendars, per-employee calendar assignment, "my holidays", automatic reminder scheduler | `core_routes.py`, `religion_holidays.py` |
+| Employee Master | Employee records and extended employee details, including scheduled working hours and working-schedule history | `core_routes.py`, `employee_details.py`, `working_details.py` |
+| Reporting hierarchy | Reporting Manager / HOD / HR Admin approver assignment per employee, team-member list and team attendance | `reporting_manager.py` |
+| Attendance | Daily attendance management, monthly and per-day views, remarks, half-day calculation, payroll locks, historical modification, weekly-off generation, Excel export | `attendance.py`, `attendance_calculations.py`, `attendance_export.py`, `weekly_off_planner.py` |
+| Attendance requests | Employees request corrections for past dates; HR Admin approves or rejects each date | `attendance_requests.py` |
+| ESSL biometric integration | Configurable external API sync, `.csv`/`.xls`/`.xlsx` file preview and import, employee ID mapping, sync history, punch issues | `essl.py` |
+| Work From Home (WFH) | Face verification with liveness challenge, browser location check against approved locations, check-in/out, breaks, email/QR fallback | `attendance.py`, `wfh_biometrics.py` |
+| Leave and permissions | Leave types, policies, balances, multi-stage approval, cancellation workflow, short-duration permissions, dashboard, reports (JSON/CSV), leave notifications | `leave.py` |
+| Notifications | Targeted notifications (all, roles, teams, departments, users) with validity period, hold/resume, view/acknowledge tracking, starring | `notifications.py` |
+| Payroll | Salary profiles with components, attendance-based monthly calculation, approval workflow, payslip generation and PDF download | `payroll.py`, `payslip_pdf.py` |
 
-- Login, logout, session-aware frontend behavior, and password change.
-- Account activation and password recovery/OTP routes.
-- User administration, account status, roles, and permissions.
-- Role-aware navigation and backend authorization checks.
+## Architecture
 
-### Organization and employee administration
+```text
+┌──────────────────────────┐   HTTP/JSON (Bearer token)   ┌───────────────────────────┐
+│  React SPA (Vite)        │ ───────────────────────────► │  FastAPI backend          │
+│  frontend/               │   /api/...                   │  backend/app/             │
+│  - hash-based navigation │ ◄─────────────────────────── │  - routers per module     │
+│  - Bootstrap 5 UI        │                              │  - in-memory sessions     │
+└────────────┬─────────────┘                              │  - background scheduler   │
+             │ (dev only) Vite proxies /api               └──────┬──────────┬─────────┘
+             └─────────────────────────────────────────────────► │          │
+                                                                  ▼          ▼
+                                                        ┌──────────────┐  ┌───────────────────────┐
+                                                        │   MongoDB    │  │ External services     │
+                                                        │ (PyMongo)    │  │ SMTP (email)          │
+                                                        └──────────────┘  │ ESSL device API (opt.)│
+                                                                          └───────────────────────┘
+```
 
-- Company and organization setup.
-- Business units, departments, teams, and designations.
-- Employee master records and extended employee details.
-- Reporting-manager/HOD assignment and team-member views.
-- Religion-based holiday calendar workflows.
-- Employee working details, including working type and scheduled working times.
+- The frontend is a client-rendered SPA. In development, Vite proxies `/api` to the backend, so the browser only talks to the Vite origin. In production the frontend is built to static files and calls the backend URL set at build time (`VITE_API_BASE_URL`).
+- The backend is one FastAPI application (`app.main:app`) that registers a router per module. On startup it creates collections, validators and indexes idempotently and starts a background thread for holiday-calendar reminders.
+- Business rules for attendance durations and half-day classification live in `attendance_calculations.py`, which has no FastAPI or MongoDB imports and is unit-tested in isolation. Weekly-off planning rules are likewise isolated in `weekly_off_planner.py`.
+- Face matching and liveness for WFH run locally (no cloud calls) in `wfh_biometrics.py`.
+- Excel rendering for attendance exports is separated into `attendance_export.py`; payslip PDF generation is in `payslip_pdf.py` (ReportLab).
 
-### Attendance
+## Technology stack
 
-- Daily and monthly attendance views, employee attendance details, and Excel export.
-- Employee attendance calendar and attendance-day breakdowns.
-- Attendance requests for corrections, with review/approval workflow.
-- Work-from-home check-in/check-out and related controls.
-- Attendance history and administrative attendance tools.
-- Employee-specific scheduled working times and working-duration calculations.
-- Half-Day Present classification using the configured Half-Day Working Duration.
-- First Half Present and Second Half Present classification where supported by the attendance interval data and applicable rules.
-- Permission-aware effective working-duration calculations designed to avoid counting permission time twice.
-- Attendance issue indicators for incomplete or inconsistent punch records.
-- Working intervals, break durations/details, permission information, and early/late checkout calculations in attendance reporting and Excel exports.
-- `Not Marked` is distinct from `Absent`: an eligible date with no check-in and no check-out may remain Not Marked according to the attendance-generation rules. Absent is applied only when the applicable attendance-generation/business rules determine that status.
-- Joining-date, employee schedule, weekly-off, holiday, attendance-correction, and payroll-lock rules are enforced in relevant workflows.
+### Frontend
 
-### ESSL attendance integration
+React 19, Vite 8, JavaScript (JSX), Bootstrap 5 and Bootstrap Icons, `libphonenumber-js`, `qrcode.react`, `pdfjs-dist`, Oxlint. Details: [`frontend/README.md`](frontend/README.md).
 
-- ESSL configuration and administration screens.
-- Backend endpoints and import/synchronization workflows for attendance data.
-- Device connectivity, credentials, network reachability, device model compatibility, and vendor API/SDK access must be configured and tested separately. The presence of integration code does not mean a physical device is already connected.
+### Backend
 
-### Leave, holidays, and permissions
-
-- Leave types, policies, balances, requests, approvals, rejections, and cancellations.
-- Holiday calendar management and employee holiday views.
-- Permission request and approval workflows.
-- Leave and attendance integration implemented in backend business logic.
-
-### Notifications
-
-- In-app notification APIs and frontend notification components.
-- Notification list/panel and notification sound asset.
-- Email notifications depend on SMTP configuration and the specific workflow.
-
-### Payroll and payslips
-
-- Employee salary setup and payroll workspace.
-- Payroll calculation/review APIs and records.
-- Payslip PDF generation and employee payslip viewing.
-- Payroll results depend on attendance, leave, holiday, and salary data being correctly configured.
-
-## Technology and architecture
-
-| Layer | Technology |
+| Area | Technology |
 |---|---|
-| Frontend | React 19, React DOM, Vite 8, JavaScript |
-| UI | Bootstrap 5, Bootstrap Icons, project CSS |
-| Frontend utilities | libphonenumber-js, qrcode.react, pdfjs-dist |
-| Linting | Oxlint |
-| Backend | Python, FastAPI, Pydantic, Uvicorn |
-| Database | MongoDB via PyMongo |
-| Reports/documents | openpyxl, xlrd, ReportLab |
-| Optional WFH biometric packages | face-recognition, MediaPipe (see `backend/requirements-wfh.txt`) |
+| Language | Python 3.10+ (the code uses `X \| None` type syntax at runtime) |
+| Web framework | FastAPI `0.141.1`, Starlette `1.6.0`, Pydantic `2.13.5`, Uvicorn `0.53.0` |
+| Database driver | PyMongo `4.18.0` (MongoDB) |
+| Configuration | `python-dotenv` |
+| Cryptography | `cryptography` `45.0.7` (Fernet encryption for ESSL credentials and WFH face templates) |
+| Passwords | PBKDF2-HMAC-SHA256 (120,000 iterations, per-password salt) via the standard library |
+| Email | Standard-library `smtplib` |
+| Excel | `openpyxl` (export), `openpyxl` + `xlrd` (ESSL file import of `.xlsx` / legacy `.xls`) |
+| PDF | `reportlab` (payslips), bundled Noto Sans fonts |
+| File uploads | `python-multipart` |
+| WFH biometrics (optional install) | `face-recognition` `1.3.0`, `mediapipe` `0.10.21` |
+
+Pinned versions come from `backend/requirements.txt` and `backend/requirements-wfh.txt`.
+
+## Repository structure
+
+The project root contains the `frontend/` and `backend/` directories.
 
 ```text
-Web browser
-   |
-   | HTTP(S), /api requests
-   v
-React + Vite frontend (default development port 5173)
-   |
-   v
-FastAPI backend (default port 8000)
-   |
-   v
-MongoDB
-   |
-   +-- Optional SMTP server for configured email workflows
-   +-- Optional ESSL device/software/network integration
+<project-root>/
+├── README.md                      # this file
+├── certs/                         # optional: localhost-key.pem + localhost.pem for HTTPS dev (not part of the packaged sources)
+├── frontend/                      # React SPA (see frontend/README.md)
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── index.html
+│   ├── public/
+│   └── src/
+│       ├── App.jsx, main.jsx, auth.js, logout.js
+│       ├── config/api.js
+│       ├── components/            # layout, sidebar, header, attendance, notifications, payslip viewer, ESSL admin
+│       ├── pages/                 # route-level screens
+│       └── services/              # shared API/helper modules
+└── backend/
+    ├── requirements.txt           # core dependencies
+    ├── requirements-wfh.txt       # WFH face-verification dependencies (+ file-import libraries)
+    ├── .env.example               # environment template
+    ├── app/
+    │   ├── main.py                # FastAPI app, CORS, organization-route middleware, router registration
+    │   ├── core_routes.py         # auth, users, organization, holidays, employees, startup tasks, /health
+    │   ├── db/mongodb.py          # Mongo client, schema validators, indexes, leave collection setup
+    │   ├── session.py             # in-memory session store (token -> user id)
+    │   ├── security.py            # password hashing
+    │   ├── activation.py          # activation tokens and activation email
+    │   ├── password_reset.py      # OTP password reset
+    │   ├── employee_details.py    # extended employee details
+    │   ├── working_details.py     # scheduled working hours + history
+    │   ├── reporting_manager.py   # approver assignment and team views
+    │   ├── attendance.py          # attendance, historical edits, weekly off, WFH, export endpoints
+    │   ├── attendance_calculations.py  # pure duration / half-day rules
+    │   ├── attendance_export.py   # Excel workbook rendering
+    │   ├── attendance_requests.py # attendance correction requests
+    │   ├── weekly_off_planner.py  # pure weekly-off planning rules
+    │   ├── essl.py                # ESSL API sync and file import
+    │   ├── wfh_biometrics.py      # local face matching + liveness
+    │   ├── leave.py               # leave, permissions, approvals, reports
+    │   ├── religion_holidays.py   # religion-based holiday calendar lookups
+    │   ├── notifications.py       # notifications
+    │   ├── payroll.py             # salary profiles, payroll, payslips
+    │   └── payslip_pdf.py         # payslip PDF generation
+    ├── assets/
+    │   ├── fonts/                 # NotoSans-Regular.ttf, NotoSans-Bold.ttf
+    │   └── images/                # company logo used on payslips
+    ├── scripts/
+    │   ├── recalculate_half_day_attendance.py
+    │   └── check_wfh_mongodb.py
+    └── tests/                     # 23 test modules
 ```
-
-## Repository layout
-
-```text
-HRMS-Project/
-├── README.md
-├── backend/
-│   ├── .env.example
-│   ├── requirements.txt
-│   ├── requirements-wfh.txt
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── core_routes.py
-│   │   ├── db/mongodb.py
-│   │   ├── attendance.py
-│   │   ├── attendance_calculations.py
-│   │   ├── attendance_export.py
-│   │   ├── attendance_requests.py
-│   │   ├── employee_details.py
-│   │   ├── working_details.py
-│   │   ├── essl.py
-│   │   ├── leave.py
-│   │   ├── notifications.py
-│   │   ├── payroll.py
-│   │   ├── payslip_pdf.py
-│   │   ├── religion_holidays.py
-│   │   ├── reporting_manager.py
-│   │   ├── activation.py
-│   │   ├── password_reset.py
-│   │   ├── security.py
-│   │   ├── session.py
-│   │   └── wfh_biometrics.py
-│   ├── scripts/
-│   ├── tests/
-│   └── assets/
-└── frontend/
-    ├── README.md
-    ├── package.json
-    ├── package-lock.json
-    ├── vite.config.js
-    ├── public/
-    └── src/
-        ├── App.jsx
-        ├── main.jsx
-        ├── components/
-        ├── pages/
-        ├── services/
-        └── config/
-```
-
-The tree highlights principal modules. Refer to the checked-out source for the complete and current file list.
 
 ## Prerequisites
 
-Install the following:
+- **Python 3.10 or newer** and `pip`.
+- **Node.js and npm** compatible with Vite 8.
+- **MongoDB** reachable from the backend (local or hosted), with a connection URL.
+- **SMTP account** (needed for account activation emails, password-reset OTP emails and WFH email fallback).
+- **For WFH face verification only:** the packages in `requirements-wfh.txt`. `face-recognition` depends on `dlib`, which commonly requires a C++ build toolchain and CMake on platforms without a prebuilt wheel; check wheel availability of `mediapipe` for your Python version.
 
-1. Python 3.12 is the version used by the supplied project environment; check compatibility with `backend/requirements.txt` before selecting another Python version.
-2. Node.js compatible with the Vite version pinned by `frontend/package-lock.json`.
-3. A reachable MongoDB instance (local or hosted).
-4. Git.
-5. Optional SMTP account for configured email delivery.
-6. Optional ESSL device/software/network access for device integration.
-7. Optional native build/runtime prerequisites for WFH biometric dependencies.
+## Installation and execution
 
-Verify versions:
+### 1. Backend
 
-```powershell
-python --version
-node --version
-npm --version
-git --version
+```bash
+cd backend
+python -m venv .venv
+# Linux / macOS
+source .venv/bin/activate
+# Windows PowerShell
+# .venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+# Optional, only if you will use WFH face verification:
+pip install -r requirements-wfh.txt
+```
+
+Create the environment file and fill in the values (see [Configuration](#configuration)):
+
+```bash
+cp .env.example .env        # Windows: copy .env.example .env
+```
+
+Run from the `backend/` directory (the `.env` file is loaded from the current working directory):
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+- Health check: `GET http://127.0.0.1:8000/health`
+- Interactive API docs (FastAPI defaults): `http://127.0.0.1:8000/docs`
+
+The core application starts without the WFH packages; only the WFH face endpoints require them and report a configuration error if they are missing.
+
+On startup the backend creates/updates collections, validators and indexes, seeds the `HR Admin` role, seeds the default leave types (Casual Leave `CL`, Medical Leave `ML`, Earned Leave `EL`, Loss of Pay `LOP`), and starts the holiday-reminder scheduler. The MongoDB connection is created at import time, so `MONGODB_URL` and `MONGODB_DATABASE` must be set before starting.
+
+### 2. First administrator account
+
+In development (`HRMS_ENV=development`, which is also the default when the variable is unset), the backend can create or update a sample login at startup when both `DEMO_USER_EMAIL` and `DEMO_USER_PASSWORD` are set in `.env`. `DEMO_USER_NAME`, `DEMO_USER_MOBILE` and `DEMO_USER_ROLE` (default `HR Admin`) are optional. Use this account to sign in and create other users from **User Management**. The sample-login seeding is skipped when `HRMS_ENV` is anything other than `development`.
+
+### 3. Frontend
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Open `http://localhost:5173`. In development the Vite server proxies `/api` to `http://127.0.0.1:8000`; set `VITE_BACKEND_PROXY_TARGET` if the backend is elsewhere. Full frontend configuration: [`frontend/README.md`](frontend/README.md#configuration).
+
+### 4. Production build of the frontend
+
+```bash
+cd frontend
+npm ci
+npm run build       # static output in frontend/dist/
 ```
 
 ## Configuration
 
-### Backend environment
+### Backend environment variables
 
-1. Copy `backend/.env.example` to `backend/.env`.
-2. Set the MongoDB connection string and database.
-3. Configure only the integrations used by your environment.
-4. Keep secrets out of Git.
+Defined in `backend/.env` (template: `backend/.env.example`). Variables marked *code default* are read by the code but are not listed in `.env.example`.
 
-Important variables documented in the supplied `.env.example`:
+| Variable | Purpose | Default / notes |
+|---|---|---|
+| `MONGODB_URL` | MongoDB connection string | Required |
+| `MONGODB_DATABASE` | Database name | Required (`hrms_db` in the template) |
+| `ORG_TIMEZONE` | Timezone for holiday validation and reminder schedule | `Asia/Kolkata` |
+| `COMPANY_TIMEZONE` | Timezone for attendance and ESSL date logic (*code default*) | `Asia/Kolkata` |
+| `COMPANY_START_TIME` | Company start time used by attendance logic (*code default*) | `09:00` |
+| `HRMS_ENV` | `development` enables the sample-login seeding | `development` when unset |
+| `DEMO_USER_NAME`, `DEMO_USER_EMAIL`, `DEMO_USER_MOBILE`, `DEMO_USER_ROLE`, `DEMO_USER_PASSWORD` | Development sample login | Commented out in the template; email and password are required for seeding |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` | Outgoing email | Template port `587`; `SMTP_FROM` falls back to `SMTP_USERNAME` |
+| `FRONTEND_URL` | Base URL used in emailed links (activation, WFH fallback) | `http://localhost:5173` |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated allowed frontend origins | `http://localhost:5173,http://127.0.0.1:5173` |
+| `CORS_ALLOWED_ORIGIN_REGEX` | Additional allowed-origin regex (*code default*) | Matches `localhost`, `127.0.0.1` and private IPv4 ranges (10.x, 192.168.x, 172.16–31.x) on port 5173 |
+| `WFH_ATTENDANCE_ENABLED` | Enable/disable WFH check-in and check-out | `true` |
+| `WFH_TEMPLATE_ENCRYPTION_KEY` | Fernet key that encrypts stored face templates | Required for WFH face registration/verification |
+| `WFH_FACE_MATCH_TOLERANCE` | Face-match threshold | `0.48`; may be lowered but not raised above `0.48` |
+| `WFH_MAX_LOCATION_ACCURACY_METERS` | Maximum acceptable GPS accuracy | `100`; lower values allowed, higher values are capped |
+| `WFH_MAX_LOCATION_AGE_SECONDS` | Maximum age of a browser location fix | `120` |
+| `ESSL_CONFIG_ENCRYPTION_KEY` | Fernet key that encrypts the ESSL API credentials and request parameters stored in MongoDB | Required to save/use ESSL API configuration |
 
-| Variable | Purpose |
-|---|---|
-| `MONGODB_URL` | MongoDB connection URI |
-| `MONGODB_DATABASE` | Database name; example defaults to `hrms_db` |
-| `ORG_TIMEZONE` | Organization timezone; example uses `Asia/Kolkata` |
-| `FRONTEND_URL` | Frontend base URL used by configured account/email flows |
-| `SMTP_HOST`, `SMTP_PORT` | SMTP server settings |
-| `SMTP_USERNAME`, `SMTP_PASSWORD` | SMTP credentials |
-| `SMTP_FROM` | Sender address |
-| `CORS_ALLOWED_ORIGINS` | Comma-separated allowed frontend origins |
-| `WFH_ATTENDANCE_ENABLED` | Enables/disables WFH attendance endpoints where checked |
-| `WFH_TEMPLATE_ENCRYPTION_KEY` | Encryption key for biometric templates, if enabled |
-| `ESSL_CONFIG_ENCRYPTION_KEY` | Encryption key for stored ESSL configuration, if enabled |
+Generate a Fernet key for either encryption variable:
 
-Generate a Fernet key where required:
-
-```powershell
+```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Use a stable, private key for existing encrypted records. Do not replace an encryption key casually after storing encrypted data.
+Keep both keys private and stable; changing them makes existing encrypted data unreadable.
 
-### Frontend environment
+**SMTP port caution.** The modules that send mail do not all connect the same way: account activation uses `SMTP` + STARTTLS (e.g. port 587); password-reset OTP email uses `SMTP_SSL` (implicit TLS, e.g. port 465, which is also that module's code default); WFH email fallback uses `SMTP_SSL` only when the port is `465` and STARTTLS otherwise. Because `SMTP_PORT` is shared, verify that every email flow you rely on works with the port and provider you configure.
 
-The frontend reads `VITE_API_BASE_URL` from its environment. The source default is `http://127.0.0.1:8000`.
+### Frontend environment variables
 
-Create `frontend/.env.local`:
-
-```dotenv
-VITE_API_BASE_URL=http://127.0.0.1:8000
-```
-
-For LAN/mobile testing, use the backend host reachable by the device, and configure backend CORS accordingly. Restart Vite after changing environment variables.
-
-## Run locally on Windows
-
-Open two PowerShell terminals.
-
-### 1. Backend
-
-```powershell
-cd F:\HRMS-Project\backend
-
-py -3.12 -m venv venv312
-.\venv312\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-# Create backend\.env from backend\.env.example and configure it first.
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-If PowerShell blocks virtual-environment activation, use the permitted execution policy for your workstation or invoke the environment's Python directly:
-
-```powershell
-.\venv312\Scripts\python.exe -m pip install -r requirements.txt
-.\venv312\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### 2. Frontend
-
-```powershell
-cd F:\HRMS-Project\frontend
-npm ci
-npm run dev
-```
-
-Open the URL printed by Vite, normally `http://localhost:5173`.
-
-For an existing checkout where dependencies have changed and no lockfile-compatible install is possible, `npm install` can be used. Prefer `npm ci` for repeatable clean installs.
-
-## Run locally on macOS or Linux
-
-### Backend
-
-```bash
-cd HRMS-Project/backend
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-# Create .env from .env.example and configure MongoDB.
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### Frontend
-
-```bash
-cd HRMS-Project/frontend
-npm ci
-npm run dev
-```
-
-## API documentation and health checks
-
-With the backend running:
-
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- OpenAPI schema: `http://127.0.0.1:8000/openapi.json`
-
-Use Swagger UI to inspect the actual registered routes, request schemas, and response models for the checked-out version. Do not assume that an endpoint exists based only on a screen label.
+`VITE_API_BASE_URL` and `VITE_BACKEND_PROXY_TARGET` — see [`frontend/README.md`](frontend/README.md#environment-variables).
 
 ## Roles and access
 
-The application contains role-aware frontend navigation and backend authorization. The supplied project identifies roles including HR Admin, Administrator, HR Manager/HOD, and Employee. The frontend role-label helper may display the stored `HR Manager` role as `HOD`.
+The role stored on a user account drives both UI visibility and backend checks. Role names referenced in the code:
 
-Typical responsibility boundaries (subject to the permissions configured in the running database and backend route checks):
-
-| Role | Typical responsibility |
+| Stored role | Display / notes |
 |---|---|
-| HR Admin | Organization/employee administration, attendance and leave administration, payroll administration, user/role management |
-| Administrator | Administrative access permitted by backend authorization |
-| HOD / HR Manager | Department/team oversight and approval responsibilities assigned by the application |
-| Employee | Self-service attendance, leave/permission requests, notifications, and payslips |
+| `HR Admin` | Full administration: organization, users, employees, attendance, payroll, leave setup. Seeded automatically as a role. |
+| `Administrator` | Organization setup and attendance administration (including ESSL and WFH settings); no payroll or user/employee-master administration in the UI |
+| `HR Manager` | Displayed as **HOD** (Head of Department); leave approver stage |
+| `Manager` | Referenced in organization read permissions |
+| `Employee` | Self-service |
+| `Super Admin` | Referenced only for reading profile organization details |
 
-The backend is the authorization source of truth. Hiding a button in the frontend is not a security control. When adding a permission, verify the role identifier and backend permission check as well as the frontend display condition.
+Examples of backend enforcement:
 
-## Functional modules
+- Organization routes (`/api/companies`, `/api/business-units`, `/api/departments`, `/api/teams`, `/api/designations`, `/api/holiday-calendars`, `/api/holidays`, `/api/employee-holiday-calendars`, `/api/organization`) are guarded by middleware in `main.py`: reads for HR Admin, Administrator, Manager and Employee; writes only for HR Admin and Administrator; the HOD role is blocked except for `GET /api/organization/me`.
+- Payroll administration endpoints require `HR Admin`.
+- ESSL management requires `HR Admin` or `Administrator`.
+- Approval of leave requests follows the assigned approver chain (see [Leave](#leave-and-permissions)).
 
-| Module | Main frontend entry points | Backend modules |
+Team views (`Team Members`) are available to any user who is assigned as a reporting manager.
+
+## Authentication and sessions
+
+- `POST /api/auth/login` accepts a work email or employee ID plus password and returns an opaque random token (`secrets.token_urlsafe(32)`) and the user object. The frontend sends it as `Authorization: Bearer <token>`.
+- **Sessions are stored in memory** (`app/session.py`, a dict of token → user id). They are lost when the backend restarts and are not shared between multiple server processes. There is no session-expiry mechanism in the code; a token stays valid until logout or restart.
+- **Lockout:** after 5 consecutive failed logins an account is locked for 15 minutes. The login response is the same generic "Invalid email or password" for unknown, inactive, locked and wrong-password cases.
+- **Activation:** `POST /api/users` without a password creates an inactive account with a hashed activation token; the emailed link expires after 24 hours and opens `/activate` in the frontend.
+- **Password reset:** `POST /api/auth/forgot-password` emails a 6-digit OTP (valid 5 minutes, maximum 5 attempts); `verify-reset-otp` and `reset-password` complete the flow. OTPs and reset tokens are stored hashed.
+- **Passwords** are hashed with PBKDF2-HMAC-SHA256 (120,000 iterations).
+
+## Database
+
+MongoDB, accessed with PyMongo. The `ensure_*` functions create collections with JSON-schema validators and indexes at startup and do not replace existing data.
+
+| Group | Collections |
+|---|---|
+| Accounts and access | `users`, `roles`, `permissions`, `audit_logs`, `password_resets` |
+| Organization | `companies`, `business_units`, `departments`, `teams`, `designations`, `organization_audit_history` |
+| Holidays | `holiday_calendars`, `holidays`, `employee_holiday_calendars`, `holiday_calendar_reminders` |
+| Employees | `employees`, `employee_details` (also holds the scheduled working hours; schedule changes are archived in working-schedule history) |
+| Attendance | `attendance`, `attendance_modification_history`, `attendance_requests`, `attendance_request_date_claims`, `attendance_remarks` |
+| ESSL | `essl_config`, `essl_raw_punches`, `essl_sync_history`, `essl_punch_issues` |
+| WFH | `wfh_face_templates`, `wfh_liveness_challenges`, `wfh_email_verification_tokens`, `wfh_email_verification_sessions` |
+| Leave | `leave_types`, `leave_policies`, `leave_balances`, `leave_requests`, `permission_requests`, `leave_notifications` |
+| Notifications | `notifications`, `notification_recipients`, `notification_sequences` |
+| Payroll | `employee_salary_profiles`, `monthly_payroll_records`, `payslip_records`, `payroll_review_audit` |
+
+Notable unique indexes include `users.work_email`, `users.employee_id` (sparse), `users.mobile`, `roles.name`, the ESSL employee mapping on users, and unique keys on ESSL punches and issues.
+
+## API reference
+
+All routes are under `/api` unless stated. Unless noted, calls require `Authorization: Bearer <token>`. Complete, interactive request/response schemas are available at `/docs` while the backend is running. The tables below list the routes defined in the code.
+
+### Health and authentication
+
+| Method | Path | Description |
 |---|---|---|
-| Authentication | `Login.jsx`, `ActivateAccount.jsx`, `ForgotPassword.jsx`, `VerifyResetOTP.jsx`, `ResetPassword.jsx`, `ChangePassword.jsx` | `main.py`, `activation.py`, `password_reset.py`, `security.py`, `session.py` |
-| Organization setup | `CompanySetup.jsx`, `OrganizationSetup.jsx`, `HolidayCalendarSetup.jsx` | `core_routes.py`, `religion_holidays.py`, `db/mongodb.py` |
-| Employee management | `EmployeeMaster.jsx`, `EmployeeDetails.jsx`, `UserManagement.jsx` | `employee_details.py`, `working_details.py`, `core_routes.py`, `reporting_manager.py` |
-| Attendance | `Attendance.jsx`, `EmployeeAttendance.jsx`, `UserAttendance.jsx`, `WfhAttendance.jsx` | `attendance.py`, `attendance_calculations.py`, `attendance_export.py`, `attendance_requests.py` |
-| ESSL | `EsslSetup.jsx`, `EsslAdminSettings.jsx` | `essl.py` |
-| Leave and permissions | `Leave.jsx` | `leave.py`, `attendance_requests.py` |
-| Notifications | `NotificationManagement.jsx`, `NotificationBell.jsx`, `NotificationPanel.jsx` | `notifications.py` |
-| Payroll | `PayrollWorkspace.jsx`, `EmployeeSalarySetup.jsx`, `EmployeePayslips.jsx` | `payroll.py`, `payslip_pdf.py` |
-| Team views | `TeamMembers.jsx`, `TeamMemberDetails.jsx` | `reporting_manager.py` |
+| GET | `/health` | Health check |
+| POST | `/api/auth/login` | Login |
+| GET | `/api/auth/me` | Current user |
+| POST | `/api/auth/logout` | Logout |
+| POST | `/api/auth/change-password` | Change own password |
+| GET, POST | `/api/auth/activate` | Read activation details / activate account |
+| POST | `/api/auth/forgot-password` | Send reset OTP |
+| POST | `/api/auth/verify-reset-otp` | Verify reset OTP |
+| POST | `/api/auth/reset-password` | Set new password |
 
-## Attendance, half-day rules, and ESSL integration
+### Users and employees
 
-Attendance logic is shared across attendance APIs, attendance calculations, attendance requests, payroll, and Excel export. The principal backend files are:
+| Method | Path | Description |
+|---|---|---|
+| POST, GET | `/api/users` | Create (activation flow) / list users |
+| GET, PUT, PATCH, DELETE | `/api/users/{user_id}` | Read / update / partial update / deactivate user |
+| PATCH | `/api/users/{user_id}/status` | Set active status |
+| POST | `/api/users/{user_id}/activate` | Activate a user |
+| POST, GET | `/api/employees` | Create / list employees |
+| GET, PUT, DELETE | `/api/employees/{employee_id}` | Read / update / deactivate employee (record retained) |
+| GET | `/api/employees/{employee_id}/holiday-calendar` | Calendar applicable to an employee |
+| GET | `/api/employee-details` | List extended employee details |
+| GET, PUT | `/api/employee-details/{user_id}` | Read / update one employee's details |
 
-- `backend/app/attendance.py` — attendance endpoints and attendance view data.
-- `backend/app/attendance_calculations.py` — shared attendance duration/status calculation helpers.
-- `backend/app/attendance_requests.py` — attendance correction/request workflows.
-- `backend/app/attendance_export.py` — attendance Excel generation.
-- `backend/app/working_details.py` and `backend/app/employee_details.py` — employee working schedule details.
-- `backend/app/payroll.py` — payroll calculations that consume attendance results.
+### Organization
 
-### Working details and Half-Day calculation
+| Method | Path | Description |
+|---|---|---|
+| POST, GET | `/api/companies`; GET `/api/companies/availability` | Companies / legal entities / branches |
+| GET, PUT, DELETE | `/api/companies/{company_id}` | Single company |
+| POST, GET | `/api/business-units`; GET, PUT, DELETE `/api/business-units/{id}` | Business units |
+| POST, GET | `/api/departments`; GET, PUT, DELETE `/api/departments/{id}` | Departments |
+| POST, GET | `/api/teams`; GET, PUT, DELETE `/api/teams/{id}` | Teams |
+| POST, GET | `/api/designations`; GET, PUT, DELETE `/api/designations/{id}` | Designations |
+| GET | `/api/organization/hierarchy` | Organization hierarchy |
+| GET | `/api/organization/me` | The signed-in user's organization details |
 
-Employee working details include the employee's working type and scheduled work times. The configured Half-Day Working Duration is used as the reference duration for Half-Day classification; it must not be replaced with a fixed company-wide number.
+### Holidays
 
-The implemented Half-Day threshold policy is:
+| Method | Path | Description |
+|---|---|---|
+| POST, GET | `/api/holiday-calendars` | Create / list calendars |
+| GET | `/api/holiday-calendars/options` | Calendar options |
+| GET, PUT, DELETE | `/api/holiday-calendars/{calendar_id}` | Single calendar |
+| GET | `/api/holiday-calendars/{calendar_id}/audit` | Calendar audit history |
+| POST | `/api/holiday-calendars/{calendar_id}/publish` | Publish a calendar |
+| POST, GET | `/api/holiday-calendars/{calendar_id}/holidays` | Add / list holidays |
+| PUT, DELETE | `/api/holidays/{holiday_id}` | Update / delete a holiday |
+| POST, GET | `/api/employee-holiday-calendars` | Assign / list employee calendar assignments |
+| DELETE | `/api/employee-holiday-calendars/{assignment_id}` | Remove an assignment |
+| GET | `/api/my-holidays` | Holidays applicable to the signed-in employee |
 
-- Let `H` be the configured Half-Day Working Duration.
-- Let `T` be effective working duration after applying the approved-permission adjustment only when permission time is not already included in the attendance duration.
-- Below `80% × H`: do not classify the day as Half-Day Present; apply the applicable absence/status rules.
-- From `80% × H` through `150% × H`, inclusive: classify as Half-Day Present and determine the applicable first-half/second-half classification from the attendance intervals and schedule.
-- Above `150% × H`: evaluate the existing full-day eligibility/business rules. Do not automatically assume that every value above the upper threshold is a full day.
+### Reporting manager (`/api/reporting-manager`)
 
-The calculation must respect employee-specific schedules, actual attendance intervals, approved permissions, breaks, joining-date eligibility, weekly offs, holidays, leave, and payroll locks. Permission must never be counted twice. A permission interval overlapping time already represented by a working/attendance interval must not be added again.
+| Method | Path | Description |
+|---|---|---|
+| GET | `/me` | Whether the current user is a reporting manager |
+| GET | `/options` | Candidate approvers for assignment |
+| GET, PUT | `/{user_id}` | Read / set an employee's Reporting Manager, HOD and HR Admin approvers |
+| GET | `/team-members/list` | Team members of the current reporting manager |
+| GET | `/team-members/{member_id}` | Team member detail |
+| GET | `/team-members/{member_id}/attendance` | Team member attendance |
 
-`Half Day Time` is the employee working-details value representing the configured half-day duration. If an older record or integration still contains the legacy `Off Day Time` field, retain compatibility while records are migrated or mapped to the current field.
+### Attendance (`/api/attendance`)
 
-### Attendance statuses and incomplete punches
+| Method | Path | Description |
+|---|---|---|
+| GET, POST | `` (root) | List attendance for a date / save attendance |
+| GET | `/my` | Own attendance for a month |
+| GET | `/user/{user_id}` | A user's attendance for a month |
+| GET | `/user/{user_id}/monthly-details` | Monthly detail |
+| GET | `/day/{user_id}` | Single-day breakdown |
+| GET, PUT | `/my/remarks` | Own attendance remarks |
+| GET | `/employees`, `/departments`, `/department-employees` | Filter lookups |
+| GET | `/payroll-locks` | Months locked by payroll |
+| GET | `/user/{user_id}/export.xlsx` | Excel export for one user |
+| GET | `/export-options` | Export options |
+| POST | `/export.xlsx` | Excel export for selected employees (one worksheet, one section per employee) |
+| GET | `/historical/user/{user_id}`, `/historical/user/{user_id}/history` | Historical attendance and modification history |
+| POST | `/historical/modify` | Modify historical attendance |
+| POST | `/historical/weekly-off-preview`, `/historical/weekly-off-approve`, `/historical/generate-weekly-off` | Weekly-off generation workflow |
 
-`Not Marked`, `Absent`, and an attendance issue are different concepts:
+### Work From Home (`/api/attendance/wfh`)
 
-- `Not Marked` means no attendance status/punch has been recorded for the date and the attendance-generation rules have not classified it as Absent.
-- `Absent` is a business attendance status generated only when the applicable date eligibility and attendance rules determine absence.
-- An attendance issue indicates incomplete or inconsistent punch/interval data (for example, a missing required check-in or check-out). An issue indicator should not erase the underlying punch data or be confused with the Absent status.
+| Method | Path | Description |
+|---|---|---|
+| GET | `/me` | Own WFH status/configuration |
+| POST | `/face/challenge`, `/face/register` | Liveness challenge; face registration |
+| POST | `/location/register`, `/location/verify` | Register / verify location |
+| POST | `/check-in`, `/check-out` | WFH check-in / check-out |
+| POST | `/break/start`, `/break/end` | WFH breaks |
+| POST | `/email-fallback/request`, `/email-fallback/redeem`, `/qr-fallback/request` | One-time email/QR fallback |
+| GET | `/admin/employees` | WFH settings for employees (admin) |
+| PUT | `/admin/employees/{user_id}` | Update an employee's WFH settings |
+| POST, DELETE | `/admin/employees/{user_id}/approved-locations` and `.../approved-locations/{location_id}` | Manage approved locations |
+| DELETE | `/admin/employees/{user_id}/location` | Remove registered location |
+| GET, DELETE | `/admin/employees/{user_id}/face` | View status / remove registered face |
 
-When a missing punch is corrected, attendance issue validation should be refreshed so resolved issue indicators do not remain in calendar, attendance details, or newly generated exports.
+### ESSL (`/api/attendance/essl`)
 
-### Attendance views and Excel exports
+| Method | Path | Description |
+|---|---|---|
+| GET, PUT | `/config` | Read / save API configuration (credentials stored encrypted) |
+| POST | `/test-connection` | Test the configured API |
+| POST | `/sync` | Sync punches for a date range |
+| POST | `/preview-file`, `/import-file` | Preview / import an `.xls`, `.xlsx` or `.csv` export |
+| GET | `/employees` | Employees with ESSL mappings |
+| PUT | `/employees/{user_id}` | Set an employee's ESSL ID mapping |
+| GET | `/sync-history`, `/issues` | Sync runs and punch issues |
 
-Attendance views and exports include working-time and status information such as:
+### Attendance requests (`/api/attendance-requests`)
 
-- Check-in and check-out times.
-- Total/net working duration and break duration.
-- Break details and working intervals, where available.
-- Permission duration and permission count.
-- Half-Day Present and first-half/second-half breakdowns.
-- Early Going By and Late Going By, calculated against the employee's scheduled check-out time.
-- Attendance source and attendance issue indicators.
+| Method | Path | Description |
+|---|---|---|
+| POST | `` (root) | Create a correction request |
+| GET | `` (root) | List requests (HR) |
+| GET | `/my` | Own requests |
+| GET | `/{request_id}` | Request detail |
+| POST | `/{request_id}/cancel` | Cancel a request |
+| POST | `/{request_id}/respond` | Approve / reject per date |
+| GET | `/eligible-dates` | Dates eligible for correction |
+| GET | `/calendar`, `/calendar/user/{user_id}` | Request calendar |
 
-In the detailed Excel report, each working interval is intended to be displayed on its own line using a `WI` sequence label, and each break on its own line using a `B` sequence label. Example labels are `WI1`, `WI2`, `B1`, and `B2`; actual times and durations come from the attendance records. Break Duration remains a separate duration value and should not be redundantly prefixed with a “Total Break Duration” label.
+### Leave and permissions (`/api/leave`)
 
-Excel summaries are generated from the attendance data for the selected employee/period. Always reconcile exported values with the corresponding attendance screen and source records before using them for payroll.
+| Method | Path | Description |
+|---|---|---|
+| GET, POST | `/types`; PUT `/types/{leave_type_id}` | Leave types |
+| GET | `/policies/{leave_type_id}`; POST `/policies`; PUT `/policies/{leave_type_id}` | Leave policies |
+| GET, PUT | `/company-policy` | Company leave/weekly-off policy |
+| GET | `/balance`, `/approval-preview`, `/my-approval-role`, `/dashboard` | Balances, approver preview, approver role, dashboard |
+| POST | `/apply` | Apply for leave |
+| GET | `/my-requests`, `/pending`, `/requests/{request_id}`, `/requests/{request_id}/attachment` | Requests and attachment |
+| PUT | `/requests/{request_id}/approve`, `/reject`, `/cancel` | Decide / cancel |
+| PUT | `/requests/{request_id}/cancellation/{decision}` | Decide a cancellation request |
+| POST | `/permissions` | Request a permission |
+| GET | `/permissions/my-requests`, `/permissions/pending` | Permission lists |
+| PUT | `/permissions/{request_id}/approve`, `/reject`, `/cancel` | Decide / cancel permission |
+| PUT | `/permissions/{request_id}/cancellation/{decision}` | Decide a permission cancellation |
+| GET | `/reports`, `/reports/csv` | Leave reports (JSON / CSV) |
+| GET | `/notifications` | Leave notifications |
+
+### Notifications (`/api/notifications`)
+
+| Method | Path | Description |
+|---|---|---|
+| POST, GET | `` (root) | Create / list notifications |
+| GET | `/unread-count`, `/snapshot`, `/lookups` | Counts, snapshot, audience lookups |
+| PUT, DELETE | `/{notification_id}` | Update / delete |
+| POST | `/{notification_id}/view`, `/acknowledge`, `/star`, `/unstar`, `/hold`, `/resume` | Per-notification actions |
+| GET | `/{notification_id}/viewers` | Who viewed it |
+| POST | `/leave/{id}/read`, `/leave/{id}/star`, `/leave/{id}/unstar` | Leave-notification actions |
+| DELETE | `/leave/{id}` | Delete a leave notification |
+
+### Payroll (`/api/payroll`)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/employees` | Employees for payroll |
+| GET | `/salary-profiles` | Salary profiles |
+| PUT | `/salary-profiles/{employee_id}` | Create/update a salary profile |
+| GET | `/salary-profiles/{employee_id}/history` | Salary profile history |
+| GET | `/attendance-summary` | Attendance summary used for calculation |
+| POST | `/calculate` | Calculate monthly payroll |
+| GET | `/records` | Payroll records |
+| POST | `/records/{record_id}/action` | `approve`, `process`, `paid`, `disapprove` |
+| GET | `/payslips`, `/payslips/{record_id}`, `/payslips/{record_id}/pdf` | Payslip register / view / PDF (HR Admin) |
+| GET | `/my-payslips`, `/my-payslips/{record_id}`, `/my-payslips/{record_id}/pdf` | Own payslips |
+
+## Business rules
+
+### Attendance rules
+
+- **Half-day classification** (`attendance_calculations.py`): each employee has a configured working schedule; the **Half Day Time** is half of the scheduled working duration. Total Duration (check-out minus check-in, breaks included) is compared with it:
+  - below **50%** → Absent
+  - **50% to 120%** (both inclusive) → Half-Day Present
+  - above **120%** → full-day rules apply
+  
+  Comparisons use integer arithmetic, so the boundaries are exact. Holiday, Weekly Off, Leave, Medical Leave, Permission, Not Applicable and "Before joining" statuses are protected and not overridden by this calculation.
+- **Durations** are elapsed wall-clock minutes; a check-out earlier than check-in is treated as an overnight shift. Overlapping working intervals are merged so minutes are not counted twice, and approved permission time is added once.
+- **First half / second half:** the scheduled shift is split at its midpoint, and the half containing more of the actual working time determines First Half Present or Second Half Present.
+- **Attendance issues** (incomplete or inconsistent punches, e.g. overlapping intervals) are reported separately from the attendance status.
+- **Leave integration:** approved leave is written to attendance only for the current day (company timezone) or when a past leave date is read; future leave dates are never pre-created. Cancelling a leave removes the attendance it created. Approved full-day leave locks attendance until cancelled. Leave attendance is always derived from `leave_requests`, never from client-supplied leave data.
+- **Calendar window:** attendance calendars look forward up to 89 days (`CALENDAR_FORWARD_DAYS`).
+- **Payroll locks:** months whose payroll is Approved, Processed or Paid are locked against attendance changes (`GET /api/attendance/payroll-locks`).
+- **Attendance requests:** employees request a status for their own past dates (Present, Half-Day Present, Absent, Holiday, Weekly Off, Medical Leave, Permission); HR Admin approves (optionally changing status/times) or rejects each date individually. Monthly Weekly Off and Medical Leave limits are enforced at every step.
+- **Weekly Off generation:** HR Admin previews and approves weekly offs for eligible `Not Marked` dates; at most **4 Weekly Offs per month** (`MAX_WEEKLY_OFFS_PER_MONTH`). Company-configured weekly-off weekdays are preferred, then the most frequent weekday, with ties resolved in the order Sunday, Saturday, Monday–Friday.
+- **Excel export:** all selected employees are rendered as separate sections in one worksheet.
+
+### Leave and permissions
+
+- Default leave types: Casual Leave (`CL`), Medical Leave (`ML`), Earned Leave (`EL`) and Loss of Pay (`LOP`, unpaid). Leave types can be created and edited; each can allow half-day and require an attachment.
+- **Medical Leave** is limited to **1 day per month**.
+- **Approval chain:** a request is routed to the stage assigned to the employee: Reporting Manager → HOD → HR Admin. The approver is assigned on the employee record through the reporting-manager API; the HOD stage requires an account with the `HR Manager` role and the HR Admin stage an `HR Admin` account.
+- Approved leave and permissions can be cancelled through a cancellation workflow with approver decisions. Approvers and employees receive leave notifications.
+- Permissions are short time-range requests (date, start time, end time, reason) with the same approval and cancellation handling.
+
+### Holiday calendars
+
+- Calendars have a status (`Draft` or `Published`); only Published, active calendars and non-cancelled holidays are official for attendance, leave and payroll.
+- Religion-based calendars apply to employees whose Employee Master religion matches and, when organization assignments are set, who belong to those branches; calendars with no assignments apply to all branches.
+- A background thread (`holiday-calendar-reminder-scheduler`) runs hourly and emits holiday-calendar reminders; deduplication is enforced by a unique index on reminder target and period.
+- The Holiday Calendar screen can import public holidays from the third-party Nager.Date service, called from the user's browser.
 
 ### ESSL integration
 
-Attendance data can originate from application attendance workflows and configured device import/synchronization workflows. The ESSL module includes configuration and synchronization code, but successful live device integration depends on the exact device model/firmware, vendor interface or SDK, network configuration, credentials, and mapping of device user identifiers to HRMS employees.
+- **API sync:** configure URL, method (`GET`/`POST`), authentication (`none`, `bearer`, `api_key`, `basic`), request parameters/body/headers, and JSON paths for records, employee ID, timestamp, and optional punch/device ID. Secrets and request data are stored encrypted (`ESSL_CONFIG_ENCRYPTION_KEY`). Responses are capped at 10 MB.
+- **File import:** `.csv`, `.xls` and `.xlsx` exports can be previewed and imported; file type is detected from content.
+- **Mapping:** each user has an optional ESSL employee ID (unique, normalized). Raw punches are stored with a unique key so repeated syncs are idempotent; problems are recorded as punch issues.
 
-Before enabling production synchronization:
+### Work From Home
 
-1. Confirm the device's supported integration method with the vendor.
-2. Configure network reachability and credentials securely.
-3. Map each device user ID to the correct HRMS employee.
-4. Test with a small date range and a limited set of employees.
-5. Check duplicate-punch handling, timezone interpretation, missing punches, and joining-date boundaries.
-6. Reconcile imported records against the source device/software before payroll use.
+- Employees must have a registered face and an approved location configured by HR Admin/Administrator.
+- Face verification is local: a challenge-response liveness check (blink / head-turn sequences) and face-embedding comparison, with tolerance capped at `0.48`. Face templates are Fernet-encrypted at rest.
+- Browser location must be within the allowed accuracy and age limits and inside an approved location.
+- A one-time email or QR fallback link (valid 15 minutes, single use) is available; it does not bypass face, liveness, location-accuracy or geofence checks.
+- Attendance created by WFH check-in/out is recalculated with the same half-day rules as ESSL punches.
 
-Do not import a full production history until a backup and reconciliation procedure is in place.
+### Payroll
 
-## Leave, holidays, and permissions
+- **Salary profile** (HR Admin): monthly salary, bank details, PAN (format `ABCDE1234F`), currency (default `INR`), effective date, and up to 50 components (earning or deduction; fixed or percentage), plus attendance-deduction settings (enabled flag; basis `calendar_days`, `working_days` or `fixed_amount`; per-day amount).
+- **Calculation** uses the attendance records for the month (present, half days, paid/unpaid leave, medical leave, holidays, weekly offs).
+- **Workflow:** `Calculated` → `Approved` → `Processed` → `Paid`. Approval is blocked when attendance for the month changed after calculation. Marking a record `Paid` requires a payment reference and makes the payslip available. A `Calculated` record can be disapproved (it is deleted). Approved/Processed/Paid records are not overwritten by recalculation.
+- **Payslips:** HR Admin views the payslip register; each employee views and downloads their own payslips. PDFs are generated with ReportLab using the bundled Noto Sans fonts and company logo.
 
-Leave rules can depend on leave type, configured entitlement, approval routing, employee data, holidays, and attendance records. Holiday calendars and weekly-off settings can affect working-day calculations.
+### Notifications
 
-Before changing leave policy, verify:
+- Audience types: `all`, `roles`, `teams`, `departments`, `users`.
+- Validity can be set in minutes, hours, days or weeks; a notification can be `ACTIVE` or on `HOLD`, and can be updated, resumed or deleted.
+- Recipients can view, acknowledge and star notifications; senders can see viewers. Leave-related notifications have their own read/star/delete actions.
 
-- Leave type codes and paid/unpaid classification.
-- Monthly versus annual entitlement behavior.
-- Accrual and carry-forward rules, if configured.
-- Eligibility and probation/work-stage rules, if configured.
-- Approval routing and role assignments.
-- Holiday and weekly-off calculations.
-- LOP/payroll treatment.
-- Existing employee balances and historical leave records.
+## Scripts and tests
 
-Do not manually edit production leave balances without understanding the corresponding calculation and audit behavior.
+### Maintenance scripts (run from `backend/`)
 
-## Payroll and payslips
+| Script | Purpose |
+|---|---|
+| `python scripts/recalculate_half_day_attendance.py [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--apply]` | Recalculates historical **automatic** (ESSL / WFH) attendance with the current half-day rules. Dry run by default; writes only with `--apply`. Skips manual, HR-edited and attendance-request records and any month whose payroll is Approved, Processed or Paid. |
+| `python scripts/check_wfh_mongodb.py` | Read-only MongoDB connectivity and collection check for WFH. Requires `MONGODB_URL` / `MONGODB_DATABASE` in `backend/.env`. |
 
-Payroll uses employee salary information and attendance/leave inputs. Review salary components, payable days, unpaid leave/LOP, approved payroll state, and payslip output before finalizing a payroll period.
+### Tests
 
-Recommended payroll cycle:
+`backend/tests/` contains 23 test modules covering attendance calculations, attendance requests and export, ESSL import and employee recreation, WFH attendance and late check-in, weekly-off generation, working details, holiday models/API/workflow, religion holidays, organization workflow, companies API, company-employee assignment, employee details, users API, leave approval routing and hierarchy, notification scope, payslip view, and a checklist test. The suite mixes `unittest` style and `pytest` style; `pytest` is not listed in `requirements.txt`, so install it separately:
 
-1. Verify employee master data and salary profiles.
-2. Reconcile attendance and approved attendance corrections.
-3. Verify approved leave, holidays, and weekly offs.
-4. Review payable days and LOP.
-5. Calculate and review payroll.
-6. Approve/finalize according to the organization's workflow.
-7. Verify generated payslips and employee access.
-
-Historical attendance or leave changes may affect payroll reconciliation. Follow the application's approval and recalculation workflow rather than editing payroll records directly in MongoDB.
-
-## Tests and quality checks
-
-The backend archive includes tests under `backend/tests/`. Run them from the backend directory with the project's test dependencies installed:
-
-```powershell
+```bash
 cd backend
-python -m pytest -q
+pip install pytest
+python -m pytest tests
 ```
 
-If pytest is not listed in the runtime requirements, install it in the development environment:
+Several tests import application modules, which create the MongoDB client at import time, so keep `MONGODB_URL` and `MONGODB_DATABASE` defined in `.env` when running them. Frontend checks are limited to `npm run lint` and `npm run build`.
 
-```powershell
-python -m pip install pytest
-```
+## Deployment notes
 
-Frontend scripts are defined in `frontend/package.json`:
+- Build the frontend (`npm run build`) and serve `frontend/dist/` from a static host or web server with a fallback to `index.html` (several email links open real URL paths such as `/activate` and `/reset-password`).
+- Set `VITE_API_BASE_URL` at build time to the public backend URL.
+- Run the backend with Uvicorn behind a reverse proxy using HTTPS. Because sessions are in memory, run a single backend process unless the session store is changed.
+- Set `CORS_ALLOWED_ORIGINS` to the deployed frontend origin(s), `FRONTEND_URL` to the public frontend URL, and `HRMS_ENV` to a value other than `development` to disable sample-login seeding.
+- Provide `ESSL_CONFIG_ENCRYPTION_KEY` and, if WFH is used, `WFH_TEMPLATE_ENCRYPTION_KEY`; store all secrets outside version control.
+- WFH requires HTTPS on the frontend so browsers permit camera and location access.
 
-```powershell
-cd frontend
-npm ci
-npm run lint
-npm run build
-```
+## Known limitations and security notes
 
-A successful build verifies compilation; it does not replace API, database, browser, payroll, or end-to-end testing.
+These reflect the current code and are listed so they can be addressed before a production rollout:
 
-## Git and environment-file guidance
-
-Before committing:
-
-```powershell
-git status
-git add README.md frontend/README.md
-git commit -m "Update project documentation"
-git push origin main
-```
-
-Commit source code, lockfiles, `.env.example`, and documentation. Do **not** commit:
-
-- `.env`, `.env.local`, production secrets, API keys, SMTP passwords, MongoDB credentials, or encryption keys.
-- Python virtual environments (`venv/`, `venv312/`, `.venv/`).
-- `node_modules/`, generated `dist/`, caches, or `__pycache__/`.
-- Local database dumps or employee personal data unless explicitly approved and securely handled.
-
-Review `.gitignore` before committing. If a secret was previously committed, removing it from the latest commit is not enough; rotate the exposed credential.
+- **Authorization coverage is uneven.** The `/api/users*` and `/api/employees*` handlers in `core_routes.py` do not declare an authentication or role dependency, so access to them is not enforced by the backend in the reviewed code; the UI restricts these screens by role. Organization routes are protected by middleware, and the payroll, ESSL, leave, notification, attendance-request and reporting-manager routers perform their own session checks. Review and add backend authorization to the user and employee endpoints (and the other routes listed in the API reference as needed) before exposing the service beyond a trusted network.
+- **In-memory sessions:** no expiry, lost on restart, not shared across processes.
+- **SMTP mode differs by module** (see [Configuration](#configuration)).
+- **Frontend session storage:** the token is kept in `sessionStorage`, readable by any script running on the page.
+- **Public-holiday import** sends requests from the browser to a third-party service (`date.nager.at`).
+- The `NotificationPanel` frontend component exists in the source tree but is not imported anywhere.
 
 ## Troubleshooting
 
-### Backend fails during startup
+**Backend fails at startup with a Mongo or `None` error** — `MONGODB_URL` / `MONGODB_DATABASE` are missing; the client is created at import time. Run from `backend/` so `.env` is found.
 
-- Activate the intended virtual environment.
-- Install `backend/requirements.txt`.
-- Read the first exception in the traceback; later ASGI frames are usually propagation.
-- Check import names and constants referenced across modules.
-- Confirm `.env` exists and MongoDB configuration is valid.
+**Frontend cannot reach the API** — confirm the backend is on port 8000, check `VITE_BACKEND_PROXY_TARGET` (dev) or `VITE_API_BASE_URL` (production build), and CORS settings.
 
-### MongoDB connection or data errors
+**Everyone is signed out after a backend restart** — expected; sessions are in memory.
 
-- Confirm MongoDB is running and reachable.
-- Verify `MONGODB_URL` and `MONGODB_DATABASE`.
-- Check database user permissions and network allowlists.
-- Do not expose connection strings in screenshots or Git commits.
+**Account locked** — 5 failed logins lock the account for 15 minutes.
 
-### Frontend cannot reach the API
+**Activation or reset emails are not received** — check the `SMTP_*` values, the port/TLS mode (see the SMTP caution), and `FRONTEND_URL` for correct link targets.
 
-- Confirm the backend is running on port 8000.
-- Check `VITE_API_BASE_URL` in `frontend/.env.local`.
-- Check CORS settings and browser developer-console/network errors.
-- Restart Vite after changing environment variables.
+**WFH face registration fails with a configuration error** — install `requirements-wfh.txt` and set `WFH_TEMPLATE_ENCRYPTION_KEY` to a valid Fernet key; confirm `WFH_ATTENDANCE_ENABLED` is not `false`.
 
-### Excel export returns HTTP 500
+**ESSL configuration cannot be saved** — set `ESSL_CONFIG_ENCRYPTION_KEY` to a valid Fernet key.
 
-- Read the backend traceback and identify the first application-code frame.
-- Confirm report dependencies such as `openpyxl` are installed.
-- Check the failing export endpoint's data assumptions and traceback before changing code.
+**Attendance shows Not Marked instead of Absent** — this is intentional; the backend decides the final status from joining date, holidays, leave, weekly off and the completed-day rules.
 
-### ESSL sync returns no records
-
-- Verify device connectivity and vendor integration settings.
-- Confirm employee/device ID mappings and date/timezone settings.
-- Inspect sync history and skipped/invalid record details.
-- Test a small date range first.
-
-## Production-readiness checklist
-
-- [ ] Production MongoDB URI and least-privilege database user configured.
-- [ ] Secrets stored outside Git and rotated if previously exposed.
-- [ ] Stable encryption keys backed up securely.
-- [ ] HTTPS configured for frontend and backend.
-- [ ] CORS restricted to trusted frontend origins.
-- [ ] SMTP tested if email workflows are enabled.
-- [ ] HR Admin, Administrator, HOD, and Employee permissions tested.
-- [ ] Attendance, Half-Day, permission, leave, holidays, and payroll calculations reconciled with business owners.
-- [ ] ESSL integration tested against the actual device and vendor interface.
-- [ ] Database backups and restore procedure tested.
-- [ ] Backend tests, frontend lint/build, and end-to-end workflows passed.
-- [ ] Monitoring and error logging configured without exposing sensitive employee data.
-
-For frontend-specific setup, page structure, scripts, and development details, see [`frontend/README.md`](frontend/README.md).
+**Payroll approval is rejected with an "attendance changed" message** — recalculate the month's payroll so it reflects the latest attendance, then approve again.

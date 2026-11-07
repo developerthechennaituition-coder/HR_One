@@ -1,66 +1,177 @@
 # HRMS Frontend
 
-The HRMS frontend is a React single-page application for employee self-service and HR administration. It communicates with the Python FastAPI backend and uses MongoDB-backed APIs for authentication, organization, employee, attendance, leave, notification, payroll, and related workflows.
+The HRMS frontend is a React single-page application (SPA) for employee self-service and HR administration. It talks to the HRMS FastAPI backend over REST and covers authentication, organization setup, employee records, attendance (manual, ESSL biometric and work-from-home), leave and permissions, notifications, and payroll/payslips.
 
-For the complete application architecture, backend setup, environment configuration, role descriptions, business workflows, and deployment guidance, see the repository-root [`README.md`](../README.md).
+For the full system documentation (architecture, backend, database, business rules, environment variables), see the project-level [`README.md`](../README.md).
 
 ## Contents
 
 - [Technology stack](#technology-stack)
-- [Application structure](#application-structure)
 - [Prerequisites](#prerequisites)
-- [Install and run locally](#install-and-run-locally)
-- [API configuration](#api-configuration)
+- [Installation and development](#installation-and-development)
+- [Configuration](#configuration)
 - [Available scripts](#available-scripts)
-- [Application areas](#application-areas)
+- [Project structure](#project-structure)
+- [Application architecture](#application-architecture)
+- [Pages](#pages)
+- [Components](#components)
+- [Services and utilities](#services-and-utilities)
+- [Role-based access](#role-based-access)
+- [Backend API usage](#backend-api-usage)
 - [Attendance UI behavior](#attendance-ui-behavior)
-- [Authentication and API requests](#authentication-and-api-requests)
-- [Build and deployment](#build-and-deployment)
+- [Styling](#styling)
+- [Production build and deployment](#production-build-and-deployment)
 - [Development conventions](#development-conventions)
 - [Troubleshooting](#troubleshooting)
 
 ## Technology stack
 
+Versions below are the ranges declared in `package.json`; `package-lock.json` pins the resolved versions.
+
 | Area | Technology |
 |---|---|
-| UI framework | React 19, React DOM |
-| Build/dev server | Vite 8 |
-| Language | JavaScript ES modules, JSX |
-| UI styling | Bootstrap 5, Bootstrap Icons, project CSS |
-| Phone utilities | libphonenumber-js |
-| QR codes | qrcode.react |
-| PDF rendering | pdfjs-dist |
-| Linting | Oxlint |
+| UI framework | React `^19.2.8`, React DOM `^19.2.8` |
+| Build tool / dev server | Vite `^8.3.0` with `@vitejs/plugin-react` `^6.1.1` |
+| Language | JavaScript (ES modules, JSX); `@types/react` and `@types/react-dom` are installed as dev dependencies |
+| UI styling | Bootstrap `^5.3.8`, Bootstrap Icons `^1.13.1`, plus project CSS (`src/styles-01.css` … `styles-08.css`, `index.css`) |
+| Phone number handling | `libphonenumber-js` `^1.13.13` (used in User Management) |
+| QR codes | `qrcode.react` `^4.2.0` (used in WFH Attendance) |
+| PDF rendering | `pdfjs-dist` `^5.7.284` (used by the payslip viewer) |
+| Linting | Oxlint `^1.81.0` (`react/rules-of-hooks` as error, `react/only-export-components` as warning) |
 
-Dependency versions are declared in `package.json`; `package-lock.json` records the resolved dependency tree. Use `npm ci` for reproducible installation.
+There is no client-side routing library, no global state library and no TypeScript source; state is held in React hooks and navigation is hash-based (see [Application architecture](#application-architecture)).
 
-## Application structure
+## Prerequisites
+
+- Node.js and npm compatible with Vite 8 (check the engine requirements of the installed Vite version).
+- The HRMS backend running and reachable (default `http://127.0.0.1:8000`) with its MongoDB database configured. See the project [`README.md`](../README.md).
+- Optional: a local HTTPS certificate pair for HTTPS development (see [HTTPS in development](#https-in-development)).
+
+```bash
+node --version
+npm --version
+```
+
+## Installation and development
+
+From the project root:
+
+```bash
+cd frontend
+npm ci          # reproducible install from package-lock.json
+npm run dev     # start the Vite dev server
+```
+
+The dev server is configured in `vite.config.js` to bind to `0.0.0.0` on port `5173` with `strictPort: true`, so it fails instead of silently choosing another port if 5173 is taken. Open:
+
+- `http://localhost:5173/`
+- `http://127.0.0.1:5173/`
+- `http(s)://<your-LAN-IP>:5173/` from another device on the same network
+
+Start the backend first (or at the same time), otherwise login and every data request will fail. Use `npm install` only when you intentionally change dependencies, and commit the updated `package-lock.json`.
+
+## Configuration
+
+### How the API base URL is resolved
+
+`src/config/api.js` exports `HRONE_API_BASE`, used by all API calls:
+
+| Situation | Resulting base URL |
+|---|---|
+| `VITE_API_BASE_URL` is set (any mode) | The value of `VITE_API_BASE_URL`, trailing slashes removed |
+| Development (`npm run dev`) and `VITE_API_BASE_URL` not set | Empty string, so requests go to the page's own origin as `/api/...` |
+| Production build and `VITE_API_BASE_URL` not set | `http://127.0.0.1:8000` |
+
+### Development proxy
+
+In `vite.config.js`, both the dev server and `vite preview` proxy `/api` to the backend:
+
+- Target: `http://127.0.0.1:8000` by default.
+- Override with the `VITE_BACKEND_PROXY_TARGET` environment variable when the backend runs elsewhere.
+- `changeOrigin: true` is enabled.
+
+Because the browser only talks to the Vite origin in development, the same setup works for `http://localhost:5173` and `https://<LAN-IP>:5173` and avoids mixed-content and certificate problems with the plain-HTTP backend.
+
+### Environment variables
+
+| Variable | Read by | Purpose |
+|---|---|---|
+| `VITE_API_BASE_URL` | `src/config/api.js` (browser bundle) | Absolute backend URL. Set it when the backend is hosted on a different origin, and always for production builds that do not serve `/api` from the same origin. |
+| `VITE_BACKEND_PROXY_TARGET` | `vite.config.js` (Node, dev/preview only) | Backend URL the Vite proxy forwards `/api` to. |
+
+Example `frontend/.env.local` (only needed for non-default setups):
+
+```dotenv
+VITE_API_BASE_URL=https://api.example.com
+VITE_BACKEND_PROXY_TARGET=http://127.0.0.1:8000
+```
+
+Notes:
+
+- Restart Vite after changing environment variables.
+- `VITE_*` values are embedded in the browser bundle. Never put secrets (passwords, database URLs, SMTP credentials, encryption keys) in them.
+- `*.local` files are git-ignored.
+- The backend must allow the frontend origin through its CORS settings (`CORS_ALLOWED_ORIGINS` / `CORS_ALLOWED_ORIGIN_REGEX`; see the project README).
+
+### HTTPS in development
+
+`vite.config.js` looks for these files in a `certs/` directory **next to** the `frontend/` directory (`../certs` relative to `frontend/`):
+
+- `localhost-key.pem`
+- `localhost.pem`
+
+If both exist, the dev server starts with HTTPS; otherwise it starts with plain HTTP. HTTPS is useful for features that browsers restrict to secure contexts when testing from another device (the WFH page uses the camera and geolocation).
+
+## Available scripts
+
+Run from `frontend/`:
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Start the Vite dev server on port 5173 |
+| `npm run build` | Create a production build in `dist/` |
+| `npm run preview` | Serve the production build locally on port 5173 (with the `/api` proxy) |
+| `npm run lint` | Run Oxlint |
+
+Typical pre-commit check:
+
+```bash
+npm run lint
+npm run build
+```
+
+A successful build confirms the app bundles; it does not verify backend connectivity or runtime workflows. The repository contains no frontend test runner.
+
+## Project structure
 
 ```text
 frontend/
 ├── README.md
+├── index.html                 # Vite entry HTML (title: "HRMS | Human Resource Management")
 ├── package.json
 ├── package-lock.json
-├── vite.config.js
-├── index.html
+├── vite.config.js             # React plugin, port 5173, /api proxy, optional HTTPS
+├── .oxlintrc.json             # Oxlint configuration
 ├── .gitignore
 ├── public/
 │   ├── favicon.svg
 │   ├── HRMS_title_login.svg
 │   └── icons.svg
 └── src/
-    ├── App.jsx
+    ├── main.jsx               # Mounts <App/>, loads Bootstrap + Bootstrap Icons + index.css
+    ├── App.jsx                # Session handling and public (pathname-based) pages
     ├── App.css
-    ├── main.jsx
-    ├── index.css
-    ├── styles-*.css
-    ├── auth.js
-    ├── logout.js
+    ├── index.css              # Imports styles-01.css … styles-08.css
+    ├── styles-01.css … styles-08.css
+    ├── auth.js                # canManageUsers(), readStoredSession()
+    ├── logout.js              # Calls /api/auth/logout and clears the session
     ├── config/
-    │   └── api.js
+    │   └── api.js             # HRONE_API_BASE
     ├── assets/
     │   ├── hero.png
-    │   └── notification.wav
+    │   ├── react.svg
+    │   ├── vite.svg
+    │   └── notification.wav   # Sound played by the notification bell
     ├── components/
     │   ├── AttendanceDayBreakdown.jsx
     │   ├── AttendanceExportModal.jsx
@@ -75,7 +186,8 @@ frontend/
     │   ├── MyHolidayCalendar.jsx
     │   ├── NotificationBell.jsx
     │   ├── NotificationPanel.jsx
-    │   └── PayslipViewer.jsx
+    │   ├── PayslipViewer.jsx
+    │   └── Sidebar.jsx
     ├── pages/
     │   ├── AccessDenied.jsx
     │   ├── ActivateAccount.jsx
@@ -108,6 +220,7 @@ frontend/
     │   └── WfhEmailVerification.jsx
     └── services/
         ├── attendanceCalendarRange.js
+        ├── attendanceCalendarStatus.js
         ├── attendanceHistoryFormat.js
         ├── attendanceRequestApi.js
         ├── authenticatedFetch.js
@@ -117,230 +230,230 @@ frontend/
         └── weeklyOff.js
 ```
 
-This tree highlights principal modules. Refer to the checked-out source for the complete and current file list.
+## Application architecture
 
-## Prerequisites
+### Entry and session
 
-- Node.js and npm versions compatible with the Vite version pinned by `package-lock.json`.
-- The HRMS FastAPI backend running and reachable from the browser.
-- A configured MongoDB database for backend data.
-- Optional HTTPS certificate files for local HTTPS development; the Vite configuration checks the repository-level `certs/` directory.
+1. `main.jsx` renders `<App />` inside `StrictMode`.
+2. `App.jsx` reads the stored session with `readStoredSession()` (the `hrms_session` key in browser **`sessionStorage`**) and decides what to render.
+3. A signed-in session renders `MainLayout`; otherwise the `Login` page is shown. `logout.js` calls `POST /api/auth/logout`, removes `hrms_session`, and returns to `/login`.
 
-Verify:
+Because the session lives in `sessionStorage`, it is scoped to the browser tab and is discarded when the tab is closed. Requests send the token as `Authorization: Bearer <token>`.
 
-```powershell
-node --version
-npm --version
-```
+### Two navigation mechanisms
 
-## Install and run locally
+There is no React Router. The app uses two simple mechanisms:
 
-From the repository root:
+**1. Pathname-based public pages** (handled in `App.jsx`, usable without signing in):
 
-```powershell
-cd frontend
-npm ci
-npm run dev
-```
-
-Vite is configured to bind to `0.0.0.0` on port `5173` with `strictPort: true`. Open the URL shown in the terminal, normally:
-
-- `http://localhost:5173/`
-- `http://127.0.0.1:5173/`
-
-If port 5173 is already in use, stop the other process or deliberately change the Vite configuration and corresponding backend CORS settings.
-
-For a dependency update or when the lockfile has intentionally changed, use `npm install` and commit the updated lockfile. For normal clean installs and CI, prefer `npm ci`.
-
-## API configuration
-
-The shared API base URL is defined in `src/config/api.js`:
-
-```javascript
-export const HRONE_API_BASE = (
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
-).replace(/\/+$/, "");
-```
-
-Create `frontend/.env.local` for local development:
-
-```dotenv
-VITE_API_BASE_URL=http://127.0.0.1:8000
-```
-
-For a backend running on another machine, use its reachable hostname or LAN IP:
-
-```dotenv
-VITE_API_BASE_URL=http://192.168.1.50:8000
-```
-
-The address above is an example only. Replace it with the actual backend address. Configure the backend `CORS_ALLOWED_ORIGINS` to include the exact frontend origin.
-
-Important:
-
-- Restart Vite after changing `.env.local`.
-- Do not put passwords, database URIs, SMTP credentials, or encryption keys in `VITE_*` variables. Vite exposes frontend environment variables to browser code.
-- `vite.config.js` also defines a development proxy for `/api` to `http://127.0.0.1:8000`; application API calls should use the shared API configuration/service patterns already in the project.
-
-## Available scripts
-
-Run these commands from `frontend/`:
-
-| Command | Purpose |
+| Path | Page |
 |---|---|
-| `npm run dev` | Start Vite development server |
-| `npm run build` | Create an optimized production build in `dist/` |
-| `npm run preview` | Preview the production build locally |
-| `npm run lint` | Run Oxlint |
+| `/login` | `Login` |
+| `/activate` | `ActivateAccount` (account activation link from email) |
+| `/forgot-password` | `ForgotPassword` |
+| `/verify-reset-otp` | `VerifyResetOTP` |
+| `/reset-password` | `ResetPassword` |
+| `/wfh-email-verification` | `WfhEmailVerification` (one-time WFH email fallback link) |
 
-Typical validation:
+Matching uses `pathname === …` or `pathname.endsWith(…)`. When deploying, the web server must rewrite these paths to `index.html` (see [Production build and deployment](#production-build-and-deployment)).
 
-```powershell
-npm run lint
-npm run build
-```
+**2. Hash-based pages inside the authenticated shell** (`MainLayout.jsx`): the active page is the URL hash, for example `#attendance` or `#leave`. Unknown or empty hashes fall back to `#dashboard`. The page names accepted by `MainLayout` are:
 
-A successful Vite build confirms that the frontend bundles. It does not confirm that the backend is reachable or that every workflow behaves correctly at runtime.
+`dashboard`, `company-setup`, `organization-setup`, `holiday-calendar`, `employees`, `employee-salary-setup`, `payroll-dashboard`, `monthly-payroll`, `payslip-management`, `employee-details`, `users`, `attendance`, `my-attendance`, `wfh-attendance`, `wfh-settings`, `user-attendance`, `essl-setup`, `leave`, `notifications`, `profile`, `change-password`, `team-members`, `team-member-details`, `403`.
 
-## Application areas
+`MainLayout` also holds the current user, role-derived permission flags, the selected employee for detail views, the reporting-manager status, and the mobile-sidebar state. Pages that need a selected employee (`employee-details`, `team-member-details`) receive it from `MainLayout` state; opening those hashes directly without a selection shows Access Denied.
 
-| Area | Main page/component files | Purpose |
+## Pages
+
+### Public pages
+
+| File | Purpose |
+|---|---|
+| `Login.jsx` | Sign in with work email or employee ID and password (`POST /api/auth/login`) |
+| `ActivateAccount.jsx` | Set a password from the activation link (`GET`/`POST /api/auth/activate`) |
+| `ForgotPassword.jsx` | Request a password-reset OTP |
+| `VerifyResetOTP.jsx` | Verify the emailed OTP |
+| `ResetPassword.jsx` | Set a new password |
+| `WfhEmailVerification.jsx` | Redeem the one-time WFH email-fallback link |
+
+`AuthLayout.jsx` provides the shared layout for Login, Forgot Password, Verify Reset OTP and Reset Password.
+
+### Authenticated pages
+
+| Hash | File | Description |
 |---|---|---|
-| App shell and navigation | `App.jsx`, `MainLayout.jsx`, `Header.jsx`, `Sidebar.jsx` | Application routing, layout, and navigation |
-| Authentication | `Login.jsx`, `AuthLayout.jsx`, `ActivateAccount.jsx`, `ForgotPassword.jsx`, `VerifyResetOTP.jsx`, `ResetPassword.jsx`, `ChangePassword.jsx` | Sign-in and account lifecycle |
-| Dashboard | `Dashboard.jsx` | HRMS landing/dashboard view |
-| Organization | `CompanySetup.jsx`, `OrganizationSetup.jsx`, `HolidayCalendarSetup.jsx` | Company structure and holiday setup |
-| Employee administration | `EmployeeMaster.jsx`, `EmployeeDetails.jsx`, `UserManagement.jsx` | Employee and user records |
-| Attendance | `Attendance.jsx`, `EmployeeAttendance.jsx`, `UserAttendance.jsx`, `AttendanceDayBreakdown.jsx`, `MyAttendanceCalendar.jsx` | Daily/monthly attendance and employee attendance details |
-| Attendance export | `AttendanceExportModal.jsx` | Employee/month selection for attendance export |
-| Attendance requests | `MyAttendanceRequests.jsx`, `AttendanceRequestInbox.jsx` | Employee requests and HR review |
-| Historical attendance | `HistoricalAttendanceModal.jsx` | Historical attendance review/edit interface exposed by the attendance page |
-| WFH | `WfhAttendance.jsx`, `WfhAdminSettings.jsx`, `WfhEmailVerification.jsx` | Work-from-home attendance and administration |
-| ESSL | `EsslSetup.jsx`, `EsslAdminSettings.jsx` | Device integration setup and administration |
-| Leave | `Leave.jsx` | Leave and permission workflows |
-| Notifications | `NotificationBell.jsx`, `NotificationPanel.jsx`, `NotificationManagement.jsx` | In-app notification experience |
-| Payroll | `PayrollWorkspace.jsx`, `EmployeeSalarySetup.jsx`, `EmployeePayslips.jsx`, `PayslipViewer.jsx` | Salary, payroll, and payslip screens |
-| Team | `TeamMembers.jsx`, `TeamMemberDetails.jsx` | Team-member views |
-| Profile | `Profile.jsx` | Employee profile/self-service |
+| `#dashboard` | `Dashboard.jsx` | Landing page; loads attendance, employee, user, leave-dashboard and team data from the backend |
+| `#company-setup` | `CompanySetup.jsx` | Company / legal-entity / branch records (`/api/companies`) |
+| `#organization-setup` | `OrganizationSetup.jsx` | Organization structure (business units, departments, teams, designations) |
+| `#holiday-calendar` | `HolidayCalendarSetup.jsx` | Holiday calendars and holidays. Can look up public holidays from the third-party Nager.Date API (`https://date.nager.at`) directly from the browser |
+| `#employees` | `EmployeeMaster.jsx` | Employee Master list (HR Admin) |
+| `#employee-details` | `EmployeeDetails.jsx` | Detailed employee record; editable when opened from Employee Master, read-only from Profile |
+| `#users` | `UserManagement.jsx` | Create/manage user accounts, roles and activation (HR Admin) |
+| `#attendance` | `Attendance.jsx` (HR Admin, Administrator) or `EmployeeAttendance.jsx` (other roles) | Daily attendance management, or the employee's own attendance |
+| `#my-attendance` | `EmployeeAttendance.jsx` | Own attendance calendar and correction requests (shown separately to HR Admin and Administrator) |
+| `#user-attendance` | `UserAttendance.jsx` | Per-employee monthly attendance, department filters and Excel export (HR Admin, Administrator) |
+| `#wfh-attendance` | `WfhAttendance.jsx` | Work-from-home check-in/check-out with face verification and location |
+| `#wfh-settings` | `WfhAdminSettings.jsx` | WFH configuration per employee: approved locations, face data (HR Admin, Administrator) |
+| `#essl-setup` | `EsslSetup.jsx` → `EsslAdminSettings.jsx` | ESSL biometric integration: API config, employee mapping, sync, file import, history and issues (HR Admin, Administrator) |
+| `#leave` | `Leave.jsx` | Leave dashboard, my leave, permissions, approvals, setup (for approvers/admins), reports and leave notifications |
+| `#notifications` | `NotificationManagement.jsx` | Create and manage notifications |
+| `#payroll-dashboard` | `PayrollWorkspace.jsx` (`mode="dashboard"`) | Payroll overview (HR Admin) |
+| `#employee-salary-setup` | `EmployeeSalarySetup.jsx` | Salary profiles (HR Admin) |
+| `#monthly-payroll` | `PayrollWorkspace.jsx` (`mode="monthly"`) | Monthly payroll calculation and approval workflow (HR Admin) |
+| `#payslip-management` | `PayrollWorkspace.jsx` (`mode="payslips"`) for HR Admin; `EmployeePayslips.jsx` for everyone else | Payslip register, or the employee's own payslips |
+| `#profile` | `Profile.jsx` | Own profile, organization details, holiday and attendance calendars, leave summary |
+| `#change-password` | `ChangePassword.jsx` | Change own password |
+| `#team-members` | `TeamMembers.jsx` | Team list for reporting managers |
+| `#team-member-details` | `TeamMemberDetails.jsx` | Detail and attendance view of one team member |
+| `#403` | `AccessDenied.jsx` | Shown when a page is not permitted |
 
-Feature availability is controlled by backend permissions, role assignments, and business data. A visible frontend control does not replace backend authorization.
+## Components
+
+| Component | Used by | Purpose |
+|---|---|---|
+| `MainLayout.jsx` | `App.jsx` | Authenticated shell: permissions, hash navigation, page rendering, header and sidebar |
+| `Header.jsx` | `MainLayout` | Top bar; checks reporting-manager status; hosts the notification bell |
+| `Sidebar.jsx` | `MainLayout` | Role-aware navigation with collapsible Organization Setup, Attendance and Payroll groups |
+| `AuthLayout.jsx` | Login and password-reset pages | Shared layout for unauthenticated pages |
+| `NotificationBell.jsx` | `Header` | Unread count and notification access; plays `assets/notification.wav` |
+| `NotificationPanel.jsx` | — | Notification panel component present in the source tree; it is not currently imported by any other file |
+| `AttendanceRequestInbox.jsx` | `Attendance` | HR review of employee attendance-correction requests |
+| `MyAttendanceRequests.jsx` | `EmployeeAttendance`, `AttendanceRequestInbox` | Employee attendance-correction requests |
+| `HistoricalAttendanceModal.jsx` | `Attendance` | Historical attendance review and modification |
+| `AttendanceExportModal.jsx` | `UserAttendance` | Select employees and month for the Excel export |
+| `AttendanceDayBreakdown.jsx` | `Profile`, `TeamMemberDetails`, `EmployeeAttendance`, `UserAttendance` | Per-day attendance detail (times, intervals, issues) |
+| `MyAttendanceCalendar.jsx` | `EmployeeAttendance`, `UserAttendance` | Monthly attendance calendar with status legend |
+| `MyHolidayCalendar.jsx` | `Profile` | The signed-in employee's applicable holidays (`/api/my-holidays`) |
+| `EsslAdminSettings.jsx` | `EsslSetup` | ESSL admin UI |
+| `PayslipViewer.jsx` | `PayrollWorkspace`, `EmployeePayslips` | In-app payslip PDF viewing (uses `pdfjs-dist`) |
+
+## Services and utilities
+
+| File | Purpose |
+|---|---|
+| `config/api.js` | `HRONE_API_BASE`, the shared API base URL |
+| `auth.js` | `canManageUsers(user)`; `readStoredSession()` (reads `hrms_session` from `sessionStorage`) |
+| `logout.js` | Server logout call and local session cleanup |
+| `services/authenticatedFetch.js` | `fetch` wrapper that adds the `Authorization: Bearer` header from the stored session |
+| `services/notificationApi.js` | Notification and leave-notification operations (list, unread count, snapshot, lookups, view, acknowledge, star/unstar, hold/resume, delete, viewers) |
+| `services/payrollApi.js` | Payroll API operations |
+| `services/attendanceRequestApi.js` | Attendance-request API operations |
+| `services/attendanceCalendarRange.js` | Shared attendance calendar date-range helpers |
+| `services/attendanceCalendarStatus.js` | Shared attendance calendar status helpers |
+| `services/attendanceHistoryFormat.js` | Formatting of attendance history entries |
+| `services/weeklyOff.js` | Weekly-off helpers (reads `/api/leave/company-policy`) |
+| `services/roleLabels.js` | Role display labels; the stored role `HR Manager` is displayed as **HOD** |
+
+Many pages call the backend directly with `fetch` and `HRONE_API_BASE`; the service modules above group the shared operations.
+
+## Role-based access
+
+Role checks are derived from the signed-in user's `role` (case-insensitive) in `MainLayout.jsx` and `Sidebar.jsx`. These checks control **what the UI shows**; the backend enforces authorization independently and is the source of truth.
+
+| Capability | Roles with access in the UI |
+|---|---|
+| Dashboard | HR Admin, Administrator, HR Manager (HOD), Employee |
+| Organization Setup (Company, Holiday Calendar, Organization Structure) | HR Admin, Administrator |
+| Employees (Employee Master), User Management | HR Admin |
+| Attendance menu | HR Admin, Administrator, HR Manager (HOD), Employee |
+| Daily Attendance, Employee Attendance, WFH Settings, ESSL Attendance Setup | HR Admin, Administrator |
+| My Attendance (as separate item) | HR Admin, Administrator |
+| WFH Attendance | HR Admin, Administrator, HR Manager (HOD), Employee |
+| Leave | HR Admin, Administrator, HR Manager (HOD), Employee |
+| Payroll Dashboard, Employee Salary Setup, Monthly Payroll, Payslip Management (register) | HR Admin |
+| My Payslips | All other roles |
+| Team Members / Team Member Details | Any user the backend reports as a reporting manager (`GET /api/reporting-manager/me`) |
+| Profile, Change Password, Notifications | All signed-in users |
+
+Non-HR-Admin users who open a payroll hash are redirected to `payslip-management`. A rejected page shows `AccessDenied`.
+
+## Backend API usage
+
+The frontend calls the following backend route groups (all relative to `HRONE_API_BASE`). See the project README for the complete backend API reference.
+
+| Prefix | Used for |
+|---|---|
+| `/api/auth/*` | Login, logout, activation, current user, change password, forgot/verify/reset password |
+| `/api/users`, `/api/employees` | User accounts and employee records |
+| `/api/companies`, `/api/organization/me`, `/api/my-holidays` | Organization data and the employee's holidays |
+| `/api/employee-details/*` | Extended employee details |
+| `/api/reporting-manager/*` | Reporting-manager status, approver assignment options, team members and their attendance |
+| `/api/attendance/*` | Daily, monthly, own and per-user attendance; historical edits; Excel export; WFH endpoints |
+| `/api/attendance/essl/*` | ESSL configuration, employee mapping, sync, file import, history and issues |
+| `/api/attendance-requests/*` | Attendance-correction requests |
+| `/api/leave/*` | Leave, permissions, approvals, policies, reports, leave notifications |
+| `/api/notifications/*` | Notifications |
+| `/api/payroll/*` | Salary profiles, payroll records, payslips |
+
+One request leaves the platform: `HolidayCalendarSetup.jsx` calls the public Nager.Date service (`https://date.nager.at/api/v3/PublicHolidays/{year}/{countryCode}`) from the browser to import public holidays.
 
 ## Attendance UI behavior
 
-The frontend attendance experience is backed by shared backend attendance calculations. The UI should present the status and time information returned by the backend rather than independently reimplementing attendance policy.
+The UI presents statuses and times computed by the backend; it must not re-implement attendance policy.
 
-### Attendance statuses
+- **Statuses shown** include Present, Half-Day Present (with First Half / Second Half indications), Absent, Leave, Medical Leave, Holiday, Weekly Off, Not Marked, and attendance-issue indicators for incomplete or inconsistent punch records. The calendar legend is defined in `MyAttendanceCalendar.jsx`.
+- **Not Marked is not Absent.** Empty check-in/check-out does not by itself mean absence; the backend decides the final status using joining date, holidays, leave, weekly off and payroll locks.
+- **Daily Attendance editing** (`Attendance.jsx`) is enabled only for the current day and is disabled for locked records and dates before the employee's joining date. Past dates are handled through `HistoricalAttendanceModal` and the employee's correction requests.
+- **Half-day thresholds** are computed by the backend from the employee's configured Half Day Time: below 50% is Absent, 50%–120% (inclusive) is Half-Day Present, above 120% is treated as a full day. See the project README section [Attendance rules](../README.md#attendance-rules).
+- **Missing times** are shown as unavailable rather than invented.
+- **Excel export** is generated by the backend (`POST /api/attendance/export.xlsx` and `GET /api/attendance/user/{user_id}/export.xlsx`); the frontend only sends the selected employees and month.
 
-The attendance calendar and attendance detail components distinguish the relevant attendance states, including:
+## Styling
 
-- Present.
-- Half-Day Present, including First Half Present and Second Half Present classifications where returned by the backend.
-- Absent.
-- Leave and Medical Leave.
-- Holiday and Weekly Off.
-- Not Marked.
-- Attendance issue indicators for incomplete or inconsistent punch records.
+- Bootstrap 5 CSS and Bootstrap Icons are imported in `main.jsx`.
+- `src/index.css` imports `styles-01.css` … `styles-08.css`. `index.css` contains a comment noting that `styles-02.css` still holds an older icon-only mobile sidebar rule that later rules override; keep that in mind when changing sidebar styles.
+- The layout is responsive, with a mobile sidebar toggle handled in `MainLayout`.
+- `index.html` sets the browser theme colour to `#12345a`.
 
-`Not Marked` must not be displayed as `Absent` merely because both check-in and check-out are empty. The final status depends on the backend's date eligibility and attendance-generation rules. Do not infer absence in a frontend component from empty time fields alone.
+## Production build and deployment
 
-An attendance issue is separate from an attendance status. For example, a date may contain a partial punch record and an issue indicator. The issue detail should identify the missing/inconsistent punch while retaining the actual attendance information. After a punch is corrected, refreshed attendance data should remove the resolved issue indicator.
-
-### Half-Day presentation
-
-The UI displays the Half-Day classification and uses separate visual distinctions for First Half Present and Second Half Present where those classifications are supplied. Calendar symbols and legends should remain consistent across employee attendance, self-service attendance, team attendance, and attendance-day breakdown views.
-
-The configured Half-Day Working Duration and the 80%–150% threshold policy are calculated by the backend. Frontend code should not hardcode employee working-hour thresholds. For the authoritative business rules and examples, see the root [`README.md`](../README.md#working-details-and-half-day-calculation).
-
-### Time and interval details
-
-Attendance detail views can present check-in/check-out times, working intervals, break details, permission information, and early/late checkout values. A missing check-in or check-out should be displayed as unavailable rather than fabricated.
-
-Excel formatting is generated by the backend. The frontend export UI initiates the existing export workflow and should pass the selected employee/month filters without changing report calculations.
-
-## Authentication and API requests
-
-- `src/auth.js` contains frontend authentication/session helpers.
-- `src/services/authenticatedFetch.js` provides the shared authenticated request pattern.
-- `src/config/api.js` centralizes the API base URL.
-- `src/services/notificationApi.js`, `payrollApi.js`, and `attendanceRequestApi.js` group related API operations.
-- `src/services/roleLabels.js` contains role display-name helpers.
-- `src/services/attendanceCalendarRange.js` and `weeklyOff.js` hold shared attendance/calendar utilities.
-- `src/services/attendanceHistoryFormat.js` formats attendance history information.
-
-When adding an API request:
-
-1. Reuse the shared API base URL.
-2. Follow the existing authentication/header pattern.
-3. Handle non-2xx responses and expired sessions.
-4. Display actionable errors without exposing tokens or sensitive backend details.
-5. Keep authorization checks in the backend as well as any frontend visibility checks.
-
-## Build and deployment
-
-Create the production bundle:
-
-```powershell
+```bash
+cd frontend
 npm ci
-npm run build
+npm run build      # output in frontend/dist/
 ```
 
-Vite writes the output to `frontend/dist/`. Deploy the contents of `dist/` to the chosen static hosting service or web server.
+Deploy the contents of `dist/` to a static host or web server. Requirements:
 
-Production deployment must also provide:
+1. **API URL.** Set `VITE_API_BASE_URL` at build time to the public backend URL, unless the web server serves `/api` from the same origin (in which case it must also proxy `/api` to the backend, and you must still set `VITE_API_BASE_URL` to that origin, because a production build without it falls back to `http://127.0.0.1:8000`).
+2. **SPA fallback.** The public pages (`/login`, `/activate`, `/forgot-password`, `/verify-reset-otp`, `/reset-password`, `/wfh-email-verification`) are real URL paths that links in emails point to. Configure the server to return `index.html` for these paths.
+3. **CORS.** Add the deployed frontend origin to the backend `CORS_ALLOWED_ORIGINS`.
+4. **HTTPS.** Serve the frontend over HTTPS; the WFH page needs camera and location access, which browsers restrict to secure contexts. Set the backend `FRONTEND_URL` to the deployed frontend URL so emailed links point to it.
+5. Rebuild whenever `VITE_*` values change.
 
-- A production API URL through the build-time `VITE_API_BASE_URL`.
-- HTTPS for the frontend and API.
-- Backend CORS configuration for the deployed frontend origin.
-- Correct reverse-proxy routing if `/api` is served through the same origin.
-- A deployment process that rebuilds the frontend when environment configuration changes.
-
-Do not deploy `.env.local`, `node_modules/`, or development-only files as static site content.
+Do not deploy `node_modules/`, `.env*.local` files or other development files.
 
 ## Development conventions
 
-- Keep shared UI in `src/components/` and route-level screens in `src/pages/`.
-- Reuse existing service modules instead of duplicating API URL, authentication, notification, and date-formatting logic.
-- Keep responsive behavior in the existing CSS system and test narrow mobile, tablet, and desktop widths.
-- Use accessible labels for inputs, clear validation messages, keyboard-operable controls, and visible focus states.
-- Avoid hardcoding role names or permission assumptions in multiple components; use the existing role/permission helpers and backend authorization.
-- Preserve existing API contracts unless backend and frontend changes are coordinated.
-- Keep attendance status and duration policy in shared backend calculations; avoid creating a second, conflicting frontend calculation.
-- Do not commit generated build output, dependencies, local secrets, or employee data.
+- Route-level screens go in `src/pages/`; reusable UI in `src/components/`; shared API/helpers in `src/services/`.
+- To add a page: create the component, add its name to `allowedPages` in `MainLayout.jsx`, render it in `MainLayout`'s page switch with the appropriate permission check, and add a `Sidebar.jsx` entry if it needs navigation.
+- Reuse `HRONE_API_BASE` and the authenticated-request pattern (`authenticatedFetch`) instead of hardcoding URLs or headers.
+- Treat frontend role checks as presentation only; keep authorization in the backend.
+- Do not duplicate attendance, leave or payroll rules in the UI; display backend results.
+- Do not commit `dist/`, `node_modules/`, local environment files or employee data.
 
 ## Troubleshooting
 
-### Vite starts but API requests fail
+**Login or data requests fail**
+- Confirm the backend is running (default port 8000) and MongoDB is reachable from it.
+- In development, check that `VITE_BACKEND_PROXY_TARGET` (if set) points at the backend. In production builds, check `VITE_API_BASE_URL`.
+- Check backend CORS settings and the browser network tab. Restart Vite after environment changes.
 
-- Confirm the backend is running on port 8000.
-- Check `VITE_API_BASE_URL` in `.env.local`.
-- Confirm the browser can reach the backend host.
-- Check backend CORS settings and browser developer tools.
-- Restart Vite after changing environment variables.
+**Port 5173 already in use**
+- `strictPort` is enabled. Stop the other process, or change the port in `vite.config.js` and update the backend CORS allowlist (note that the backend's default private-LAN CORS pattern is tied to port 5173).
 
-### Port 5173 is already in use
+**A page or menu item is missing**
+- Check the signed-in role against [Role-based access](#role-based-access). Team Members requires the backend to report the user as a reporting manager.
+- Opening `#employee-details` or `#team-member-details` directly (for example by refreshing) shows Access Denied because the selected employee is held in memory.
 
-The Vite server uses `strictPort: true`. Stop the process using the port or update `vite.config.js` and the backend CORS allowlist together.
+**Signed out after closing the tab or restarting the backend**
+- The browser session is stored in `sessionStorage`, and the backend keeps login sessions in memory (see the project README), so a backend restart invalidates all tokens.
 
-### A page or button does not appear
+**WFH page cannot use the camera or location**
+- Use HTTPS (or `localhost`) and grant the browser permissions. See [HTTPS in development](#https-in-development).
 
-- Confirm the correct route/component is being rendered.
-- Check the logged-in role and permissions returned by the backend.
-- Check browser console errors and failed API requests.
-- Confirm that the running frontend was rebuilt/restarted after source changes.
-- Remember that frontend visibility and backend authorization are separate checks.
+**Production links such as `/reset-password` return 404**
+- Add the SPA fallback to `index.html` on the web server.
 
-### Attendance status or calendar symbol looks incorrect
-
-- Refresh the attendance data and inspect the API response for the affected date.
-- Confirm the backend status and issue fields rather than deriving status from empty time fields in the UI.
-- Check employee joining date, scheduled working details, weekly-off/holiday/leave status, and payroll-lock rules.
-- Check the backend attendance calculation and date/timezone handling before changing frontend presentation.
-
-### Production build fails
-
-```powershell
-npm ci
-npm run build
-```
-
-Read the first Vite/JavaScript error. Confirm the Node.js version is compatible with the Vite version in the lockfile and that dependencies installed successfully.
+**Build fails**
+- Run `npm ci` and read the first reported error; confirm the Node.js version suits Vite 8.
