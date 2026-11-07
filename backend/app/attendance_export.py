@@ -39,15 +39,22 @@ def _time_text(value: Any) -> str:
     if value in (None, "", "—", "-"):
         return "—"
     raw = str(value).strip()
-    # Preserve already formatted clock strings and convert 24-hour HH:MM values.
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", raw)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", raw)
     if match:
-        hour, minute = int(match.group(1)), int(match.group(2))
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return datetime(2000, 1, 1, hour, minute).strftime("%I:%M %p")
+        hour, minute, second = int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+        if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
+            return f"{hour:02d}:{minute:02d}:{second:02d}"
+    for clock_format in ("%I:%M:%S %p", "%I:%M %p"):
+        try:
+            return datetime.strptime(raw.upper(), clock_format).strftime("%H:%M:%S")
+        except ValueError:
+            pass
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return parsed.strftime("%I:%M %p")
+        if parsed.tzinfo is not None:
+            from zoneinfo import ZoneInfo
+            parsed = parsed.astimezone(ZoneInfo("Asia/Kolkata"))
+        return parsed.strftime("%H:%M:%S")
     except ValueError:
         return raw
 
@@ -372,7 +379,7 @@ def build_multi_employee_attendance_workbook(
                     # Strip legacy descriptive labels such as "Tea Break:" or
                     # "Break 1:", but never mistake the colon in a clock time
                     # (11:30 AM) for a label separator.
-                    if re.match(r"^(?:break\\s*\\d+|.*\\bbreak)\\s*:", line, re.IGNORECASE):
+                    if re.match(r"^(?:break\\s*\d+|.*\\bbreak)\\s*:", line, re.IGNORECASE):
                         line = line.split(":", 1)[1].strip()
                     break_lines.append(f"B{index}: {line}")
             date_text = day.strftime("%d-%b-%Y") + (" ⚠" if item.get("has_attendance_issue") else "")
@@ -383,8 +390,8 @@ def build_multi_employee_attendance_workbook(
                 _duration_text(int(item.get("total_duration_minutes") or 0)),
                 _duration_text(int(item.get("working_minutes") or 0)),
                 _duration_text(int(item.get("break_minutes") or 0)),
-                "\\n".join(interval_lines) or "—",
-                "\\n".join(break_lines) or "No break intervals recorded",
+                "\n".join(interval_lines) or "—",
+                "\n".join(break_lines) or "No break intervals recorded",
                 permission_text,
                 _attendance_type_text(item.get("attendance_type")),
                 item.get("attendance_source_label") or item.get("attendance_source") or "—",
@@ -400,7 +407,7 @@ def build_multi_employee_attendance_workbook(
             for col, value in enumerate(values, 1):
                 cell = ws.cell(current_row, col, value)
                 cell.alignment = Alignment(
-                    vertical="center",
+                    vertical="top" if col in (9, 10) else "center",
                     horizontal="left" if col in (9, 10, 20, 21) else "center",
                     wrap_text=col in (9, 10, 11, 20, 21),
                 )
@@ -414,7 +421,7 @@ def build_multi_employee_attendance_workbook(
                     if fill:
                         cell.fill = PatternFill("solid", fgColor=fill)
             multiline_counts = [str(values[index] or "").count("\n") + 1 for index in (8, 9, 16, 19, 20)]
-            ws.row_dimensions[current_row].height = max(30, min(120, 18 * max(multiline_counts or [1])))
+            ws.row_dimensions[current_row].height = max(30, min(180, 22 * max(multiline_counts or [1])))
             current_row += 1
 
         last_data_row = current_row - 1

@@ -42,6 +42,18 @@ function formatDateTime(value) {
   });
 }
 
+function describeApiError(data, fallback) {
+  const detail = data?.detail ?? data?.message ?? data?.error;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item?.msg || item?.message || JSON.stringify(item)).join("; ");
+  }
+  if (detail && typeof detail === "object") {
+    return detail.message || detail.msg || JSON.stringify(detail);
+  }
+  return fallback;
+}
+
 function EsslAdminSettings({ session }) {
   const token = session?.token;
   const [config, setConfig] = useState(emptyConfig);
@@ -66,6 +78,7 @@ function EsslAdminSettings({ session }) {
   const [importPreview, setImportPreview] = useState(null);
   const [mappingSearch, setMappingSearch] = useState("");
   const [mappingDepartment, setMappingDepartment] = useState("all");
+  const [selectedEmployeeIds, setSelectedEmployeeIds] = useState(() => new Set());
   const [savingMappingId, setSavingMappingId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -76,6 +89,8 @@ function EsslAdminSettings({ session }) {
   const mappingDepartments = [...new Set(
     employees.map((employee) => String(employee.department || "").trim()).filter(Boolean),
   )].sort((a, b) => a.localeCompare(b));
+  const mappedEmployees = employees.filter((employee) => Boolean(String(employee.saved_essl_employee_id || "").trim()) && employee.is_active !== false && String(employee.essl_employee_id || "").trim() === String(employee.saved_essl_employee_id || "").trim());
+  const selectedMappedCount = mappedEmployees.filter((employee) => selectedEmployeeIds.has(employee.user_id)).length;
   const filteredEmployees = employees.filter((employee) => {
     const query = mappingSearch.trim().toLocaleLowerCase();
     const searchable = [
@@ -120,7 +135,7 @@ function EsslAdminSettings({ session }) {
         ]);
       setError("");
       setConfig({ ...emptyConfig, ...savedConfig });
-      setEmployees(savedEmployees);
+      setEmployees(savedEmployees.map((employee) => ({ ...employee, saved_essl_employee_id: employee.essl_employee_id || "" })));
       setHistory(savedHistory);
       setIssues(savedIssues);
     } catch (loadError) {
@@ -533,14 +548,22 @@ function EsslAdminSettings({ session }) {
               </select>
             </div>
           </div>
+          <div className="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+            <div className="small"><strong>{selectedMappedCount}</strong> selected / <strong>{mappedEmployees.length}</strong> valid mapped employees</div>
+            <div className="d-flex gap-2">
+              <button type="button" className="btn btn-sm btn-outline-primary" disabled={!mappedEmployees.length} onClick={() => setSelectedEmployeeIds(new Set(mappedEmployees.map((item) => item.user_id)))}>Select All</button>
+              <button type="button" className="btn btn-sm btn-outline-secondary" disabled={selectedMappedCount === 0} onClick={() => setSelectedEmployeeIds(new Set())}>Deselect All</button>
+            </div>
+          </div>
           <div className="table-responsive essl-employee-mapping-scroll" style={{ height: `${Math.min(460, Math.max(180, employees.length * 40 + 44))}px`, maxHeight: "460px", overflowY: "auto", overflowX: "auto", overscrollBehavior: "contain" }}>
             <table className="table table-sm table-hover align-middle mb-0">
               <thead className="table-light" style={{ position: "sticky", top: 0, zIndex: 2 }}>
-                <tr><th>Employee Name</th><th>Employee ID</th><th>Role</th><th>Department</th><th>ESSL Employee Code</th><th>Mapping Status</th><th>Action</th></tr>
+                <tr><th><input type="checkbox" className="form-check-input" aria-label="Select all mapped employees" checked={mappedEmployees.length > 0 && selectedMappedCount === mappedEmployees.length} onChange={(event) => setSelectedEmployeeIds(event.target.checked ? new Set(mappedEmployees.map((item) => item.user_id)) : new Set())} /></th><th>Employee Name</th><th>Employee ID</th><th>Role</th><th>Department</th><th>ESSL Employee Code</th><th>Mapping Status</th><th>Action</th></tr>
               </thead>
               <tbody>
                 {filteredEmployees.map((employee) => (
-                  <tr key={employee.user_id}>
+                  <tr key={employee.user_id} className={selectedEmployeeIds.has(employee.user_id) ? "table-primary" : ""}>
+                    <td><input type="checkbox" className="form-check-input" aria-label={`Select ${employee.name || employee.employee_id}`} disabled={!String(employee.saved_essl_employee_id || "").trim() || String(employee.essl_employee_id || "").trim() !== String(employee.saved_essl_employee_id || "").trim() || employee.is_active === false} checked={selectedEmployeeIds.has(employee.user_id)} onChange={(event) => setSelectedEmployeeIds((current) => { const next = new Set(current); if (event.target.checked) next.add(employee.user_id); else next.delete(employee.user_id); return next; })} /></td>
                     <td>{employee.name || "—"}{!employee.is_active && <span className="badge text-bg-secondary ms-2">Inactive</span>}</td>
                     <td>{employee.employee_id || "—"}</td>
                     <td>{roleLabel(employee.role) || "—"}</td>
@@ -561,7 +584,7 @@ function EsslAdminSettings({ session }) {
                     </button></td>
                   </tr>
                 ))}
-                {filteredEmployees.length === 0 && <tr><td colSpan="7" className="text-center text-muted py-4">No employees match the selected search or department.</td></tr>}
+                {filteredEmployees.length === 0 && <tr><td colSpan="8" className="text-center text-muted py-4">No employees match the selected search or department.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -570,7 +593,7 @@ function EsslAdminSettings({ session }) {
         <div className="border rounded p-3 mb-4">
           <h5>Import ESSL Attendance File</h5>
           <p className="text-muted small mb-3">
-            Upload the original eTimeTrackLite daily report. The importer detects each repeated date section and its IN/OUT columns. Review the preview and resolve unmapped employees before importing. Re-importing reconciles file-import punches for employee/date pairs in the report; API punches and protected manual/WFH attendance are preserved.
+            Upload the original eTimeTrackLite report, select the mapped employees to process, then review the preview. Only selected employees are processed. Valid imported punches reconcile conflicting system-generated attendance for represented dates; missing dates are not deleted and protected manual/WFH attendance is preserved.
           </p>
           <div className="row g-2 align-items-end">
             <div className="col-md-8">
@@ -615,6 +638,7 @@ function EsslAdminSettings({ session }) {
                   <div className="col-sm-4">Department differences: {importPreview.department_mismatch_count || 0}</div>
                   <div className="col-sm-4">Invalid time values: {importPreview.invalid_punch_values}</div>
                 </div>
+                {importPreview.document_coverage && !importPreview.document_coverage.complete_month && <div className="mt-2 text-warning-emphasis">Document coverage is incomplete for the reporting month ({importPreview.document_coverage.covered_dates} date(s) represented). Existing attendance on dates without imported punches will remain unchanged; no missing punches or attendance deletions will be generated.</div>}
                 {importPreview.unmapped_employee_count > 0 && <div className="mt-2 text-danger">
 Only employees with saved ESSL mappings will be imported. You can import mapped employees now and map the remaining employees later; unmapped employees will be skipped and listed in the result.
                 </div>}
@@ -626,13 +650,14 @@ Only employees with saved ESSL mappings will be imported. You can import mapped 
               <div className="table-responsive mb-3" style={{ maxHeight: "240px", overflowY: "auto" }}>
                 <table className="table table-sm table-hover align-middle">
                   <thead className="table-light" style={{ position: "sticky", top: 0, zIndex: 1 }}>
-                    <tr><th>ESSL Code</th><th>ESSL Name</th><th>ESSL Department</th><th>HRMS Employee</th><th>HRMS Department</th><th>Status</th></tr>
+                    <tr><th>Selected</th><th>ESSL Code</th><th>ESSL Name</th><th>ESSL Department</th><th>HRMS Employee</th><th>HRMS Department</th><th>Payroll</th><th>Mapping Status</th></tr>
                   </thead>
                   <tbody>{(importPreview.employees || []).map((item) => (
-                    <tr key={item.essl_employee_id}>
-                      <td>{item.essl_employee_id}</td><td>{item.name || "—"}</td><td>{item.department || "—"}</td>
+                    <tr key={item.essl_employee_id} className={item.hrms_user_id && selectedEmployeeIds.has(item.hrms_user_id) ? "table-primary" : ""}>
+                      <td>{item.hrms_user_id && selectedEmployeeIds.has(item.hrms_user_id) ? "Yes" : "No"}</td><td>{item.essl_employee_id}</td><td>{item.name || "—"}</td><td>{item.department || "—"}</td>
                       <td>{item.hrms_employee_name ? `${item.hrms_employee_name} (${item.hrms_employee_id})` : "—"}</td>
                       <td>{item.hrms_department || "—"}</td>
+                      <td><span className={`badge ${item.payroll_locked ? "text-bg-danger" : "text-bg-secondary"}`}>{item.payroll_status || "Unknown"}</span></td>
                       <td><span className={`badge ${item.mapping_status === "mapped" ? "text-bg-success" : item.mapping_status === "department_mismatch" ? "text-bg-warning" : "text-bg-danger"}`}>{item.mapping_status === "department_mismatch" ? "Department differs" : item.mapping_status}</span></td>
                     </tr>
                   ))}</tbody>
@@ -651,17 +676,41 @@ Only employees with saved ESSL mappings will be imported. You can import mapped 
                   ))}</tbody>
                 </table>
               </div>
-              <button type="button" className="btn btn-primary" disabled={importing || (importPreview.mapped_employee_count ?? ((importPreview.employees || []).filter((item) => item.mapping_status !== "unmapped").length)) === 0}
+              <div className="alert alert-secondary py-2"><strong>Selected for import:</strong> {(importPreview.employees || []).filter((item) => item.hrms_user_id && selectedEmployeeIds.has(item.hrms_user_id) && item.mapping_status !== "unmapped").length} employee(s). Only these selected mappings will be sent to the server.</div>
+              <button type="button" className="btn btn-primary" disabled={importing || selectedMappedCount === 0 || !(importPreview.employees || []).some((item) => item.hrms_user_id && selectedEmployeeIds.has(item.hrms_user_id) && item.mapping_status !== "unmapped")}
                 onClick={async () => {
                   try {
                     setImporting(true); setError(""); setNotice(""); setImportSummary(null);
-                    const formData = new FormData(); formData.append("file", importFile);
-                    const response = await fetch(`${ESSL_API_URL}/import-file`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: formData });
-                    const data = await response.json().catch(() => ({}));
-                    if (!response.ok) throw new Error(data?.detail || "Attendance file import failed.");
+                    const selectedForImport = (importPreview.employees || [])
+                      .filter((item) => item.hrms_user_id && selectedEmployeeIds.has(item.hrms_user_id) && item.mapping_status !== "unmapped")
+                      .map((item) => item.hrms_user_id);
+                    if (!selectedForImport.length) throw new Error("Please select at least one mapped employee to import attendance.");
+                    const formData = new FormData();
+                    formData.append("file", importFile);
+                    formData.append("selected_employee_ids", JSON.stringify(selectedForImport));
+                    let response;
+                    try {
+                      response = await fetch(`${ESSL_API_URL}/import-file`, {
+                        method: "POST",
+                        headers: { Authorization: `Bearer ${token}` },
+                        body: formData,
+                      });
+                    } catch (networkError) {
+                      throw new Error("Could not reach the HRMS server. Check that the backend is running and the network connection is available. Your selected file and preview have been retained.");
+                    }
+                    const responseText = await response.text();
+                    let data = {};
+                    try { data = responseText ? JSON.parse(responseText) : {}; }
+                    catch { data = { message: responseText }; }
+                    if (!response.ok) {
+                      throw new Error(describeApiError(data, `Attendance import failed (HTTP ${response.status}).`));
+                    }
                     setImportSummary(data);
-                    setNotice("Attendance file imported. Review the result summary below.");
-                    await loadAdminData();
+                    setNotice("Attendance import processing finished. Review imported, skipped, and failed records below.");
+                    try { await loadAdminData(); }
+                    catch (refreshError) {
+                      setError("Attendance import completed, but the page could not refresh its latest data. Reload the page to see the updated attendance.");
+                    }
                   } catch (importError) {
                     setError(importError.message || "Attendance file import failed.");
                   } finally { setImporting(false); }
@@ -672,16 +721,45 @@ Only employees with saved ESSL mappings will be imported. You can import mapped 
                 <div className="alert alert-success mt-3 mb-0">
                   <strong>Import completed</strong>
                   <div className="row mt-2 g-2">
+                    <div className="col-md-4">Total mapped employees: {importSummary.total_mapped_employees ?? 0}</div>
+                    <div className="col-md-4">Selected employees: {importSummary.selected_employees ?? 0}</div>
+                    <div className="col-md-4">Eligible employees: {importSummary.eligible_employees ?? 0}</div>
+                    <div className="col-md-4">Payroll-locked employees: {importSummary.payroll_locked_employees ?? 0}</div>
+                    <div className="col-md-4">Unselected employees: {importSummary.unselected_employees ?? 0}</div>
+                    <div className="col-md-4">Employees in file: {importSummary.total_employees ?? 0}</div>
+                    <div className="col-md-4">Attendance dates: {importSummary.total_attendance_dates ?? 0}</div>
+                    <div className="col-md-4">Total Excel rows: {importSummary.total_excel_rows ?? importSummary.rows_with_punches}</div>
                     <div className="col-md-4">Punch rows found: {importSummary.rows_with_punches}</div>
                     <div className="col-md-4">Punches imported: {importSummary.punches_imported}</div>
+                    <div className="col-md-4">Valid punch records: {importSummary.valid_punch_records ?? importSummary.punches_imported}</div>
+                    <div className="col-md-4">Empty punch dates: {importSummary.empty_punch_records ?? 0}</div>
                     <div className="col-md-4">Duplicates in file: {importSummary.duplicate_punches_in_file}</div>
                     <div className="col-md-4">Invalid time values: {importSummary.invalid_punch_values}</div>
                     <div className="col-md-4">Attendance created: {importSummary.attendance_records_created}</div>
                     <div className="col-md-4">Attendance updated: {importSummary.attendance_records_updated}</div>
+                    <div className="col-md-4">Attendance recalculated: {importSummary.recalculated_attendance_records ?? 0}</div>
                     <div className="col-md-4">Protected existing records: {importSummary.attendance_records_protected}</div>
                     <div className="col-md-4">Skipped (before joining date): {importSummary.punches_skipped_before_joining ?? 0}</div>
+                    <div className="col-md-4">Payroll-locked records: {importSummary.payroll_locked_records ?? 0}</div>
+                    <div className="col-md-4">Other skipped records: {importSummary.skipped_records ?? 0}</div>
+                    <div className="col-md-4">Failed records: {importSummary.failed_records ?? 0}</div>
                   </div>
                   {importSummary.unmatched_employee_ids?.length > 0 && <div className="mt-2"><strong>Unmapped ESSL IDs:</strong> {importSummary.unmatched_employee_ids.join(", ")}</div>}
+                  {importSummary.row_results?.length > 0 && (
+                    <details className="mt-3">
+                      <summary className="fw-semibold">View employee/date processing details ({importSummary.row_results.length})</summary>
+                      <div className="table-responsive mt-2" style={{ maxHeight: "280px", overflowY: "auto" }}>
+                        <table className="table table-sm table-bordered align-middle mb-0">
+                          <thead className="table-light"><tr><th>Employee ID</th><th>Attendance Date</th><th>Result</th><th>Reason</th></tr></thead>
+                          <tbody>{importSummary.row_results.map((item, index) => (
+                            <tr key={`${item.employee_id}-${item.attendance_date}-${item.result}-${index}`}>
+                              <td>{item.employee_id || "—"}</td><td>{item.attendance_date || "—"}</td><td>{item.result || "—"}</td><td>{item.reason || "—"}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
             </div>

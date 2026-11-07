@@ -475,22 +475,28 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         self.set_weekly_offs([])
         days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
         # Medical Leave is independent of Weekly Off usage.
-        self.assertEqual(days["2026-09-07"]["request_options"], ["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave"])
+        self.assertEqual(days["2026-09-07"]["request_options"], ["Present", "Half-Day Present", "Absent", "Holiday", "Medical Leave", "Permission"])
         self.assertFalse(any("Weekly Off" in note and "Medical Leave" in note for note in days["2026-09-07"]["option_notes"]))
+        # The calendar may materialize automatic weekly-off rows; clear these
+        # fixture dates before inserting the explicit statuses tested below.
+        db["attendance"].delete_many({
+            "user_id": str(self.other["_id"]),
+            "attendance_date": {"$in": ["2026-09-08", "2026-09-09", "2026-09-10"]},
+        })
         db["attendance"].insert_many([
             {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-08", "status": "Absent"},
             {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-09", "status": "Weekly Off"},
             {"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-10", "status": "Present", "check_in_time": "09:00", "check_out_time": "18:00"},
         ])
         days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
-        self.assertEqual(days["2026-09-08"]["request_options"], ["Present", "Holiday", "Weekly Off"])
-        self.assertEqual(days["2026-09-09"]["request_options"], ["Present", "Absent"])
-        self.assertEqual(days["2026-09-10"]["request_options"], ["Present", "Absent", "Weekly Off"])
+        self.assertEqual(days["2026-09-08"]["request_options"], ["Present", "Half-Day Present", "Holiday", "Medical Leave", "Permission"])
+        self.assertEqual(days["2026-09-09"]["request_options"], ["Present", "Medical Leave", "Absent"])
+        self.assertEqual(days["2026-09-10"]["request_options"], ["Present", "Half-Day Present", "Absent", "Medical Leave", "Permission"])
         # Four configured Sundays use the allowance: Medical Leave replaces Weekly Off.
         self.set_weekly_offs(["sunday"])
         days = {d["attendance_date"]: d for d in ar.my_attendance_calendar(2026, 9, self.other["auth"])["days"]}
-        self.assertEqual(days["2026-09-08"]["request_options"], ["Present", "Holiday", "Medical Leave"])
-        self.assertEqual(days["2026-09-10"]["request_options"], ["Present", "Absent", "Medical Leave"])
+        self.assertEqual(days["2026-09-08"]["request_options"], ["Present", "Half-Day Present", "Holiday", "Medical Leave", "Permission"])
+        self.assertEqual(days["2026-09-10"]["request_options"], ["Present", "Half-Day Present", "Absent", "Medical Leave", "Permission"])
 
     def test_present_time_correction_is_applied_only_after_hr_approval(self):
         employee_id = str(self.employee["_id"])
@@ -539,26 +545,16 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
 
     # -- Monthly limits -----------------------------------------------------
 
-    def test_automatic_weekly_off_upsert_does_not_conflict_on_employee_id(self):
-        # The no-existing-record path performs an upsert. employee_id is set
-        # through $set (for both inserts and updates), never again in
-        # $setOnInsert, which would trigger MongoDB ConflictingUpdateOperators.
+    def test_automatic_weekly_off_generation_is_disabled(self):
+        # Weekly Off records are now manual-only; calendar/payroll reads must
+        # never create AUTO_WEEKLY_OFF attendance records.
         created = ar._ensure_monthly_auto_weekly_offs(self.employee, 2026, 9)
-        self.assertGreater(created, 0)
-        generated = list(db["attendance"].find({
-            "user_id": str(self.employee["_id"]),
-            "attendance_source": "AUTO_WEEKLY_OFF",
-            "attendance_date": {"$gte": "2026-09-01", "$lte": "2026-09-30"},
-        }))
-        self.assertLessEqual(len(generated), 4)
-        self.assertTrue(all(row.get("employee_id") == "E-201" for row in generated))
-        # Finalization is idempotent and must not create duplicates on restart.
-        self.assertEqual(ar._ensure_monthly_auto_weekly_offs(self.employee, 2026, 9), 0)
+        self.assertEqual(created, 0)
         self.assertEqual(db["attendance"].count_documents({
             "user_id": str(self.employee["_id"]),
             "attendance_source": "AUTO_WEEKLY_OFF",
             "attendance_date": {"$gte": "2026-09-01", "$lte": "2026-09-30"},
-        }), len(generated))
+        }), 0)
 
     def test_weekly_off_limit_of_four_per_month(self):
         self.set_weekly_offs([])
@@ -714,7 +710,7 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         db["attendance"].insert_one({"user_id": str(self.other["_id"]), "employee_id": "E-202", "attendance_date": "2026-09-01",
                                      "status": "Leave", "leave_type_code": "ML", "medical_leave": True})
         day = self.calendar_day(self.other, "2026-09-07")
-        self.assertEqual(day["request_options"], ["Present", "Absent", "Holiday"])
+        self.assertEqual(day["request_options"], ["Present", "Half-Day Present", "Absent", "Holiday", "Permission"])
         self.assertEqual(len(day["option_notes"]), 2)
 
     def test_response_is_serialized_per_employee_and_month(self):
@@ -743,6 +739,99 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         self.assertEqual(len(ar.list_attendance_requests(None, "bala", None, None, None, self.hr["auth"])), 1)
         self.assertEqual(len(ar.list_attendance_requests(None, None, "finance", "2026-09", None, self.hr["auth"])), 2)
         self.assertEqual(len(ar.list_attendance_requests(None, None, None, None, date(2026, 9, 8), self.hr["auth"])), 1)
+
+    def test_half_day_request_approval_persists_both_halves_and_fractional_payroll(self):
+        schedule = {
+            "scheduled_work_start_time": "09:00",
+            "scheduled_work_end_time": "18:00",
+            "scheduled_work_duration": 480,
+            "half_day_working_duration": 240,
+        }
+        request_payload = ar.AttendanceRequestCreate(dates=[{
+            "attendance_date": "2026-09-07",
+            "requested_status": "Half-Day Present",
+            "requested_first_half_status": "Present",
+            "requested_second_half_status": "Absent",
+            "requested_first_half_check_in_time": "09:00",
+            "requested_first_half_check_out_time": "12:00",
+        }])
+        response_payload = ar.AttendanceRequestResponsePayload(decisions=[{
+            "attendance_date": "2026-09-07",
+            "action": "approve",
+            "final_status": "Half-Day Present",
+            "final_first_half_status": "Present",
+            "final_second_half_status": "Absent",
+            "final_first_half_check_in_time": "09:00",
+            "final_first_half_check_out_time": "12:00",
+        }])
+
+        with patch("app.working_details.applicable_schedule", return_value=schedule), \
+                patch.object(attendance_module, "applicable_schedule", return_value=schedule), \
+                patch.object(attendance_module, "company_today", return_value=TODAY):
+            before = payroll._attendance_summary_for_employee("E-201", 9, 2026)
+            created = ar.create_attendance_request(request_payload, self.employee["auth"])
+            self.assertEqual(db["attendance"].count_documents({
+                "user_id": str(self.employee["_id"]), "attendance_date": "2026-09-07",
+            }), 0)
+
+            result = ar.respond_to_attendance_request(created["id"], response_payload, self.hr["auth"])
+            self.assertEqual(result["status"], "approved")
+            record = db["attendance"].find_one({
+                "user_id": str(self.employee["_id"]), "attendance_date": "2026-09-07",
+            })
+            self.assertEqual(record["status"], "Half-Day Present")
+            self.assertEqual((record["first_half_status"], record["second_half_status"]), ("Present", "Absent"))
+            self.assertEqual((record["first_half_check_in_time"], record["first_half_check_out_time"]), ("09:00", "12:00"))
+            self.assertEqual(record["half_day_present"], "Yes – First Half")
+            self.assertEqual(record["actual_working_minutes"], 180)
+
+            after = payroll._attendance_summary_for_employee("E-201", 9, 2026)
+            self.assertEqual(after["present_days"], before["present_days"] + 0.5)
+            self.assertEqual(after["absent_days"], before["absent_days"] + 0.5)
+            response = attendance_module._to_response(record, self.employee)
+            self.assertEqual(response["first_half_status"], "Present")
+            self.assertEqual(response["second_half_status"], "Absent")
+
+    def test_historical_half_day_modification_persists_and_retrieves_portions(self):
+        db["permissions"].insert_one({
+            "role_id": "hr_admin",
+            "permission": "attendance.historical.modify",
+        })
+        schedule = {
+            "scheduled_work_start_time": "09:00",
+            "scheduled_work_end_time": "18:00",
+            "scheduled_work_duration": 480,
+            "half_day_working_duration": 240,
+        }
+        update = attendance_module.HistoricalAttendanceUpdate(
+            user_id=str(self.employee["_id"]),
+            attendance_date="2026-09-11",
+            status="Half-Day Present",
+            first_half_status="Present",
+            second_half_status="Absent",
+            first_half_check_in_time="09:00",
+            first_half_check_out_time="12:00",
+            modification_reason="Correct first-half attendance",
+        )
+        with patch.object(attendance_module, "company_today", return_value=TODAY), \
+                patch.object(attendance_module, "applicable_schedule", return_value=schedule):
+            result = attendance_module.modify_historical_attendance(update, self.hr["auth"])
+            self.assertTrue(result["changed"])
+            record = db["attendance"].find_one({
+                "user_id": str(self.employee["_id"]), "attendance_date": "2026-09-11",
+            })
+            self.assertEqual(record["status"], "Half-Day Present")
+            self.assertEqual(record["first_half_status"], "Present")
+            self.assertEqual(record["second_half_status"], "Absent")
+            self.assertEqual(record["half_day_present"], "Yes – First Half")
+            self.assertEqual(record["actual_working_minutes"], 180)
+            self.assertEqual(result["record"]["first_half_status"], "Present")
+            self.assertEqual(result["record"]["second_half_status"], "Absent")
+            history = db["attendance_modification_history"].find_one({
+                "user_id": str(self.employee["_id"]), "attendance_date": "2026-09-11",
+            })
+            self.assertIn("first_half_status", history["changes"])
+            self.assertIn("second_half_status", history["changes"])
 
 
 if __name__ == "__main__":

@@ -5,12 +5,14 @@ import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import MyHolidayCalendar from "../components/MyHolidayCalendar";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
 import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
+import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
+import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
 import { roleLabel } from "../services/roleLabels";
 
 const API_URL = HRONE_API_BASE + "/api/auth/me";
 
 const ATTENDANCE_API_URL =
-  HRONE_API_BASE + "/api/attendance/my";
+  HRONE_API_BASE + "/api/attendance-requests/calendar";
 
 const LEAVE_API_URL =
   HRONE_API_BASE + "/api/leave";
@@ -410,11 +412,7 @@ function Profile({ onNavigate }) {
         const attendanceData =
           await attendanceResponse.json();
 
-        setAttendance(
-          Array.isArray(attendanceData)
-            ? attendanceData
-            : [],
-        );
+        setAttendance(Array.isArray(attendanceData?.days) ? attendanceData.days : []);
 
         /*
          * --------------------------------------------------------
@@ -560,9 +558,19 @@ function Profile({ onNavigate }) {
    */
 
   const statusColors = {
+    halfday: {
+      background: "#dbeafe",
+      text: "#1e40af",
+    },
+
     present: {
       background: "#198754",
       text: "#ffffff",
+    },
+
+    wfh: {
+      background: "#cff4fc",
+      text: "#055160",
     },
 
     absent: {
@@ -573,6 +581,11 @@ function Profile({ onNavigate }) {
     leave: {
       background: "#6f42c1",
       text: "#ffffff",
+    },
+
+    medicalleave: {
+      background: "#f3e8ff",
+      text: "#6b21a8",
     },
 
     holiday: {
@@ -593,6 +606,11 @@ function Profile({ onNavigate }) {
     notmarked: {
       background: "#F0E0C8",
       text: "#7a5a2f",
+    },
+
+    other: {
+      background: "#f8f9fa",
+      text: "#6c757d",
     },
   };
 
@@ -955,37 +973,8 @@ function Profile({ onNavigate }) {
    */
 
   const getStatusKey = (record) => {
-    const statusValue =
-      record?.status?.toLowerCase();
-
-    if (statusValue === "present") {
-      return "present";
-    }
-
-    if (statusValue === "absent") {
-      return "absent";
-    }
-
-    if (
-      statusValue === "leave" ||
-      record?.is_approved_leave
-    ) {
-      return "leave";
-    }
-
-    if (statusValue === "holiday") {
-      return "holiday";
-    }
-
-    if (statusValue === "weekly off") {
-      return "weeklyoff";
-    }
-
-    if (statusValue === "not applicable") {
-      return "notapplicable";
-    }
-
-    return "notmarked";
+    const key = attendanceCalendarStatusKey(record);
+    return key === "other" ? "notmarked" : key;
   };
 
   /*
@@ -1000,21 +989,11 @@ function Profile({ onNavigate }) {
       return "";
     }
 
-    if (statusKey === "leave") {
-      return record.leave_type_code || "Leave";
+    if (statusKey === "holiday" && !record?.holiday_name && holidayByDate[record?.attendance_date]) {
+      return holidayByDate[record.attendance_date];
     }
 
-    if (statusKey === "holiday" && (record.holiday_name || holidayByDate[record.attendance_date])) {
-      return record.holiday_name || holidayByDate[record.attendance_date];
-    }
-
-    return {
-      present: "Present",
-      absent: "Absent",
-      holiday: "Holiday",
-      weeklyoff: "Weekly Off",
-      notapplicable: "Not Applicable",
-    }[statusKey];
+    return attendanceCalendarLabel(record);
   };
 
   /*
@@ -1063,27 +1042,17 @@ function Profile({ onNavigate }) {
     calendarRange,
   ]);
 
-  const countHalfStatus = (record, targetStatus) => {
-    if (!record) return 0;
-    const first = String(record.first_half_status || "").toLowerCase();
-    const second = String(record.second_half_status || "").toLowerCase();
-    if (first && second) {
-      return (first === targetStatus ? 0.5 : 0) + (second === targetStatus ? 0.5 : 0);
-    }
-    return String(record.status || "").toLowerCase() === targetStatus ? 1 : 0;
-  };
-
   const presentCount = monthDateKeys.reduce((total, dateString) => {
-    return total + countHalfStatus(getAttendanceForDate(dateString), "present");
+    return total + attendanceCalendarPortions(getAttendanceForDate(dateString)).present;
   }, 0);
 
   const absentCount = monthDateKeys.reduce((total, dateString) => {
-    return total + countHalfStatus(getAttendanceForDate(dateString), "absent");
+    return total + attendanceCalendarPortions(getAttendanceForDate(dateString)).absent;
   }, 0);
 
   const leaveCount = monthDateKeys.reduce((total, dateString) => {
     const record = getAttendanceForDate(dateString);
-    const recordedLeave = countHalfStatus(record, "leave");
+    const recordedLeave = attendanceCalendarPortions(record).leave;
     if (recordedLeave) return total + recordedLeave;
     return total + (getApprovedLeaveForDate(dateString) ? 1 : 0);
   }, 0);
@@ -1197,7 +1166,7 @@ function Profile({ onNavigate }) {
         aria-label={`${dateString} ${calendarLabel || "Not Marked"}${state.isFuture ? " (upcoming, not selectable)" : ""}`}
         title={[
           calendarLabel,
-          ...dayPermissions.map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`),
+          ...dayPermissions.map((item) => `Permission ${formatAttendanceClock(item.start_time)}–${formatAttendanceClock(item.end_time)} (${item.status})`),
           state.isFuture && "Upcoming date · view only",
         ].filter(Boolean).join(" · ") || undefined}
         className="w-100"
@@ -1274,6 +1243,12 @@ function Profile({ onNavigate }) {
           />
         )}
 
+        {statusKey === "halfday" && (
+          <span aria-label={attendanceCalendarLabel(record)} title={attendanceCalendarLabel(record)} style={{ fontSize: "13px", fontWeight: 700, lineHeight: 1 }}>
+            {attendanceCalendarHalfSymbol(record)}
+          </span>
+        )}
+
         {/* ----------------------------------------------------
             Show the two half-day statuses when a date is half-day present.
         ---------------------------------------------------- */}
@@ -1295,6 +1270,14 @@ function Profile({ onNavigate }) {
           </div>
         )}
 
+        {record?.has_attendance_issue && (
+          <div title={(record.attendance_issue_details || []).join(", ") || "Attendance issue"}
+            aria-label="Attendance issue"
+            style={{ fontSize: "9px", fontWeight: 700, color: "#92400e", lineHeight: 1.1 }}>
+            ⚠ Issue
+          </div>
+        )}
+
         {dayPermissions.length > 0 && (
           <div
             style={{
@@ -1306,7 +1289,7 @@ function Profile({ onNavigate }) {
               whiteSpace: "nowrap",
             }}
           >
-            P {dayPermissions[0].start_time}–{dayPermissions[0].end_time}
+            P {formatAttendanceClock(dayPermissions[0].start_time)}–{formatAttendanceClock(dayPermissions[0].end_time)}
             {dayPermissions.length > 1 ? ` +${dayPermissions.length - 1}` : ""}
           </div>
         )}
@@ -1725,6 +1708,7 @@ function Profile({ onNavigate }) {
                       {item.label}
                     </option>
                   ))}
+                  <span className="small text-muted">◐ First Half Present · ◑ Second Half Present · ⚠ Attendance Issue</span>
                 </select>
 
                 {/* YEAR */}
@@ -1798,8 +1782,16 @@ function Profile({ onNavigate }) {
                       label: "Present",
                     },
                     {
+                      key: "halfday",
+                      label: "Half-Day Present",
+                    },
+                    {
                       key: "absent",
                       label: "Absent",
+                    },
+                    {
+                      key: "medicalleave",
+                      label: "Medical Leave (ML)",
                     },
                     {
                       key: "leave",
@@ -2066,7 +2058,7 @@ function Profile({ onNavigate }) {
                         APPROVED LEAVE
                     ================================================== */}
 
-                    {selectedRecord?.is_approved_leave && (
+                    {selectedRecord?.is_approved_leave && getStatusKey(selectedRecord) !== "medicalleave" && (
                       <div
                         className="card"
                         style={{
@@ -2244,9 +2236,18 @@ function Profile({ onNavigate }) {
                                 </small>
 
                                 <strong>
-                                  {selectedRecord.check_in_time ||
-                                    "Not available"}
-                                </strong>
+                                            {formatAttendanceClock(
+                                              selectedRecord.check_in_time ||
+                                                selectedRecord.first_check_in_time ||
+                                                selectedRecord.first_half_check_in_time,
+                                            ) === "—"
+                                              ? "Not available"
+                                              : formatAttendanceClock(
+                                                  selectedRecord.check_in_time ||
+                                                    selectedRecord.first_check_in_time ||
+                                                    selectedRecord.first_half_check_in_time,
+                                                )}
+                                          </strong>
                               </div>
 
                               <div className="col-md-4">
@@ -2255,9 +2256,18 @@ function Profile({ onNavigate }) {
                                 </small>
 
                                 <strong>
-                                  {selectedRecord.check_out_time ||
-                                    "Not available"}
-                                </strong>
+                                            {formatAttendanceClock(
+                                              selectedRecord.check_out_time ||
+                                                selectedRecord.last_check_out_time ||
+                                                selectedRecord.second_half_check_out_time,
+                                            ) === "—"
+                                              ? "Not available"
+                                              : formatAttendanceClock(
+                                                  selectedRecord.check_out_time ||
+                                                    selectedRecord.last_check_out_time ||
+                                                    selectedRecord.second_half_check_out_time,
+                                                )}
+                                          </strong>
                               </div>
 
                             </div>
@@ -2434,13 +2444,18 @@ function Profile({ onNavigate }) {
 
                     {selectedRecord && (
                       (String(selectedRecord.half_day_present || "No").startsWith("Yes") ||
-                        (selectedRecord.first_half_status && selectedRecord.second_half_status && selectedRecord.first_half_status !== selectedRecord.second_half_status)) && (
+                        (selectedRecord.first_half_status && selectedRecord.second_half_status && selectedRecord.first_half_status !== selectedRecord.second_half_status) ||
+                        selectedRecord.first_half_check_in_time || selectedRecord.second_half_check_in_time) && (
                         <div className="card border-info mb-3">
                           <div className="card-body">
-                            <h6 className="text-info mb-3">Half-Day Attendance Details</h6>
+                            <h6 className="text-info mb-3">First / Second Half Attendance Details</h6>
                             <div className="row g-3">
                               <div className="col-md-4">
-                                <small className="text-muted d-block">Half-Day Present</small>
+                                <small className="text-muted d-block">Final Daily Result</small>
+                                <strong>{selectedRecord.status || "Not Marked"}</strong>
+                              </div>
+                              <div className="col-md-4">
+                                <small className="text-muted d-block">Half-Day Calculation</small>
                                 <strong>{selectedRecord.half_day_present || "No"}</strong>
                               </div>
                               <div className="col-md-4">
@@ -2451,13 +2466,41 @@ function Profile({ onNavigate }) {
                                 <small className="text-muted d-block">Second Half</small>
                                 <strong>{selectedRecord.second_half_status || selectedRecord.status || "Not Marked"}</strong>
                               </div>
-                              {selectedRecord.total_duration && <div className="col-md-4"><small className="text-muted d-block">Total Duration</small><strong>{selectedRecord.total_duration}</strong></div>}
-                              {selectedRecord.working_duration && <div className="col-md-4"><small className="text-muted d-block">Net Working Time</small><strong>{selectedRecord.working_duration}</strong></div>}
+                              <div className="col-md-4"><small className="text-muted d-block">First Half Check-in / Check-out</small><strong>{formatAttendanceClock(selectedRecord.first_half_check_in_time)} – {formatAttendanceClock(selectedRecord.first_half_check_out_time)}</strong></div>
+                              <div className="col-md-4"><small className="text-muted d-block">Second Half Check-in / Check-out</small><strong>{formatAttendanceClock(selectedRecord.second_half_check_in_time)} – {formatAttendanceClock(selectedRecord.second_half_check_out_time)}</strong></div>
+                              {(selectedRecord.total_duration || selectedRecord.total_duration_minutes !== undefined) && <div className="col-md-4"><small className="text-muted d-block">Total Duration</small><strong>{selectedRecord.total_duration || `${selectedRecord.total_duration_minutes} minutes`}</strong></div>}
+                              {(selectedRecord.working_duration || selectedRecord.working_minutes !== undefined) && <div className="col-md-4"><small className="text-muted d-block">Net Working Time</small><strong>{selectedRecord.working_duration || `${selectedRecord.working_minutes} minutes`}</strong></div>}
                               {selectedRecord.break_duration && <div className="col-md-4"><small className="text-muted d-block">Break Time</small><strong>{selectedRecord.break_duration}</strong></div>}
                             </div>
+                            {Array.isArray(selectedRecord.working_intervals) && selectedRecord.working_intervals.length > 0 && (
+                              <div className="mt-3">
+                                <small className="text-muted d-block mb-1">Working intervals</small>
+                                {selectedRecord.working_intervals.map((interval, index) => (
+                                  <div className="small" key={`${interval.from_time}-${index}`}>
+                                    {formatAttendanceClock(interval.from_time)} – {formatAttendanceClock(interval.to_time)}
+                                    {interval.duration ? ` (${interval.duration})` : ""}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </div>
                       )
+                    )}
+
+                    {selectedRecord && getStatusKey(selectedRecord) === "medicalleave" && (
+                      <div className="card border-secondary mb-3">
+                        <div className="card-body">
+                          <h6 className="mb-2" style={{ color: statusColors.medicalleave.text }}>Medical Leave (ML)</h6>
+                          <div>Date: <strong>{formatDateForDisplay(selectedAttendanceDate)}</strong></div>
+                          {(selectedRecord.leave_type_name || selectedRecord.leave_type_code) && (
+                            <div className="text-muted mt-1">
+                              {selectedRecord.leave_type_name || "Medical Leave"}
+                              {selectedRecord.leave_type_code ? ` (${selectedRecord.leave_type_code})` : ""}
+                            </div>
+                          )}
+                        </div>
+                      </div>
                     )}
 
                     {/* ==================================================
@@ -2550,6 +2593,13 @@ function Profile({ onNavigate }) {
                       </div>
                     )}
 
+                    {selectedRecord?.has_attendance_issue && (
+                      <div className="alert alert-warning py-2 mt-3 mb-0">
+                        <strong>⚠ Attendance Issue:</strong>{" "}
+                        {(selectedRecord.attendance_issue_details || []).join(", ") || "Please review the attendance punches."}
+                      </div>
+                    )}
+
                     {/* PERMISSION ON THE SELECTED DATE */}
 
                     {(permissionsByDate[selectedAttendanceDate] || []).length > 0 && (
@@ -2561,7 +2611,7 @@ function Profile({ onNavigate }) {
 
                           {permissionsByDate[selectedAttendanceDate].map((item, index) => (
                             <p className="mb-1" key={`${item.start_time}-${index}`}>
-                              <strong>{item.start_time} – {item.end_time}</strong>{" "}
+                              <strong>{formatAttendanceClock(item.start_time)} – {formatAttendanceClock(item.end_time)}</strong>{" "}
                               <span className={`badge ${item.status === "approved" ? "bg-success" : "bg-warning text-dark"}`}>
                                 {item.status === "approved" ? "Approved" : "Pending"}
                               </span>

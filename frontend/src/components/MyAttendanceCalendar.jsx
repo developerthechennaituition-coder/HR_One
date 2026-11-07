@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { dateState, monthOptions, clampMonth, isMonthInRange, shiftMonth as shiftCalendarMonth, yearOptions } from "../services/attendanceCalendarRange";
+import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
+import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -9,6 +11,7 @@ const CALENDAR_LEGEND = [
   { key: "wfh", label: "Work From Home", background: "#cff4fc", text: "#055160" },
   { key: "absent", label: "Absent", background: "#f8d7da", text: "#842029" },
   { key: "holiday", label: "Holiday", background: "#e2d9f3", text: "#432874" },
+  { key: "medicalleave", label: "Medical Leave (ML)", background: "#f3e8ff", text: "#6b21a8" },
   { key: "leave", label: "Leave", background: "#ffe5d0", text: "#984c0c" },
   { key: "weeklyoff", label: "Weekly Off", background: "#e9ecef", text: "#495057" },
   { key: "notmarked", label: "Not Marked", background: "#fff3cd", text: "#664d03" },
@@ -17,31 +20,11 @@ const CALENDAR_LEGEND = [
 ];
 const LEGEND_BY_KEY = Object.fromEntries(CALENDAR_LEGEND.map((item) => [item.key, item]));
 
-const dayStyleKey = (day) => {
-  const value = String(day?.status || "").toLowerCase();
-  if (String(day?.half_day_present || "No").startsWith("Yes") || value === "half-day present") return "halfday";
-  if (value === "present") return day.attendance_category === "Work From Home" ? "wfh" : "present";
-  if (value === "absent") return "absent";
-  if (value === "holiday") return "holiday";
-  if (value === "leave") return "leave";
-  if (value === "weekly off") return "weeklyoff";
-  if (value === "not marked") return "notmarked";
-  if (value === "not applicable") return "notapplicable";
-  return "other";
-};
-
 const DAY_PART_LABELS = { full_day: "Full day", first_half: "First half", second_half: "Second half" };
 
 const formatLongDate = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString("en-IN", {
   weekday: "long", day: "numeric", month: "long", year: "numeric",
 });
-
-const formatClock = (time) => {
-  if (!time) return "—";
-  const [hourText, minute] = String(time).split(":");
-  const hour = Number(hourText);
-  return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
-};
 
 // Read-only details for an upcoming holiday / leave / permission date.
 function UpcomingDayDetails({ day, onClose }) {
@@ -82,7 +65,7 @@ function UpcomingDayDetails({ day, onClose }) {
             <div className="small text-muted mb-1">Permission</div>
             {day.permissions.map((item, index) => (
               <div key={`${item.start_time}-${index}`} className="d-flex flex-wrap align-items-center gap-2 mb-1">
-                <span className="fw-semibold">{formatClock(item.start_time)} – {formatClock(item.end_time)}</span>
+                <span className="fw-semibold">{formatAttendanceClock(item.start_time)} – {formatAttendanceClock(item.end_time)}</span>
                 <span className={`badge ${item.status === "approved" ? "text-bg-success" : "text-bg-warning"}`}>
                   {item.status === "approved" ? "Approved" : "Pending"}
                 </span>
@@ -187,15 +170,16 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                   const state = dateState(range, day.attendance_date);
                   // Dates before joining are not shown.
                   if (state.hidden) return <div key={day.attendance_date} aria-hidden="true" />;
-                  const colors = LEGEND_BY_KEY[dayStyleKey(day)];
+                  const statusKey = attendanceCalendarStatusKey(day);
+                  const colors = LEGEND_BY_KEY[statusKey] || LEGEND_BY_KEY.other;
                   const leaveLabel = colors.key === "leave" && day.leave_type_code ? `Leave · ${day.leave_type_code}` : null;
                   const hasSplitHalfStatus = Boolean(day.first_half_status && day.second_half_status && day.first_half_status !== day.second_half_status);
-                  const isHalfDayPresent = String(day.half_day_present || "No").startsWith("Yes");
+                  const isHalfDayPresent = statusKey === "halfday";
                   const halfDayLabel = hasSplitHalfStatus
                     ? `1st: ${day.first_half_status || "Not Marked"} · 2nd: ${day.second_half_status || "Not Marked"}`
                     : null;
-                  const label = halfDayLabel || day.holiday_name || leaveLabel || (day.status_label && day.status_label !== day.status ? day.status_label : colors.key === "other" ? day.status : colors.label);
-                  const halfSymbol = String(day.half_day_present || "").endsWith("First Half") ? "◐" : String(day.half_day_present || "").endsWith("Second Half") ? "◑" : "◒";
+                  const label = halfDayLabel || day.holiday_name || leaveLabel || attendanceCalendarLabel(day) || colors.label;
+                  const halfSymbol = attendanceCalendarHalfSymbol(day);
                   // Upcoming holiday / leave / permission dates (within the 90 days) open details only.
                   const viewable = state.isFuture && !state.afterWindow && Boolean(day.has_upcoming_details);
                   const readOnly = !state.selectable;
@@ -217,7 +201,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                       disabled={!clickable}
                       aria-pressed={selected}
                       aria-label={`${day.attendance_date}: ${label}${viewable ? " (upcoming, view details)" : readOnly ? " (upcoming, not selectable)" : ""}`}
-                      title={[label, isHalfDayPresent && day.half_day_present, day.has_attendance_issue && (day.attendance_issue_details || []).join(", "), day.total_duration && `Total ${day.total_duration}`, day.check_in_time && `In ${day.check_in_time}`, day.check_out_time && `Out ${day.check_out_time}`, day.working_duration && `Net Work ${day.working_duration}`, day.break_duration && `Break ${day.break_duration}`, day.request && `Request ${day.request.request_number} ${day.request.status}`, ...(day.permissions || []).map((item) => `Permission ${item.start_time}–${item.end_time} (${item.status})`), viewable ? "Upcoming date · click to view details" : readOnly && "Upcoming date · view only"].filter(Boolean).join(" · ")}
+                      title={[label, isHalfDayPresent && day.half_day_present, day.has_attendance_issue && (day.attendance_issue_details || []).join(", "), day.total_duration && `Total ${day.total_duration}`, day.check_in_time && `In ${formatAttendanceClock(day.check_in_time)}`, day.check_out_time && `Out ${formatAttendanceClock(day.check_out_time)}`, day.working_duration && `Net Work ${day.working_duration}`, day.break_duration && `Break ${day.break_duration}`, day.request && `Request ${day.request.request_number} ${day.request.status}`, ...(day.permissions || []).map((item) => `Permission ${formatAttendanceClock(item.start_time)}–${formatAttendanceClock(item.end_time)} (${item.status})`), viewable ? "Upcoming date · click to view details" : readOnly && "Upcoming date · view only"].filter(Boolean).join(" · ")}
                       style={{
                         minHeight: 64, minWidth: 0, textAlign: "left", padding: "6px 8px", borderRadius: 8,
                         border: selected ? "2px solid #0d6efd" : readOnly ? "1px dashed rgba(0,0,0,0.25)" : "1px solid rgba(0,0,0,0.12)",
@@ -242,7 +226,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                       )}
                       {day.permissions?.length > 0 && (
                         <div style={{ fontSize: 10, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          P {day.permissions[0].start_time}–{day.permissions[0].end_time}
+                          P {formatAttendanceClock(day.permissions[0].start_time)}–{formatAttendanceClock(day.permissions[0].end_time)}
                           {day.permissions.length > 1 ? ` +${day.permissions.length - 1}` : ""}
                         </div>
                       )}

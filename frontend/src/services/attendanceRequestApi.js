@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { formatAttendanceClock as formatClock } from "./attendanceHistoryFormat.js";
 
 const API_URL = `${HRONE_API_BASE}/api/attendance-requests`;
 
@@ -96,9 +97,17 @@ export const OUTCOME_LABELS = {
   not_applied: "Not applied",
 };
 
+/** Format attendance clock values consistently as 24-hour HH:mm. */
+export const formatAttendanceClock = (value) =>
+  value === null || value === undefined || value === ""
+    ? ""
+    : formatClock(value);
+
 /** Check-in/check-out pair as text, without inventing missing values. */
 export const formatTimeRange = (checkIn, checkOut) =>
-  checkIn || checkOut ? `${checkIn || "no check-in"} – ${checkOut || "no check-out"}` : "";
+  checkIn || checkOut
+    ? `${formatAttendanceClock(checkIn) || "no check-in"} – ${formatAttendanceClock(checkOut) || "no check-out"}`
+    : "";
 
 // Date-only values are built in UTC so the weekday never shifts with the browser timezone.
 export const formatRequestDate = (iso) => {

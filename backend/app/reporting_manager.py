@@ -987,6 +987,38 @@ def get_team_member_attendance(
     # Return response
     # --------------------------------------------------------
 
+    # Enrich each saved attendance day with the same calculated punch-issue
+    # information used by the daily attendance endpoint. This lets the team
+    # calendar show issue indicators without exposing raw database fields.
+    attendance_rows = []
+    if records:
+        from datetime import date as _date
+        from app.attendance import _calculate_daily_attendance
+        from app.attendance_calculations import attendance_issue
+
+        for attendance_record in records:
+            row = _serialize_attendance(attendance_record)
+            date_value = str(attendance_record.get("attendance_date") or "")[:10]
+            try:
+                selected_day = _date.fromisoformat(date_value)
+                daily = _calculate_daily_attendance(member_id, selected_day, member)
+                issue = attendance_issue(
+                    daily.get("first_check_in") or attendance_record.get("check_in_time"),
+                    daily.get("last_check_out") or attendance_record.get("check_out_time"),
+                    daily.get("working_intervals") or [],
+                )
+                row.update(issue)
+            except (TypeError, ValueError):
+                row.update({"has_attendance_issue": False, "attendance_issue_details": []})
+            attendance_rows.append(row)
+
+    # Keep Team Member Details aligned with the employee and HR calendars:
+    # use the same per-date status mapping, half-day calculation, leave data,
+    # and attendance-issue interpretation after the direct-report check above.
+    if year is not None and month is not None:
+        from app.attendance_requests import _build_calendar
+        attendance_rows = _build_calendar(member, year, month)["days"]
+
     return {
         "employee": {
             "id": str(member["_id"]),
@@ -1000,10 +1032,7 @@ def get_team_member_attendance(
 
         "count": len(records),
 
-        "attendance": [
-            _serialize_attendance(record)
-            for record in records
-        ],
+        "attendance": attendance_rows,
         "approved_leaves": approved_leaves,
         "holidays": holidays,
         "permissions": permissions,

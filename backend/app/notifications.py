@@ -212,13 +212,13 @@ class NotificationCreate(BaseModel):
             unit = "hours"
         if value is None or value <= 0:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Validity must be a positive number with a supported unit.",
             )
         duration = timedelta(**{unit: value})
         if duration > timedelta(days=30):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Notification validity cannot exceed 30 days.",
             )
         return duration

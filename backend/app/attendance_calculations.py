@@ -19,7 +19,9 @@ def duration_minutes(check_in: Any, check_out: Any) -> int | None:
         if start.tzinfo and end.tzinfo:
             return max(0, int((end - start).total_seconds() // 60))
         if end < start:
-            return None
+            # Naive datetime pairs may represent an overnight shift.
+            from datetime import timedelta
+            end = end + timedelta(days=1)
         return max(0, int((end - start).total_seconds() // 60))
     start = _clock_minutes(check_in)
     end = _clock_minutes(check_out)
@@ -205,45 +207,179 @@ def attendance_issue(check_in: Any, check_out: Any, working_intervals: list[dict
     return {"has_attendance_issue": bool(issues), "attendance_issue_details": issues}
 
 
+# Half-day thresholds, as percentages of the employee's configured Half Day Time.
+# They are applied to Total Duration (Check-Out minus Check-In, breaks included).
+HALF_DAY_ABSENT_BELOW_PERCENT = 50
+HALF_DAY_FULL_ABOVE_PERCENT = 120
+
+PROTECTED_DAY_STATUSES = frozenset({
+    "holiday", "weekly off", "weekly-off", "week off", "not applicable",
+    "before joining", "leave", "medical leave", "permission",
+})
+_RECALCULABLE_STATUSES = frozenset({
+    "", "present", "absent", "half-day present", "half day present", "not marked",
+})
+
+
+def half_day_band(total_duration_minutes: int | None, half_day_threshold_minutes: int | None) -> str | None:
+    """Return 'absent', 'half' or 'full' for a completed day, or None if undecidable.
+
+    * below 50% of Half Day Time           -> 'absent'
+    * 50% .. 120% of Half Day Time (both inclusive) -> 'half'
+    * above 120% of Half Day Time          -> 'full' (existing full-day rules apply)
+
+    Integer cross-multiplication is used (no floating-point percentages), so the
+    exact boundaries 50% and 120% behave exactly as written for any configured
+    Half Day Time.
+    """
+    threshold = int(half_day_threshold_minutes or 0)
+    if total_duration_minutes is None or threshold <= 0:
+        return None
+    total = max(0, int(total_duration_minutes))
+    if total * 100 < threshold * HALF_DAY_ABSENT_BELOW_PERCENT:
+        return "absent"
+    if total * 100 > threshold * HALF_DAY_FULL_ABOVE_PERCENT:
+        return "full"
+    return "half"
+
+
+def half_day_status_override(
+    half: dict[str, Any],
+    *,
+    total_duration_minutes: int | None,
+    half_day_threshold_minutes: int | None,
+    check_in: Any,
+    check_out: Any,
+    day_completed: bool,
+    current_status: Any,
+    recalculated: bool = False,
+) -> str | None:
+    """Day status implied by the half-day rules, or None to keep ``current_status``.
+
+    Shared by every attendance view, the persisted recalculation and payroll so
+    that all of them reach the same conclusion. Protected statuses (holiday,
+    weekly off, leave...) are never overridden. ``recalculated`` marks a status
+    that came from an earlier automatic calculation (ESSL/WFH, not edited by HR
+    Admin), which may therefore be replaced by the current result.
+    """
+    current = str(current_status or "").strip().casefold()
+    if current in PROTECTED_DAY_STATUSES:
+        return None
+    if str((half or {}).get("half_day_present") or "No").startswith("Yes"):
+        return "Half-Day Present"
+    if not (day_completed and check_in and check_out):
+        return None
+    band = half_day_band(total_duration_minutes, half_day_threshold_minutes)
+    if band == "absent":
+        return "Absent"
+    if band == "full" and recalculated and current in _RECALCULABLE_STATUSES and current != "present":
+        return "Present"
+    return None
+
+
+def _to_clock(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return _clock_minutes(value)
+
+
+def _subtract_segments(segments: list[tuple[float, float]], covers: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    for cover_start, cover_end in covers:
+        remaining: list[tuple[float, float]] = []
+        for seg_start, seg_end in segments:
+            if cover_end <= seg_start or cover_start >= seg_end:
+                remaining.append((seg_start, seg_end))
+                continue
+            if seg_start < cover_start:
+                remaining.append((seg_start, cover_start))
+            if cover_end < seg_end:
+                remaining.append((cover_end, seg_end))
+        segments = remaining
+    return segments
+
+
 def _half_side_from_intervals(scheduled_start: Any, scheduled_end: Any, check_in: Any, check_out: Any,
-                              working_intervals: list[dict[str, Any]] | None) -> str | None:
-    start = _clock_minutes(scheduled_start)
-    end = _clock_minutes(scheduled_end)
+                              working_intervals: list[dict[str, Any]] | None,
+                              permission_intervals: list[tuple[Any, Any]] | None = None) -> str | None:
+    """Return 'first' or 'second' for a day that qualifies as Half-Day Present.
+
+    The scheduled shift is split at its midpoint. The half containing more
+    actual working time wins; approved permission time (not already covered by
+    actual working intervals) counts as presence in the half it falls in. Ties
+    are resolved deterministically (check-in/check-out span, then the half in
+    which the employee started), so a qualifying day is never left undecided.
+    ``None`` is returned only when check-in/check-out cannot be read at all.
+    """
     actual_in = _clock_minutes(check_in)
     actual_out = _clock_minutes(check_out)
-    if None in (start, end, actual_in, actual_out):
+    if actual_in is None or actual_out is None:
         return None
-    span = (end - start) % 1440
+    start = _clock_minutes(scheduled_start)
+    end = _clock_minutes(scheduled_end)
+    span = ((end - start) % 1440) if (start is not None and end is not None) else 0
     if span <= 0:
-        return None
-    midpoint = (start + span / 2) % 1440
-    # Put clock values on one linear timeline, including overnight schedules.
+        # No usable schedule: split the calendar day at noon.
+        start, span = 0, 1440
+    mid = span / 2
+
     def relative(value: int) -> float:
         return float((value - start) % 1440)
-    midpoint_rel = span / 2
-    first_minutes = second_minutes = 0.0
+
+    def split(a: float, b: float) -> tuple[float, float]:
+        if b <= a:
+            b += 1440
+        return (max(0.0, min(b, mid) - max(a, 0.0)), max(0.0, min(b, span) - max(a, mid)))
+
+    work: list[tuple[float, float]] = []
     for interval in working_intervals or []:
-        a = _clock_minutes(interval.get("from_time"))
-        b = _clock_minutes(interval.get("to_time"))
+        a = _clock_minutes(interval.get("from_time") or interval.get("start"))
+        b = _clock_minutes(interval.get("to_time") or interval.get("end"))
         if a is None or b is None:
             continue
         ar, br = relative(a), relative(b)
         if br <= ar:
             br += 1440
-        first_minutes += max(0.0, min(br, midpoint_rel) - max(ar, 0.0))
-        second_minutes += max(0.0, min(br, span) - max(ar, midpoint_rel))
-    if first_minutes or second_minutes:
-        if first_minutes == second_minutes:
-            return None
+        work.append((ar, br))
+    first_minutes = second_minutes = 0.0
+    for ar, br in work:
+        f, sec = split(ar, br)
+        first_minutes += f
+        second_minutes += sec
+
+    perms: list[tuple[float, float]] = []
+    for start_value, end_value in permission_intervals or []:
+        a, b = _to_clock(start_value), _to_clock(end_value)
+        if a is None or b is None:
+            continue
+        ar, br = relative(a), relative(b)
+        if br <= ar:
+            br += 1440
+        perms.append((ar, br))
+    for seg_a, seg_b in _subtract_segments(perms, work):
+        f, sec = split(seg_a, seg_b)
+        first_minutes += f
+        second_minutes += sec
+
+    if first_minutes != second_minutes:
         return "first" if first_minutes > second_minutes else "second"
+
     in_rel, out_rel = relative(actual_in), relative(actual_out)
     if out_rel <= in_rel:
         out_rel += 1440
-    first_overlap = max(0.0, min(out_rel, midpoint_rel) - max(in_rel, 0.0))
-    second_overlap = max(0.0, min(out_rel, span) - max(in_rel, midpoint_rel))
-    if first_overlap == second_overlap:
-        return None
-    return "first" if first_overlap > second_overlap else "second"
+    first_overlap, second_overlap = split(in_rel, out_rel)
+    if first_overlap != second_overlap:
+        return "first" if first_overlap > second_overlap else "second"
+
+    if first_overlap == 0 and second_overlap == 0:
+        # Worked entirely outside the scheduled hours: attribute to the nearer end.
+        centre = (actual_in + ((actual_out - actual_in) % 1440) / 2) % 1440
+        to_start = min((centre - start) % 1440, (start - centre) % 1440)
+        to_end = min((centre - (start + span)) % 1440, ((start + span) - centre) % 1440)
+        return "second" if to_end < to_start else "first"
+    # Perfectly balanced across the midpoint: the half in which the day began.
+    return "first" if in_rel < mid else "second"
 
 
 def classify_half_day(
@@ -259,12 +395,24 @@ def classify_half_day(
     leave_day_part: str | None = None,
     leave_is_full_day: bool = False,
     working_intervals: list[dict[str, Any]] | None = None,
+    permission_intervals: list[tuple[Any, Any]] | None = None,
+    recalculated_base: bool = False,
 ) -> dict[str, Any]:
-    """Classify a completed day using the configured half-day threshold.
+    """Classify a completed day using Total Duration and the configured half-day threshold.
 
-    80%-150% of the configured half-day duration (inclusive) is half-day present.
-    Below 80% is absent. Above 150% falls through to the existing full-day status
-    rules. Protected holiday/weekly-off/leave statuses are never overwritten.
+    The comparison value is elapsed Check-Out minus Check-In time (including breaks),
+    never net working time. Thresholds are derived from the employee's configured
+    Half Day Time (never hard-coded durations):
+
+    * below 50%            -> Absent
+    * 50% to 120% inclusive -> Half-Day Present (First or Second Half)
+    * above 120%           -> existing full-day rules (Present)
+
+    ``half_day_review_required`` is raised only when HR Admin action is actually
+    needed: a completed day with a missing punch, or an unfinished day in progress.
+    Protected holiday/weekly-off/leave statuses are never overwritten.
+    ``recalculated_base`` allows a stale automatic status (Absent / Half-Day
+    Present from an earlier calculation) to be replaced when the day is full.
     """
     status = str(base_status or "Not Marked").strip()
     normalized = status.casefold()
@@ -289,30 +437,40 @@ def classify_half_day(
             result["half_day_present_side"] = present_side
         result["half_day_review_required"] = bool(not day_completed and check_in and not check_out)
         return result
-    if normalized in {"holiday", "weekly off", "weekly-off", "week off", "not applicable", "before joining", "leave", "medical leave"}:
+    if normalized in PROTECTED_DAY_STATUSES:
         return result
     if not day_completed:
         if check_in and not check_out:
             result.update(first_half_status="Not Finalized", second_half_status="Not Finalized", half_day_review_required=True)
         return result
-    if total_duration_minutes is None or not check_in or not check_out or half_day_threshold_minutes <= 0:
-        result["half_day_review_required"] = bool(check_in or check_out)
+    if bool(check_in) != bool(check_out):
+        # A completed day with only one punch cannot be finalized automatically.
+        result["half_day_review_required"] = True
         return result
-    threshold = int(half_day_threshold_minutes)
-    lower = threshold * 0.80
-    upper = threshold * 1.50
-    worked = max(0, int(total_duration_minutes))
-    if worked < lower:
+    if not check_in or not check_out:
+        return result
+    total = total_duration_minutes
+    if total is None:
+        total = duration_minutes(check_in, check_out)
+    if total is None:
+        result["half_day_review_required"] = True
+        return result
+    band = half_day_band(total, half_day_threshold_minutes)
+    if band is None:
+        # No Half Day Time is configured for this employee/date, so the half-day
+        # rules do not apply and there is nothing for HR Admin to approve.
+        return result
+    if band == "absent":
         result.update(first_half_status="Absent", second_half_status="Absent")
         return result
-    if worked > upper:
-        if normalized == "present":
+    if band == "full":
+        if normalized == "present" or (recalculated_base and normalized in _RECALCULABLE_STATUSES):
             result.update(first_half_status="Present", second_half_status="Present")
         return result
-    side = _half_side_from_intervals(scheduled_start, scheduled_end, check_in, check_out, working_intervals)
+    side = _half_side_from_intervals(scheduled_start, scheduled_end, check_in, check_out,
+                                     working_intervals, permission_intervals)
     if side is None:
         result["half_day_review_required"] = True
-        result.update(first_half_status="Absent", second_half_status="Absent")
         return result
     result.update(
         half_day_present="Yes – First Half" if side == "first" else "Yes – Second Half",
@@ -321,6 +479,126 @@ def classify_half_day(
         second_half_status="Present" if side == "second" else "Absent",
     )
     return result
+
+
+def combine_half_day_statuses(first_half_status: str, second_half_status: str) -> dict[str, Any]:
+    """Derive a display status without discarding either half's source status."""
+    first = str(first_half_status or "Not Marked").strip()
+    second = str(second_half_status or "Not Marked").strip()
+    first_key, second_key = first.casefold(), second.casefold()
+    result: dict[str, Any] = {
+        "first_half_status": first,
+        "second_half_status": second,
+        "half_day_present": "No",
+        "half_day_present_side": None,
+        "half_day_review_required": False,
+    }
+    if first_key == "present" and second_key == "present":
+        result["status"] = "Present"
+    elif first_key == "present" or second_key == "present":
+        side = "first" if first_key == "present" else "second"
+        result["half_day_present"] = "Yes – First Half" if side == "first" else "Yes – Second Half"
+        result["half_day_present_side"] = side
+        result["status"] = "Half-Day Present"
+    elif first_key == second_key:
+        result["status"] = first
+    elif "absent" in {first_key, second_key}:
+        result["status"] = "Absent"
+    elif "medical leave" in {first_key, second_key}:
+        result["status"] = "Medical Leave"
+    elif "leave" in {first_key, second_key}:
+        result["status"] = "Leave"
+    elif "holiday" in {first_key, second_key}:
+        result["status"] = "Holiday"
+    elif "weekly off" in {first_key, second_key}:
+        result["status"] = "Weekly Off"
+    else:
+        result["status"] = first if first_key != "not marked" else second
+    return result
+
+
+def calculate_half_day_portions(
+    *,
+    first_half_status: str,
+    second_half_status: str,
+    first_half_check_in_time: Any = None,
+    first_half_check_out_time: Any = None,
+    second_half_check_in_time: Any = None,
+    second_half_check_out_time: Any = None,
+    half_day_threshold_minutes: int,
+    scheduled_start: Any,
+    scheduled_end: Any,
+) -> dict[str, Any]:
+    """Validate half-day portions and return the persisted attendance fields."""
+    statuses = {
+        "first": str(first_half_status or "").strip().title(),
+        "second": str(second_half_status or "").strip().title(),
+    }
+    supported = {"Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"}
+    if any(value not in supported for value in statuses.values()):
+        raise ValueError("Select a valid status for both halves.")
+    if "Present" not in statuses.values():
+        raise ValueError("Half-Day Present requires at least one Present half.")
+    if half_day_threshold_minutes <= 0:
+        raise ValueError("A scheduled half-day duration is required to validate Half-Day Present.")
+
+    times = {
+        "first": (first_half_check_in_time, first_half_check_out_time),
+        "second": (second_half_check_in_time, second_half_check_out_time),
+    }
+    intervals: dict[str, list[dict[str, Any]]] = {"first": [], "second": []}
+    for side, (check_in, check_out) in times.items():
+        if statuses[side] != "Present":
+            if check_in or check_out:
+                raise ValueError(f"Clear the {side} half times unless that half is Present.")
+            continue
+        if not check_in or not check_out:
+            raise ValueError(f"{side.title()} Half requires check-in and check-out times.")
+        if str(check_out) <= str(check_in) or duration_minutes(check_in, check_out) is None:
+            raise ValueError(f"{side.title()} Half check-out must be later than check-in.")
+        minutes = duration_minutes(check_in, check_out) or 0
+        interval = {"from_time": check_in, "to_time": check_out}
+        eligibility = classify_half_day(
+            total_duration_minutes=minutes,
+            half_day_threshold_minutes=half_day_threshold_minutes,
+            scheduled_start=scheduled_start,
+            scheduled_end=scheduled_end,
+            check_in=check_in,
+            check_out=check_out,
+            day_completed=True,
+            base_status="Present",
+            working_intervals=[interval],
+        )
+        expected = "First Half" if side == "first" else "Second Half"
+        if eligibility.get("half_day_present") != f"Yes – {expected}":
+            raise ValueError(
+                f"{side.title()} Half work time must meet the inclusive 50%–120% scheduled half-day threshold."
+            )
+        interval["duration_minutes"] = minutes
+        intervals[side].append(interval)
+
+    if (
+        intervals["first"] and intervals["second"]
+        and intervals["first"][0]["to_time"] > intervals["second"][0]["from_time"]
+    ):
+        raise ValueError("First-half and second-half working intervals cannot overlap.")
+    combined = combine_half_day_statuses(statuses["first"], statuses["second"])
+    all_intervals = intervals["first"] + intervals["second"]
+    return {
+        **combined,
+        "first_half_check_in_time": times["first"][0] if statuses["first"] == "Present" else None,
+        "first_half_check_out_time": times["first"][1] if statuses["first"] == "Present" else None,
+        "second_half_check_in_time": times["second"][0] if statuses["second"] == "Present" else None,
+        "second_half_check_out_time": times["second"][1] if statuses["second"] == "Present" else None,
+        "first_half_working_intervals": intervals["first"],
+        "second_half_working_intervals": intervals["second"],
+        "working_intervals": all_intervals,
+        "actual_working_minutes": union_interval_minutes([
+            (item["from_time"], item["to_time"]) for item in all_intervals
+        ]),
+        "half_day_working_duration": half_day_threshold_minutes,
+        "half_day_eligibility": "Eligible",
+    }
 
 
 def select_weekly_off_dates(candidates: list[Any], slots: int, preferred_weekdays: set[int] | None = None) -> list[Any]:

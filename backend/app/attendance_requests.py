@@ -41,9 +41,21 @@ from app.attendance import (
     _calculate_daily_attendance,
     _going_by_minutes,
     _format_duration,
+    _attendance_clock_hhmm,
+    _is_automatic_attendance_record,
 )
 from app.db.mongodb import db
-from app.attendance_calculations import classify_half_day, select_weekly_off_dates, effective_working_minutes, attendance_issue, union_interval_minutes, permission_minutes_outside_total_duration
+from app.attendance_calculations import (
+    calculate_half_day_portions,
+    classify_half_day,
+    combine_half_day_statuses,
+    effective_working_minutes,
+    attendance_issue,
+    half_day_status_override,
+    union_interval_minutes,
+    permission_minutes_outside_total_duration,
+    duration_minutes,
+)
 
 router = APIRouter(prefix="/api/attendance-requests", tags=["Attendance Requests"])
 logger = logging.getLogger(__name__)
@@ -56,19 +68,20 @@ payroll_collection = db["monthly_payroll_records"]
 leave_notifications_collection = db["leave_notifications"]
 notification_sequences_collection = db["notification_sequences"]
 
-RequestStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"]
+RequestStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"]
 # HR Admin may also finalize a requested date as Not Applicable (counted as LOP).
-FinalStatus = Literal["Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission", "Not Applicable"]
+FinalStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission", "Not Applicable"]
 NOT_APPLICABLE = "Not Applicable"
 BEFORE_JOINING = "Before Joining"
 # Permitted corrections by the date's current attendance status. Leave dates
 # are owned by the Leave module and future/pre-joining dates are not eligible.
 STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    "Not Marked": ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
-    NOT_APPLICABLE: ("Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
-    "Absent": ("Present", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
+    "Not Marked": ("Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
+    NOT_APPLICABLE: ("Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
+    "Absent": ("Present", "Half-Day Present", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
     "Weekly Off": ("Present", "Medical Leave", "Absent"),
-    "Present": ("Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
+    "Present": ("Present", "Half-Day Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
+    "Half-Day Present": ("Present", "Half-Day Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
     "Holiday": ("Present",),
 }
 MEDICAL_LEAVE_MONTHLY_LIMIT = leave.MEDICAL_LEAVE_DAYS_PER_MONTH
@@ -83,6 +96,7 @@ PAYROLL_DRAFT_STATUSES = {"Calculated"}
 PROCESSING_TIMEOUT = timedelta(minutes=5)
 MAX_DATES_PER_REQUEST = 31
 TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+HALF_DAY_STATUSES = {"Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"}
 
 
 def ensure_attendance_request_indexes() -> None:
@@ -103,11 +117,10 @@ def startup_attendance_requests() -> None:
 
 
 @router.on_event("startup")
-def startup_finalize_completed_month_weekly_offs() -> None:
-    """Catch up the last completed month for every active employee on startup.
+def startup_sync_previous_month_leave_records() -> None:
+    """Synchronize leave-owned attendance records for the previous month.
 
-    Month views also run the same idempotent finalizer lazily, so employees are
-    still processed if the server was offline at the month boundary.
+    Weekly Off attendance is never generated as a startup or month-view side effect.
     """
     today = company_today()
     previous_month_end = today.replace(day=1) - timedelta(days=1)
@@ -120,9 +133,8 @@ def startup_finalize_completed_month_weekly_offs() -> None:
             continue
         try:
             _sync_leave_for_user_range(user_id, start, previous_month_end.isoformat())
-            _ensure_monthly_auto_weekly_offs(employee, year, month)
         except Exception:
-            logger.exception("Automatic weekly-off finalization failed for employee %s", user_id)
+            logger.exception("Previous-month leave synchronization failed for employee %s", user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +160,22 @@ class AttendanceRequestDateIn(BaseModel):
     requested_status: RequestStatus
     requested_check_in_time: str | None = None
     requested_check_out_time: str | None = None
+    requested_first_half_status: str | None = None
+    requested_second_half_status: str | None = None
+    requested_first_half_check_in_time: str | None = None
+    requested_first_half_check_out_time: str | None = None
+    requested_second_half_check_in_time: str | None = None
+    requested_second_half_check_out_time: str | None = None
     requested_permission_start_time: str | None = None
     requested_permission_end_time: str | None = None
     requested_permission_reason: str | None = Field(default=None, max_length=1000)
 
-    _times = field_validator("requested_check_in_time", "requested_check_out_time", "requested_permission_start_time", "requested_permission_end_time")(classmethod(lambda cls, value: _clean_time(value)))
+    _times = field_validator(
+        "requested_check_in_time", "requested_check_out_time",
+        "requested_first_half_check_in_time", "requested_first_half_check_out_time",
+        "requested_second_half_check_in_time", "requested_second_half_check_out_time",
+        "requested_permission_start_time", "requested_permission_end_time",
+    )(classmethod(lambda cls, value: _clean_time(value)))
 
 
 class AttendanceRequestCreate(BaseModel):
@@ -168,11 +191,22 @@ class AttendanceDecisionIn(BaseModel):
     final_status: FinalStatus | None = None
     final_check_in_time: str | None = None
     final_check_out_time: str | None = None
+    final_first_half_status: str | None = None
+    final_second_half_status: str | None = None
+    final_first_half_check_in_time: str | None = None
+    final_first_half_check_out_time: str | None = None
+    final_second_half_check_in_time: str | None = None
+    final_second_half_check_out_time: str | None = None
     final_permission_start_time: str | None = None
     final_permission_end_time: str | None = None
     final_permission_reason: str | None = Field(default=None, max_length=1000)
 
-    _times = field_validator("final_check_in_time", "final_check_out_time", "final_permission_start_time", "final_permission_end_time")(classmethod(lambda cls, value: _clean_time(value)))
+    _times = field_validator(
+        "final_check_in_time", "final_check_out_time",
+        "final_first_half_check_in_time", "final_first_half_check_out_time",
+        "final_second_half_check_in_time", "final_second_half_check_out_time",
+        "final_permission_start_time", "final_permission_end_time",
+    )(classmethod(lambda cls, value: _clean_time(value)))
 
 
 class AttendanceRequestResponsePayload(BaseModel):
@@ -278,160 +312,8 @@ def _permissions_by_date(user_id: str, start: date, end: date) -> dict[date, lis
 
 
 def _ensure_monthly_auto_weekly_offs(user: dict[str, Any], year: int, month: int) -> int:
-    """Finalize up to the policy limit of weekly offs after a month is complete.
-
-    Only absent/Not Marked dates are candidates. Existing attendance, approved
-    leave, holidays and HR-edited rows are never replaced. The selection is
-    deterministic and spread across distinct calendar weeks where possible.
-    """
-    start = date(year, month, 1)
-    end = date(year, month, monthrange(year, month)[1])
-    today = company_today()
-    if end >= today:
-        return 0
-
-    user_id = str(user.get("_id") or "")
-    if not user_id:
-        return 0
-    employee_id = str(user.get("employee_id") or "")
-    if employee_id:
-        payroll = db["monthly_payroll_records"].find_one(
-            {"employee_id": employee_id, "period": f"{year:04d}-{month:02d}"},
-            {"status": 1},
-        ) or {}
-        if payroll.get("status") in PAYROLL_FINALIZED_STATUSES:
-            return 0
-
-    period_start, period_end = start.isoformat(), (end + timedelta(days=1)).isoformat()
-    existing_records = list(attendance_collection.find({
-        "user_id": user_id,
-        "attendance_date": {"$gte": period_start, "$lt": period_end},
-    }))
-    records = {str(row.get("attendance_date") or "")[:10]: row for row in existing_records}
-    pending_claim_dates = {
-        str(item.get("attendance_date") or "")[:10]
-        for item in attendance_request_date_claims_collection.find({
-            "user_id": user_id,
-            "attendance_date": {"$gte": period_start, "$lt": period_end},
-        })
-    }
-    hr_admin_modified_dates = {
-        str(item.get("attendance_date") or "")[:10]
-        for item in db["attendance_modification_history"].find({
-            "user_id": user_id,
-            "attendance_date": {"$gte": period_start, "$lt": period_end},
-            "modified_by_role": {"$in": ["HR Admin", "hr_admin", "hr-admin"]},
-        }, {"attendance_date": 1})
-    }
-    existing_weekly = [
-        iso for iso, row in records.items()
-        if str(row.get("status") or "").strip().casefold() in {"weekly off", "weekly-off", "week off"}
-    ]
-    limit = min(4, _weekly_off_limit())
-    slots = max(0, limit - len(existing_weekly))
-    if slots <= 0:
-        return 0
-
-    holidays = leave._holiday_names(user, start, end)
-    joining = leave._joining_date(user)
-    preferred_weekdays = company_weekly_off_weekdays()
-    candidates: list[date] = []
-    cursor = start
-    while cursor <= end:
-        iso = cursor.isoformat()
-        record = records.get(iso)
-        if iso in pending_claim_dates or iso in hr_admin_modified_dates:
-            cursor += timedelta(days=1)
-            continue
-        if joining and cursor < joining:
-            cursor += timedelta(days=1)
-            continue
-        if cursor in holidays:
-            cursor += timedelta(days=1)
-            continue
-        if record:
-            status_text = str(record.get("status") or "Not Marked").strip().casefold()
-            if status_text != "not marked":
-                cursor += timedelta(days=1)
-                continue
-            if (
-                record.get("check_in_time") or record.get("check_out_time")
-                or record.get("hr_admin_modified")
-                or str(record.get("attendance_source") or "").upper() in {"ADMIN", "MANUAL", "ATTENDANCE_REQUEST"}
-            ):
-                cursor += timedelta(days=1)
-                continue
-        candidates.append(cursor)
-        cursor += timedelta(days=1)
-
-    if not candidates:
-        return 0
-
-    existing_weeks = {date.fromisoformat(iso).isocalendar()[:2] for iso in existing_weekly if iso}
-    candidates_for_selection = [
-        candidate for candidate in candidates
-        if candidate.isocalendar()[:2] not in existing_weeks
-    ]
-    selected_dates = select_weekly_off_dates(candidates_for_selection, slots, preferred_weekdays)
-
-    created = 0
-    for selected in sorted(selected_dates):
-        iso = selected.isoformat()
-        record = records.get(iso)
-        update = {
-            "employee_id": employee_id,
-            "status": "Weekly Off",
-            "attendance_source": "AUTO_WEEKLY_OFF",
-            "is_auto_generated_weekly_off": True,
-            "auto_weekly_off_period": f"{year:04d}-{month:02d}",
-            "auto_weekly_off_generated_at": datetime.now(timezone.utc),
-            "updated_at": datetime.now(timezone.utc),
-        }
-        try:
-            did_create = False
-            if record:
-                result = attendance_collection.update_one(
-                    {"_id": record["_id"], "status": {"$in": [None, "Not Marked"]}, "check_in_time": {"$in": [None, ""]}, "check_out_time": {"$in": [None, ""]}},
-                    {"$set": update},
-                )
-                if result.modified_count:
-                    created += 1
-                    did_create = True
-            else:
-                result = attendance_collection.update_one(
-                    {
-                        "user_id": user_id,
-                        "attendance_date": iso,
-                        "status": {"$in": [None, "Not Marked"]},
-                        "check_in_time": {"$in": [None, ""]},
-                        "check_out_time": {"$in": [None, ""]},
-                    },
-                    {"$setOnInsert": {
-                        "user_id": user_id,
-                        "attendance_date": iso,
-                        "created_at": datetime.now(timezone.utc),
-                    }, "$set": update},
-                    upsert=True,
-                )
-                if result.upserted_id or result.modified_count:
-                    created += 1
-                    did_create = True
-            if did_create:
-                db["attendance_modification_history"].insert_one({
-                    "user_id": user_id,
-                    "attendance_date": iso,
-                    "modified_by": "SYSTEM",
-                    "modified_by_role": "System",
-                    "action": "AUTO_WEEKLY_OFF_GENERATED",
-                    "new_status": "Weekly Off",
-                    "reason": "Automatically generated after monthly attendance completion.",
-                    "modified_at": datetime.now(timezone.utc),
-                })
-        except DuplicateKeyError:
-            # Another concurrent request created this date. Never overwrite it.
-            continue
-    return created
-
+    """Deprecated compatibility shim: Weekly Off records are manual-only."""
+    return 0
 
 def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any]:
     """Attendance data shared by the calendar, request creation and HR review."""
@@ -440,7 +322,6 @@ def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any
     user_id = str(user["_id"])
     today = company_today()
     _sync_leave_for_user_range(user_id, start.isoformat(), end.isoformat())
-    _ensure_monthly_auto_weekly_offs(user, year, month)
     window_end = today + timedelta(days=CALENDAR_FORWARD_DAYS)
     records = {
         str(record.get("attendance_date"))[:10]: record
@@ -452,34 +333,14 @@ def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any
     joining = leave._joining_date(user)
     upcoming_leave = _upcoming_leave(user_id, start, min(end, window_end), today)
     configured_weekdays = company_weekly_off_weekdays()
-    limit = min(4, _weekly_off_limit())
-    existing_weekly_dates = {
-        date.fromisoformat(iso) for iso, record in records.items()
-        if str(record.get("status") or "").casefold() == "weekly off"
-    }
-    scheduled_weekly_off_dates = set(existing_weekly_dates)
-    if end >= today:
-        candidates = []
-        cursor = start
-        while cursor <= end:
-            iso = cursor.isoformat()
-            record = records.get(iso)
-            if (cursor.weekday() in configured_weekdays
-                    and cursor not in holidays
-                    and cursor not in upcoming_leave
-                    and (not joining or cursor >= joining)
-                    and (not record or str(record.get("status") or "").casefold() in {"not marked", "weekly off"})):
-                candidates.append(cursor)
-            cursor += timedelta(days=1)
-        remaining = max(0, limit - len(scheduled_weekly_off_dates))
-        scheduled_weekly_off_dates.update(select_weekly_off_dates(candidates, remaining, configured_weekdays))
+    # Weekly Off dates are displayed only when a record exists. The employee
+    # schedule remains available for validation in the manual generation API.
     return {
         "start": start,
         "end": end,
         "records": records,
         "holidays": holidays,
         "weekly_offs": configured_weekdays,
-        "scheduled_weekly_off_dates": scheduled_weekly_off_dates,
         "joining": joining,
         "today": today,
         "month_completed": end < today,
@@ -502,13 +363,9 @@ def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any
             return "Holiday"
         if current in ctx.get("upcoming_leave", {}):
             return "Leave"
-        if current in ctx.get("scheduled_weekly_off_dates", set()):
-            return "Weekly Off"
         return "Upcoming"
     if current in ctx["holidays"]:
         return "Holiday"
-    if current in ctx.get("scheduled_weekly_off_dates", set()):
-        return "Weekly Off"
     if ctx["joining"] and current < ctx["joining"]:
         return BEFORE_JOINING
     return "Not Marked"
@@ -702,7 +559,7 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         daily_metrics = _calculate_daily_attendance(user_id, current, user)
         day_check_in = daily_metrics.get("first_check_in") or (record or {}).get("check_in_time")
         day_check_out = daily_metrics.get("last_check_out") or (record or {}).get("check_out_time")
-        day_total_minutes = int(daily_metrics.get("elapsed_minutes") or 0)
+        day_total_minutes = int(daily_metrics.get("working_minutes") or 0)
         approved_permission_intervals = [
             (item.get("start_time"), item.get("end_time"))
             for item in permissions if str(item.get("status") or "").casefold() == "approved"
@@ -713,7 +570,9 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         day_completed = bool(current < today or (current == today and day_check_out and daily_metrics.get("attendance_state") != "In Progress"))
         leave_part = (record or {}).get("leave_day_part") or (upcoming_leave or {}).get("day_part")
         half_day = classify_half_day(
-            total_duration_minutes=effective_minutes,
+            total_duration_minutes=int(daily_metrics.get("elapsed_minutes") or daily_metrics.get("total_duration_minutes") or 0),
+            permission_intervals=approved_permission_intervals,
+            recalculated_base=_is_automatic_attendance_record(record),
             half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
             scheduled_start=schedule.get("scheduled_work_start_time"),
             scheduled_end=schedule.get("scheduled_work_end_time"),
@@ -725,6 +584,10 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             leave_is_full_day=bool(day_status == "Leave" and (not leave_part or leave_part == "full_day")),
             working_intervals=daily_metrics.get("working_intervals") or [],
         )
+        if record and record.get("first_half_status") and record.get("second_half_status") and (record.get("hr_admin_modified") or str(record.get("attendance_source") or "").upper() in {"MANUAL", "ADMIN", "ATTENDANCE_REQUEST"}):
+            half_day.update(combine_half_day_statuses(record["first_half_status"], record["second_half_status"]))
+            half_day["half_day_eligibility"] = record.get("half_day_eligibility")
+            half_day["actual_working_minutes"] = record.get("actual_working_minutes", effective_minutes)
         issue = attendance_issue(day_check_in, day_check_out, daily_metrics.get("working_intervals") or [])
         early_minutes, late_minutes = _going_by_minutes(day_check_out, schedule.get("scheduled_work_end_time"))
         resolved_day_status = day_status
@@ -736,10 +599,16 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             # Missing both punches is Not Marked. Do not infer Absent solely
             # because a scheduled date has passed without an attendance record.
             if not issue["has_attendance_issue"] and day_completed:
-                if str(half_day.get("half_day_present") or "No").startswith("Yes"):
-                    resolved_day_status = "Half-Day Present"
-                elif effective_minutes < int(schedule.get("half_day_working_duration") or 0) * 0.80 and day_check_in and day_check_out:
-                    resolved_day_status = "Absent"
+                _status_override = half_day_status_override(
+                    half_day,
+                    total_duration_minutes=int(daily_metrics.get("elapsed_minutes") or daily_metrics.get("total_duration_minutes") or 0),
+                    half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
+                    check_in=day_check_in, check_out=day_check_out, day_completed=day_completed,
+                    current_status=day_status,
+                    recalculated=_is_automatic_attendance_record(record),
+                )
+                if _status_override:
+                    resolved_day_status = _status_override
         reason = None
         if current >= today:
             reason = "Requests are for past dates only; today's attendance can still be marked."
@@ -763,13 +632,14 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             "status_label": "Medical Leave" if record and record.get("medical_leave") else resolved_day_status,
             "attendance_category": _attendance_category(record),
             "attendance_source": record.get("attendance_source") if record else None,
-            "check_in_time": day_check_in,
-            "check_out_time": day_check_out,
+            "check_in_time": _attendance_clock_hhmm(day_check_in),
+            "check_out_time": _attendance_clock_hhmm(day_check_out),
             "working_duration": daily_metrics.get("working_duration") or "0h 00m",
             "working_minutes": int(daily_metrics.get("working_minutes") or 0),
-            "total_duration": _format_duration(effective_minutes),
-            "total_duration_minutes": effective_minutes,
-            "actual_elapsed_minutes": day_total_minutes,
+             "total_duration": _format_duration(int(daily_metrics.get("elapsed_minutes") or 0)),
+            "total_duration_minutes": int(daily_metrics.get("elapsed_minutes") or 0),
+            "effective_working_minutes": effective_minutes,
+            "actual_elapsed_minutes": int(daily_metrics.get("elapsed_minutes") or 0),
             "break_duration": daily_metrics.get("break_duration") or "0h 00m",
             "break_minutes": int(daily_metrics.get("break_minutes", daily_metrics.get("visible_break_minutes", 0)) or 0),
             "working_type": schedule.get("working_type") or "",
@@ -778,8 +648,12 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             "scheduled_work_duration": int(schedule.get("scheduled_work_duration") or 0),
             "half_day_working_duration": int(schedule.get("half_day_working_duration") or 0),
             "half_day_working_duration_text": schedule.get("half_day_working_duration_text") or "",
-            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and effective_minutes >= int(schedule.get("half_day_working_duration") or 0)),
+            "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and int(daily_metrics.get("elapsed_minutes") or daily_metrics.get("total_duration_minutes") or 0) >= int(schedule.get("half_day_working_duration") or 0)),
             "effective_working_minutes": effective_minutes,
+            "first_half_check_in_time": _attendance_clock_hhmm((record or {}).get("first_half_check_in_time")),
+            "first_half_check_out_time": _attendance_clock_hhmm((record or {}).get("first_half_check_out_time")),
+            "second_half_check_in_time": _attendance_clock_hhmm((record or {}).get("second_half_check_in_time")),
+            "second_half_check_out_time": _attendance_clock_hhmm((record or {}).get("second_half_check_out_time")),
             "permission_total_minutes": permission_minutes,
             "working_intervals": daily_metrics.get("working_intervals") or [],
             "early_going_by_minutes": early_minutes,
@@ -992,6 +866,52 @@ def _time_problem(
     return None
 
 
+def _half_day_request_fields(user: dict[str, Any], selected: date, values: dict[str, Any]) -> dict[str, Any]:
+    from app.working_details import applicable_schedule
+
+    user_id = str(user["_id"])
+    schedule = applicable_schedule(user_id, selected)
+    try:
+        portions = calculate_half_day_portions(
+            first_half_status=values.get("first_half_status"),
+            second_half_status=values.get("second_half_status"),
+            first_half_check_in_time=values.get("first_half_check_in_time"),
+            first_half_check_out_time=values.get("first_half_check_out_time"),
+            second_half_check_in_time=values.get("second_half_check_in_time"),
+            second_half_check_out_time=values.get("second_half_check_out_time"),
+            half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
+            scheduled_start=schedule.get("scheduled_work_start_time"),
+            scheduled_end=schedule.get("scheduled_work_end_time"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+
+    approved_leaves = _approved_leaves_for_date(selected.isoformat(), user_id)
+    if any(item.get("day_part", "full_day") == "full_day" for item in approved_leaves):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An approved full-day leave covers this date.")
+    for side in ("first", "second"):
+        half_status = portions[f"{side}_half_status"]
+        if half_status not in {"Leave", "Medical Leave"}:
+            continue
+        expected_part = f"{side}_half"
+        leave_record = next(
+            (item for item in approved_leaves if item.get("day_part") == expected_part),
+            None,
+        )
+        if not leave_record:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"Approved {side}-half leave is required for this request.")
+        leave_code = str(_get_leave_type_code(leave_record) or "").upper()
+        if half_status == "Medical Leave" and leave_code != MEDICAL_LEAVE_CODE:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"Approved Medical Leave is required for the {side} half.")
+        portions.update({
+            "leave_request_id": str(leave_record.get("_id")),
+            "leave_day_part": expected_part,
+            "leave_type_code": leave_code or None,
+            "medical_leave": leave_code == MEDICAL_LEAVE_CODE,
+        })
+    return portions
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_attendance_request(
     payload: AttendanceRequestCreate,
@@ -1038,6 +958,20 @@ def create_attendance_request(
         if time_problem:
             problems.append(f"{iso}: {time_problem}")
             continue
+        half_day_fields = None
+        if item.requested_status == "Half-Day Present":
+            try:
+                half_day_fields = _half_day_request_fields(user, item.attendance_date, {
+                    "first_half_status": item.requested_first_half_status,
+                    "second_half_status": item.requested_second_half_status,
+                    "first_half_check_in_time": item.requested_first_half_check_in_time,
+                    "first_half_check_out_time": item.requested_first_half_check_out_time,
+                    "second_half_check_in_time": item.requested_second_half_check_in_time,
+                    "second_half_check_out_time": item.requested_second_half_check_out_time,
+                })
+            except HTTPException as exc:
+                problems.append(f"{iso}: {exc.detail}")
+                continue
         if item.requested_status == "Permission":
             if not item.requested_permission_start_time or not item.requested_permission_end_time:
                 problems.append(f"{iso}: Permission start and end times are required.")
@@ -1075,11 +1009,45 @@ def create_attendance_request(
             "original_status": day["status"],
             "original_check_in_time": day["check_in_time"],
             "original_check_out_time": day["check_out_time"],
+            "original_first_half_status": day.get("first_half_status"),
+            "original_second_half_status": day.get("second_half_status"),
+            "original_first_half_check_in_time": day.get("first_half_check_in_time"),
+            "original_first_half_check_out_time": day.get("first_half_check_out_time"),
+            "original_second_half_check_in_time": day.get("second_half_check_in_time"),
+            "original_second_half_check_out_time": day.get("second_half_check_out_time"),
             "original_attendance_category": day["attendance_category"],
             "original_has_record": day["has_record"],
             "requested_status": item.requested_status,
             "requested_check_in_time": item.requested_check_in_time if item.requested_status == "Present" else None,
             "requested_check_out_time": item.requested_check_out_time if item.requested_status == "Present" else None,
+            "requested_first_half_status": half_day_fields.get("first_half_status") if half_day_fields else None,
+            "requested_second_half_status": half_day_fields.get("second_half_status") if half_day_fields else None,
+            "requested_first_half_check_in_time": half_day_fields.get("first_half_check_in_time") if half_day_fields else None,
+            "requested_first_half_check_out_time": half_day_fields.get("first_half_check_out_time") if half_day_fields else None,
+            "requested_second_half_check_in_time": half_day_fields.get("second_half_check_in_time") if half_day_fields else None,
+            "requested_second_half_check_out_time": half_day_fields.get("second_half_check_out_time") if half_day_fields else None,
+            "requested_first_half_working_intervals": half_day_fields.get("first_half_working_intervals") if half_day_fields else None,
+            "requested_second_half_working_intervals": half_day_fields.get("second_half_working_intervals") if half_day_fields else None,
+            "requested_actual_working_minutes": half_day_fields.get("actual_working_minutes") if half_day_fields else None,
+            "requested_total_duration_minutes": (
+                duration_minutes(
+                    min([v for v in (
+                        half_day_fields.get("first_half_check_in_time"),
+                        half_day_fields.get("second_half_check_in_time"),
+                    ) if v]),
+                    max([v for v in (
+                        half_day_fields.get("first_half_check_out_time"),
+                        half_day_fields.get("second_half_check_out_time"),
+                    ) if v]),
+                ) if half_day_fields else None
+            ),
+            "requested_total_duration": (
+                _format_duration(duration_minutes(
+                    min([v for v in (half_day_fields.get("first_half_check_in_time"), half_day_fields.get("second_half_check_in_time")) if v]),
+                    max([v for v in (half_day_fields.get("first_half_check_out_time"), half_day_fields.get("second_half_check_out_time")) if v]),
+                ) or 0) if half_day_fields else None
+            ),
+            "requested_half_day_eligibility": half_day_fields.get("half_day_eligibility") if half_day_fields else None,
             "requested_permission_start_time": item.requested_permission_start_time if item.requested_status == "Permission" else None,
             "requested_permission_end_time": item.requested_permission_end_time if item.requested_status == "Permission" else None,
             "requested_permission_reason": item.requested_permission_reason if item.requested_status == "Permission" else None,
@@ -1236,12 +1204,30 @@ def _employee_for_request(request: dict[str, Any]) -> dict[str, Any]:
 
 def _record_matches_original(item: dict[str, Any], record: dict[str, Any] | None, current_status: str) -> bool:
     """True when the date still has the attendance the employee saw at submission."""
-    if current_status != item.get("original_status", "Not Marked"):
+    original_status = item.get("original_status", "Not Marked")
+    if current_status != original_status and not (
+        original_status == "Half-Day Present"
+        and record and record.get("status") == "Present"
+    ):
         return False
     if not record:
         return True
-    return (record.get("check_in_time"), record.get("check_out_time")) == (
-        item.get("original_check_in_time"), item.get("original_check_out_time"),
+    if (_attendance_clock_hhmm(record.get("check_in_time")), _attendance_clock_hhmm(record.get("check_out_time"))) != (
+        _attendance_clock_hhmm(item.get("original_check_in_time")), _attendance_clock_hhmm(item.get("original_check_out_time")),
+    ):
+        return False
+    half_fields = (
+        "first_half_status", "second_half_status",
+        "first_half_check_in_time", "first_half_check_out_time",
+        "second_half_check_in_time", "second_half_check_out_time",
+    )
+    if not any(field in record for field in half_fields):
+        return True
+    return all(
+        _attendance_clock_hhmm(record.get(field)) == _attendance_clock_hhmm(item.get(f"original_{field}"))
+        if field.endswith("_time")
+        else record.get(field) == item.get(f"original_{field}")
+        for field in half_fields
     )
 
 
@@ -1264,9 +1250,25 @@ def get_attendance_request(request_id: str, authorization: str | None = Header(d
         payroll_status = _payroll_status(request.get("employee_id", ""), item["attendance_date"][:7], payroll_cache)
         lock_reason = _payroll_lock_reason(item["attendance_date"][:7], payroll_status)
         item["current_status"] = str(record.get("status")) if record else None
-        item["current_check_in_time"] = record.get("check_in_time") if record else None
-        item["current_check_out_time"] = record.get("check_out_time") if record else None
+        item["current_check_in_time"] = _attendance_clock_hhmm(record.get("check_in_time")) if record else None
+        item["current_check_out_time"] = _attendance_clock_hhmm(record.get("check_out_time")) if record else None
+        for field in (
+            "first_half_status", "second_half_status",
+            "first_half_check_in_time", "first_half_check_out_time",
+            "second_half_check_in_time", "second_half_check_out_time",
+        ):
+            item[f"current_{field}"] = (
+                _attendance_clock_hhmm(record.get(field)) if field.endswith("_time") else record.get(field)
+            ) if record else None
         item["current_attendance_category"] = _attendance_category(record)
+        if can_respond and employee:
+            selected = date.fromisoformat(item["attendance_date"])
+            daily = _calculate_daily_attendance(request["user_id"], selected, employee)
+            item["current_working_intervals"] = daily.get("working_intervals") or []
+            item["current_break_intervals"] = daily.get("break_intervals") or []
+            item["current_working_duration"] = daily.get("working_duration") or "0h 00m"
+            item["current_break_duration"] = daily.get("break_duration") or "0h 00m"
+            item["current_actual_working_minutes"] = int(daily.get("working_minutes") or 0)
         item["payroll_status"] = payroll_status
         item["payroll_locked"] = lock_reason is not None
         item["payroll_note"] = _payroll_draft_note(item["attendance_date"][:7], payroll_status)
@@ -1313,8 +1315,30 @@ def _apply_date_decision(
     user_id = request["user_id"]
     attendance_date = item["attendance_date"]
     final_status = decision.final_status or ""
-    check_in = decision.final_check_in_time if final_status == "Present" else None
-    check_out = decision.final_check_out_time if final_status == "Present" else None
+    half_day_fields = None
+    if final_status == "Half-Day Present":
+        try:
+            half_day_fields = _half_day_request_fields(employee, date.fromisoformat(attendance_date), {
+                "first_half_status": decision.final_first_half_status,
+                "second_half_status": decision.final_second_half_status,
+                "first_half_check_in_time": decision.final_first_half_check_in_time,
+                "first_half_check_out_time": decision.final_first_half_check_out_time,
+                "second_half_check_in_time": decision.final_second_half_check_in_time,
+                "second_half_check_out_time": decision.final_second_half_check_out_time,
+            })
+        except HTTPException as exc:
+            return False, final_status, str(exc.detail)
+        final_status = half_day_fields["status"]
+        present_times = [
+            (half_day_fields.get(f"{side}_half_check_in_time"), half_day_fields.get(f"{side}_half_check_out_time"))
+            for side in ("first", "second")
+            if half_day_fields.get(f"{side}_half_check_in_time") and half_day_fields.get(f"{side}_half_check_out_time")
+        ]
+        check_in = min((pair[0] for pair in present_times), default=None)
+        check_out = max((pair[1] for pair in present_times), default=None)
+    else:
+        check_in = decision.final_check_in_time if final_status == "Present" else None
+        check_out = decision.final_check_out_time if final_status == "Present" else None
     period = attendance_date[:7]
     lock_reason = _payroll_lock_reason(period, _payroll_status(request.get("employee_id", ""), period, payroll_cache))
     if lock_reason:
@@ -1383,14 +1407,23 @@ def _apply_date_decision(
         "check_out_time": check_out,
         "punch_details_missing": final_status == "Present" and not check_in,
         "attendance_source": "ATTENDANCE_REQUEST",
-        "attendance_type": (existing or {}).get("attendance_type") if final_status == "Present" else None,
+        "attendance_type": (existing or {}).get("attendance_type") if final_status in {"Present", "Half-Day Present"} else None,
         "attendance_request_id": request_id,
         "attendance_request_number": request.get("request_number"),
         "marked_by": str(admin["_id"]),
         "updated_at": now,
     }
     unset = {field: "" for field in ESSL_FIELDS}
-    if final_status == "Medical Leave":
+    if half_day_fields:
+        values.update(half_day_fields)
+        if half_day_fields.get("leave_request_id"):
+            values["leave_request_id"] = half_day_fields["leave_request_id"]
+            values["leave_day_part"] = half_day_fields["leave_day_part"]
+            values["leave_type_code"] = half_day_fields["leave_type_code"]
+            values["medical_leave"] = half_day_fields["medical_leave"]
+        else:
+            unset.update({field: "" for field in LEAVE_FIELDS})
+    elif final_status == "Medical Leave":
         values.update({
             "leave_type_code": MEDICAL_LEAVE_CODE,
             "leave_day_part": "full_day",
@@ -1399,19 +1432,40 @@ def _apply_date_decision(
         })
     else:
         unset.update({field: "" for field in LEAVE_FIELDS})
+        unset.update({
+            "first_half_status": "", "second_half_status": "",
+            "first_half_check_in_time": "", "first_half_check_out_time": "",
+            "second_half_check_in_time": "", "second_half_check_out_time": "",
+            "first_half_working_intervals": "", "second_half_working_intervals": "",
+            "half_day_present": "", "half_day_present_side": "",
+            "half_day_eligibility": "", "half_day_working_duration": "",
+            "actual_working_minutes": "", "working_intervals": "",
+        })
     if existing:
         values["correction_previous"] = {
             "status": existing.get("status"),
             "check_in_time": existing.get("check_in_time"),
             "check_out_time": existing.get("check_out_time"),
             "attendance_source": existing.get("attendance_source"),
+            "first_half_status": existing.get("first_half_status"),
+            "second_half_status": existing.get("second_half_status"),
+            "first_half_check_in_time": existing.get("first_half_check_in_time"),
+            "first_half_check_out_time": existing.get("first_half_check_out_time"),
+            "second_half_check_in_time": existing.get("second_half_check_in_time"),
+            "second_half_check_out_time": existing.get("second_half_check_out_time"),
         }
+        compare_fields = (
+            "first_half_status", "second_half_status",
+            "first_half_check_in_time", "first_half_check_out_time",
+            "second_half_check_in_time", "second_half_check_out_time",
+        )
         written = attendance_collection.update_one(
             {
                 "_id": existing["_id"],
                 "status": existing.get("status"),
                 "check_in_time": existing.get("check_in_time"),
                 "check_out_time": existing.get("check_out_time"),
+                **{field: existing.get(field) for field in compare_fields},
             },
             {"$set": values, "$unset": unset},
         )
@@ -1524,6 +1578,19 @@ def _validate_decisions(request: dict[str, Any], payload: AttendanceRequestRespo
                 problems.append(f"{iso}: Permission was not the requested correction type.")
                 continue
             continue
+        if decision.final_status == "Half-Day Present":
+            try:
+                _half_day_request_fields(employee, date.fromisoformat(iso), {
+                    "first_half_status": decision.final_first_half_status,
+                    "second_half_status": decision.final_second_half_status,
+                    "first_half_check_in_time": decision.final_first_half_check_in_time,
+                    "first_half_check_out_time": decision.final_first_half_check_out_time,
+                    "second_half_check_in_time": decision.final_second_half_check_in_time,
+                    "second_half_check_out_time": decision.final_second_half_check_out_time,
+                })
+            except HTTPException as exc:
+                problems.append(f"{iso}: {exc.detail}")
+            continue
         time_problem = _time_problem(
             decision.final_status, decision.final_check_in_time, decision.final_check_out_time,
             {"status": original, "check_in_time": item.get("original_check_in_time"), "check_out_time": item.get("original_check_out_time")},
@@ -1616,16 +1683,34 @@ def respond_to_attendance_request(
                                 "outcome": "rejected", "applied": False, "message": "Rejected by HR Admin; attendance unchanged."})
                 continue
             applied, final_status, message = _apply_date_decision(claimed, item, decision, admin, employee, payroll_cache)
-            final_in = decision.final_check_in_time if final_status == "Present" else None
-            final_out = decision.final_check_out_time if final_status == "Present" else None
+            if decision.final_status == "Half-Day Present":
+                final_present_times = [
+                    (decision.final_first_half_check_in_time, decision.final_first_half_check_out_time),
+                    (decision.final_second_half_check_in_time, decision.final_second_half_check_out_time),
+                ]
+                final_present_times = [pair for pair in final_present_times if pair[0] and pair[1]]
+                final_in = min((pair[0] for pair in final_present_times), default=None)
+                final_out = max((pair[1] for pair in final_present_times), default=None)
+            else:
+                final_in = decision.final_check_in_time if final_status == "Present" else None
+                final_out = decision.final_check_out_time if final_status == "Present" else None
             if not applied:
                 outcome = "not_applied"
             elif final_status == item["requested_status"] and (final_in, final_out) == (item.get("requested_check_in_time"), item.get("requested_check_out_time")):
                 outcome = "approved"
             else:
                 outcome = "changed"
-            results.append({**item, "decision": "approve", "final_status": final_status, "final_check_in_time": final_in,
-                            "final_check_out_time": final_out, "outcome": outcome, "applied": applied, "message": message})
+            results.append({
+                **item, "decision": "approve", "final_status": final_status,
+                "final_check_in_time": final_in, "final_check_out_time": final_out,
+                "final_first_half_status": decision.final_first_half_status if decision.final_status == "Half-Day Present" else None,
+                "final_second_half_status": decision.final_second_half_status if decision.final_status == "Half-Day Present" else None,
+                "final_first_half_check_in_time": decision.final_first_half_check_in_time if decision.final_status == "Half-Day Present" else None,
+                "final_first_half_check_out_time": decision.final_first_half_check_out_time if decision.final_status == "Half-Day Present" else None,
+                "final_second_half_check_in_time": decision.final_second_half_check_in_time if decision.final_status == "Half-Day Present" else None,
+                "final_second_half_check_out_time": decision.final_second_half_check_out_time if decision.final_status == "Half-Day Present" else None,
+                "outcome": outcome, "applied": applied, "message": message,
+            })
     except Exception as exc:
         # Leave the claim to expire so a retry resumes idempotently; dates
         # already written are recognised by attendance_request_id.

@@ -5,6 +5,7 @@ import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
 import MyAttendanceRequests from "../components/MyAttendanceRequests";
 import { getAttendanceCalendar } from "../services/attendanceRequestApi";
 import { buildCalendarRange, clampMonth, isMonthInRange, isSelectableDate, minSelectableDate } from "../services/attendanceCalendarRange";
+import { formatAttendanceClock as formatTime } from "../services/attendanceHistoryFormat.js";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
@@ -17,29 +18,6 @@ const companyDateParts = (date = new Date()) => {
     day: "2-digit",
   }).formatToParts(date);
   return Object.fromEntries(parts.map(({ type, value }) => [type, value]));
-};
-
-const formatTime = (time) => {
-  if (!time) return "—";
-  const value = String(time).trim();
-  const clockMatch = value.match(/^(\\d{1,2}):(\\d{2})(?::\\d{2})?$/);
-  let hour;
-  let minute;
-  if (clockMatch) {
-    hour = Number(clockMatch[1]);
-    minute = clockMatch[2];
-  } else {
-    const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) return value;
-    // Attendance API timestamps are rendered in the company's IST timezone.
-    const parts = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-    }).formatToParts(parsed);
-    hour = Number(parts.find((part) => part.type === "hour")?.value);
-    minute = parts.find((part) => part.type === "minute")?.value || "00";
-  }
-  if (!Number.isFinite(hour) || hour < 0 || hour > 23) return value;
-  return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 };
 
 const getSource = (record) => {

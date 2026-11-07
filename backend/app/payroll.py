@@ -415,18 +415,17 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     employee_user = users_collection.find_one({"employee_id": employee_id})
     from app.attendance import company_today
     if employee_user and end_date < company_today():
-        # Ensure payroll sees the same finalized weekly-off records as calendars
-        # and reports, even if no employee opened the month view first.
+        # Keep leave synchronization, but never create Weekly Off attendance
+        # records as a side effect of payroll calculation.
         from app.attendance import _sync_leave_for_user_range
-        from app.attendance_requests import _ensure_monthly_auto_weekly_offs
         _sync_leave_for_user_range(str(employee_user["_id"]), start, end)
-        _ensure_monthly_auto_weekly_offs(employee_user, year, month)
 
     records = list(attendance_collection.find({
         "employee_id": employee_id,
         "attendance_date": {"$gte": start, "$lte": end},
     }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1, "medical_leave": 1,
-        "first_half_status": 1, "second_half_status": 1, "check_in_time": 1, "check_out_time": 1}))
+        "first_half_status": 1, "second_half_status": 1, "check_in_time": 1, "check_out_time": 1,
+        "attendance_source": 1, "hr_admin_modified": 1, "approved_permission": 1}))
 
     leave_codes = {
         str(row.get("leave_type_code") or "").upper()
@@ -460,7 +459,7 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
         status_value = str(row.get("status") or "").strip().casefold()
         first_half = str(row.get("first_half_status") or "").strip().casefold()
         second_half = str(row.get("second_half_status") or "").strip().casefold()
-        if employee_user:
+        if employee_user and (not (first_half in half_status_values and second_half in half_status_values) or (str(row.get("attendance_source") or "").upper() in {"ESSL", "WFH_FACE_GPS"} and not row.get("hr_admin_modified"))):
             try:
                 from app.attendance import (
                     _calculate_daily_attendance, _collect_permissions,
@@ -477,7 +476,7 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
                 schedule = applicable_schedule(user_id, selected_date)
                 check_in = daily.get("first_check_in") or row.get("check_in_time")
                 check_out = daily.get("last_check_out") or row.get("check_out_time")
-                raw_total_minutes = int(daily.get("elapsed_minutes") or 0)
+                raw_total_minutes = int(daily.get("working_minutes") or 0)
                 permission_map = _collect_permissions(
                     user_id, selected_date.isoformat(), (selected_date + timedelta(days=1)).isoformat(),
                     {selected_date.isoformat(): row},
@@ -490,7 +489,9 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
                 today = company_today()
                 completed = bool(selected_date < today or (selected_date == today and check_out and daily.get("attendance_state") != "In Progress"))
                 half = classify_half_day(
-                    total_duration_minutes=effective_minutes,
+                    total_duration_minutes=int(daily.get("elapsed_minutes") or daily.get("total_duration_minutes") or 0),
+                    permission_intervals=[item["_interval"] for item in permission_entries],
+                    recalculated_base=(str(row.get("attendance_source") or "").upper() in {"ESSL", "WFH_FACE_GPS"} and not row.get("hr_admin_modified")),
                     half_day_threshold_minutes=int(schedule.get("half_day_working_duration") or 0),
                     scheduled_start=schedule.get("scheduled_work_start_time"),
                     scheduled_end=schedule.get("scheduled_work_end_time"),
@@ -595,30 +596,9 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
             if day_status.get(holiday_key, ("absent",))[0] == "absent":
                 day_status[holiday_key] = ("holiday", True, 1.0)
 
-    # Unrecorded HR-configured weekly-off days are payable, from the joining
-    # date up to today; any explicit attendance record for the date wins.
-    from app.attendance import company_today, company_weekly_off_weekdays
-    weekly_off_weekdays = company_weekly_off_weekdays()
-    if weekly_off_weekdays:
-        from app import leave as leave_module
-        joining = leave_module._joining_date(employee_user) if employee_user else None
-        current = max(start_date, joining) if joining else start_date
-        today = company_today()
-        last = min(end_date, today)
-        # A completed month has already been finalized into at most four
-        # persisted Weekly Off attendance records by attendance_requests.
-        # For an in-progress month, preview no more than four configured days.
-        if end_date >= today:
-            candidates = []
-            while current <= last:
-                if current.weekday() in weekly_off_weekdays and current.isoformat() not in day_status:
-                    candidates.append(current)
-                current += timedelta(days=1)
-            from app.attendance_calculations import select_weekly_off_dates
-            existing_weekly_count = sum(1 for value in day_status.values() if value[0] == "weekly_off")
-            selected_weekly_dates = select_weekly_off_dates(candidates, max(0, 4 - existing_weekly_count), weekly_off_weekdays)
-            for weekly_date in selected_weekly_dates:
-                day_status[weekly_date.isoformat()] = ("weekly_off", True, 1.0)
+    # Weekly Off is payable only when an explicit attendance record exists.
+    # Do not synthesize weekly-off days during payroll calculation; the HR Admin
+    # must generate them manually from the Historical Attendance popup.
 
     # Approved leave requests are the source of truth for approved leave. Use
     # them to fill dates not already represented by a higher-priority attendance

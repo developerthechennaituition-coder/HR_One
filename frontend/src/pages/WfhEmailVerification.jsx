@@ -1,11 +1,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import WfhAttendance from "./WfhAttendance";
+import { HRONE_API_BASE } from "../config/api.js";
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL ||
-  `${window.location.protocol}//${window.location.hostname}:8000`
-).replace(/\/+$/, "");
+const API_BASE_URL = HRONE_API_BASE;
 
 function WfhEmailVerification() {
   const [state, setState] = useState({

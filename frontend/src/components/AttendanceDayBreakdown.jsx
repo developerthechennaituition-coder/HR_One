@@ -1,5 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useState } from "react";
+import { formatAttendanceClock as formatClock } from "../services/attendanceHistoryFormat.js";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
 
@@ -18,15 +19,6 @@ function getToken() {
   } catch {
     return "";
   }
-}
-
-function formatClock(value) {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: true,
-  }).format(date);
 }
 
 function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", date, minDate, onDateChange, showStatus = false, calendarDay = null, refreshKey = 0 }) {
@@ -102,7 +94,7 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
             {showStatus && (
               <div className="d-flex flex-wrap gap-4 mb-3 small">
                 <div><span className="text-muted">Status</span><div className="fw-semibold fs-6">{(calendarDay?.attendance_date === selectedDate && (calendarDay.status_label || calendarDay.status)) || data.status || "Not Marked"}{calendarDay?.attendance_date === selectedDate && calendarDay.holiday_name ? ` · ${calendarDay.holiday_name}` : ""}</div></div>
-                <div><span className="text-muted">Check-in / Check-out</span><div className="fw-semibold fs-6">{calendarDay?.attendance_date === selectedDate && calendarDay.has_record ? `${calendarDay.check_in_time || "Not recorded"} / ${calendarDay.check_out_time || "Not recorded"}` : "—"}</div></div>
+                <div><span className="text-muted">Check-in / Check-out</span><div className="fw-semibold fs-6">{calendarDay?.attendance_date === selectedDate && calendarDay.has_record ? `${formatClock(data.first_check_in || data.check_in_time || calendarDay.check_in_time) === "—" ? "Not recorded" : formatClock(data.first_check_in || data.check_in_time || calendarDay.check_in_time)} / ${formatClock(data.last_check_out || data.check_out_time || calendarDay.check_out_time) === "—" ? "Not recorded" : formatClock(data.last_check_out || data.check_out_time || calendarDay.check_out_time)}` : "—"}</div></div>
                 <div><span className="text-muted">Attendance category</span><div className="fw-semibold fs-6">{data.attendance_type === "WFH" || data.attendance_source === "WFH_FACE_GPS" ? "Work From Home" : data.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(data.attendance_source) ? "Office" : "—"}</div></div>
                 <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" ? "Attendance request (no punch recorded)" : data.attendance_source || "—"}</div></div>
                 <div><span className="text-muted">Scheduled time</span><div className="fw-semibold fs-6">{data.scheduled_work_start_time || "—"} – {data.scheduled_work_end_time || "—"}</div></div>
@@ -160,11 +152,13 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
                 <div className="rounded border p-3 h-100">
                   <div className="small text-muted">Half Day Time</div>
                   <div className="fs-5 fw-semibold">{data.half_day_working_duration_text || "—"}</div>
-                  <div className="small text-muted">Effective time: {duration(data.effective_working_minutes || 0)}</div>
+                  <div className="small text-muted">Half-day comparison time (Total Duration): {duration(data.total_duration_minutes ?? data.elapsed_minutes ?? 0)}</div>
                 </div>
               </div>
               {data.half_day_review_required && (
-                <div className="col-12"><div className="alert alert-warning py-2 mb-0 small">Half-day attendance is not finalized or requires HR Admin review.</div></div>
+                <div className="col-12"><div className="alert alert-warning py-2 mb-0 small">{data.first_half_status === "Not Finalized"
+                  ? "Today's attendance is still in progress and will be finalized automatically after check-out."
+                  : "Half-day attendance cannot be finalized because a check-in or check-out punch is missing. HR Admin review is required."}</div></div>
               )}
             </div>
 

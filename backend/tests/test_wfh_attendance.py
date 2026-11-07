@@ -496,6 +496,48 @@ class WfhAttendanceValidationTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 403)
         self.assertIn("not enabled", error.exception.detail)
 
+    def test_wfh_me_reports_disabled_employee_without_exposing_wfh_details(self):
+        with (
+            patch.object(
+                attendance.wfh_email_sessions_collection,
+                "find_one",
+                return_value=None,
+            ),
+            patch.object(
+                attendance,
+                "_current_user",
+                return_value={
+                    "_id": ObjectId(),
+                    "role": "Employee",
+                    "is_wfh_enabled": False,
+                    "home_latitude": 12.34,
+                    "home_longitude": 56.78,
+                },
+            ),
+        ):
+            result = attendance.get_my_wfh_settings("Bearer valid", None)
+
+        self.assertIs(result["is_wfh_enabled"], False)
+        self.assertEqual(set(result), {"is_wfh_enabled", "wfh_company_enabled"})
+
+    def test_wfh_me_still_rejects_unsupported_roles(self):
+        with (
+            patch.object(
+                attendance.wfh_email_sessions_collection,
+                "find_one",
+                return_value=None,
+            ),
+            patch.object(
+                attendance,
+                "_current_user",
+                return_value={"role": "Intern", "is_wfh_enabled": True},
+            ),
+            self.assertRaises(HTTPException) as error,
+        ):
+            attendance.get_my_wfh_settings("Bearer valid", None)
+
+        self.assertEqual(error.exception.status_code, 403)
+
     def test_attendance_payload_cannot_select_identity_or_server_fields(self):
         payload = WfhAttendancePayload(
             employee_id="forged",

@@ -12,13 +12,40 @@ import {
 } from "../services/attendanceRequestApi";
 
 const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const STATUS_FILTERS = ["Not Marked", "Absent", "Present", "Weekly Off", "Holiday", "Not Applicable", "all"];
+const STATUS_FILTERS = ["Not Marked", "Absent", "Half-Day Present", "Present", "Weekly Off", "Holiday", "Not Applicable", "all"];
 const ACTIVE_STATUSES = new Set(["pending", "processing"]);
 
 const timeSuffix = (checkIn, checkOut) => {
   const text = formatTimeRange(checkIn, checkOut);
   return text ? ` (${text})` : "";
 };
+
+function durationForClockPair(checkIn, checkOut) {
+  if (!checkIn || !checkOut) return "—";
+  const toMinutes = (value) => {
+    const [hours, minutes] = String(value).slice(0, 5).split(":").map(Number);
+    return hours * 60 + minutes;
+  };
+  let minutes = toMinutes(checkOut) - toMinutes(checkIn);
+  if (minutes < 0) minutes += 1440;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function totalDurationForEntry(entry) {
+  const present = [["first", entry.first_half_status, entry.first_half_check_in, entry.first_half_check_out],
+    ["second", entry.second_half_status, entry.second_half_check_in, entry.second_half_check_out]]
+    .filter(([, status]) => status === "Present");
+  const starts = present.map(([, , start]) => start).filter(Boolean).sort();
+  const ends = present.map(([, , , end]) => end).filter(Boolean).sort();
+  if (!starts.length || !ends.length) return "—";
+  const toMinutes = (value) => {
+    const [hours, minutes] = String(value).slice(0, 5).split(":").map(Number);
+    return hours * 60 + minutes;
+  };
+  let minutes = toMinutes(ends[ends.length - 1]) - toMinutes(starts[0]);
+  if (minutes < 0) minutes += 1440;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
 
 export function DateDecisionList({ dates }) {
   return (
@@ -28,6 +55,13 @@ export function DateDecisionList({ dates }) {
           <strong>{formatRequestDate(item.attendance_date)}</strong>
           {item.original_status && <span className="text-muted"> · was {item.original_status}{timeSuffix(item.original_check_in_time, item.original_check_out_time)}</span>}
           <div>Requested {item.requested_status}{timeSuffix(item.requested_check_in_time, item.requested_check_out_time)}{item.requested_status === "Permission" ? ` (${item.requested_permission_start_time}–${item.requested_permission_end_time})` : ""}</div>
+          {item.requested_status === "Half-Day Present" && (
+            <div className="small">
+              First half: {item.requested_first_half_status || "—"}{timeSuffix(item.requested_first_half_check_in_time, item.requested_first_half_check_out_time)}
+              {" · "}Second half: {item.requested_second_half_status || "—"}{timeSuffix(item.requested_second_half_check_in_time, item.requested_second_half_check_out_time)}
+              <div>Total Duration: {item.requested_total_duration || "—"}</div>
+            </div>
+          )}
           {item.outcome ? (
             <div className={item.outcome === "rejected" || item.outcome === "not_applied" ? "text-danger" : "text-success"}>
               {OUTCOME_LABELS[item.outcome]}
@@ -48,6 +82,29 @@ function rowProblem(entry) {
     if (!entry.permission_start || !entry.permission_end) return "Enter Permission start and end times.";
     if (entry.permission_end <= entry.permission_start) return "Permission end must be later than Permission start.";
     if (!entry.permission_reason?.trim()) return "Enter a Permission reason.";
+    return "";
+  }
+  if (status === "Half-Day Present") {
+    const first = entry.first_half_status;
+    const second = entry.second_half_status;
+    if (!first || !second) return "Select a status for both halves.";
+    if (!["Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"].includes(first) ||
+        !["Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"].includes(second)) {
+      return "Select a supported status for both halves.";
+    }
+    if (first !== "Present" && second !== "Present") return "At least one half must be Present.";
+    for (const [label, halfStatus, start, end] of [
+      ["First", first, entry.first_half_check_in, entry.first_half_check_out],
+      ["Second", second, entry.second_half_check_in, entry.second_half_check_out],
+    ]) {
+      if (halfStatus !== "Present") continue;
+      if (!start || !end) return `${label} Half requires check-in and check-out times.`;
+      if (end <= start) return `${label} Half check-out must be later than check-in.`;
+    }
+    if (first === "Present" && second === "Present" &&
+        entry.first_half_check_out > entry.second_half_check_in) {
+      return "First-half and second-half working intervals cannot overlap.";
+    }
     return "";
   }
   if (status !== "Present") return "";
@@ -142,6 +199,12 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
           // Existing times prefill the Present correction fields; nothing is invented.
           check_in: day.check_in_time || "",
           check_out: day.check_out_time || "",
+          first_half_status: day.first_half_status || (day.half_day_present_side === "first" ? "Present" : ""),
+          second_half_status: day.second_half_status || (day.half_day_present_side === "second" ? "Present" : ""),
+          first_half_check_in: day.first_half_check_in_time || (day.half_day_present_side === "first" ? day.check_in_time || "" : ""),
+          first_half_check_out: day.first_half_check_out_time || (day.half_day_present_side === "first" ? day.check_out_time || "" : ""),
+          second_half_check_in: day.second_half_check_in_time || (day.half_day_present_side === "second" ? day.check_in_time || "" : ""),
+          second_half_check_out: day.second_half_check_out_time || (day.half_day_present_side === "second" ? day.check_out_time || "" : ""),
           permission_start: "",
           permission_end: "",
           permission_reason: "",
@@ -186,11 +249,18 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
         selectedDates.map((iso) => {
           const entry = selected[iso];
           const isPresent = entry.requested_status === "Present";
+          const isHalfDay = entry.requested_status === "Half-Day Present";
           return {
             attendance_date: iso,
             requested_status: entry.requested_status,
             requested_check_in_time: isPresent ? entry.check_in || null : null,
             requested_check_out_time: isPresent ? entry.check_out || null : null,
+            requested_first_half_status: isHalfDay ? entry.first_half_status : null,
+            requested_second_half_status: isHalfDay ? entry.second_half_status : null,
+            requested_first_half_check_in_time: isHalfDay && entry.first_half_status === "Present" ? entry.first_half_check_in || null : null,
+            requested_first_half_check_out_time: isHalfDay && entry.first_half_status === "Present" ? entry.first_half_check_out || null : null,
+            requested_second_half_check_in_time: isHalfDay && entry.second_half_status === "Present" ? entry.second_half_check_in || null : null,
+            requested_second_half_check_out_time: isHalfDay && entry.second_half_status === "Present" ? entry.second_half_check_out || null : null,
             requested_permission_start_time: entry.requested_status === "Permission" ? entry.permission_start : null,
             requested_permission_end_time: entry.requested_status === "Permission" ? entry.permission_end : null,
             requested_permission_reason: entry.requested_status === "Permission" ? entry.permission_reason.trim() : null,
@@ -366,7 +436,43 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                                 ) : null}
                               </td>
                               <td style={{ minWidth: 200 }}>
-                                {entry?.requested_status === "Permission" ? (
+                                {entry?.requested_status === "Half-Day Present" ? (
+                                  <div className="d-grid gap-2">
+                                    {[
+                                      ["first", "First Half"],
+                                      ["second", "Second Half"],
+                                    ].map(([side, label]) => {
+                                      const statusKey = `${side}_half_status`;
+                                      const inKey = `${side}_half_check_in`;
+                                      const outKey = `${side}_half_check_out`;
+                                      return (
+                                        <fieldset className="border rounded p-2" key={side}>
+                                          <legend className="float-none w-auto px-1 small fw-semibold mb-1">{label}</legend>
+                                          <label className="small w-100">Status
+                                            <select className="form-select form-select-sm" value={entry[statusKey] || ""} disabled={submitting}
+                                              onChange={(e) => updateEntry(iso, { [statusKey]: e.target.value })}>
+                                              <option value="">Select status...</option>
+                                              {["Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"].map((value) => <option key={value}>{value}</option>)}
+                                            </select>
+                                          </label>
+                                          {entry[statusKey] === "Present" && (
+                                            <div className="d-flex flex-wrap gap-2 mt-2">
+                                              <label className="small mb-0 flex-fill">Check-in
+                                                <input type="time" className="form-control form-control-sm" value={entry[inKey] || ""} disabled={submitting}
+                                                  onChange={(e) => updateEntry(iso, { [inKey]: e.target.value })} />
+                                              </label>
+                                              <label className="small mb-0 flex-fill">Check-out
+                                                <input type="time" className="form-control form-control-sm" value={entry[outKey] || ""} disabled={submitting}
+                                                  onChange={(e) => updateEntry(iso, { [outKey]: e.target.value })} />
+                                              </label>
+                                            </div>
+                                          )}
+                                        </fieldset>
+                                      );
+                                    })}
+                                    <div className="small text-muted">Total Duration: <strong>{totalDurationForEntry(entry)}</strong> (Check-out − Check-in)</div>
+                                  </div>
+                                ) : entry?.requested_status === "Permission" ? (
                                   <div className="d-flex flex-wrap gap-2">
                                     <label className="small mb-0">Permission start<input type="time" className="form-control form-control-sm" value={entry.permission_start || ""} disabled={submitting} onChange={(e) => updateEntry(iso, { permission_start: e.target.value })} /></label>
                                     <label className="small mb-0">Permission end<input type="time" className="form-control form-control-sm" value={entry.permission_end || ""} disabled={submitting} onChange={(e) => updateEntry(iso, { permission_end: e.target.value })} /></label>
@@ -382,6 +488,7 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                                       <input type="time" className="form-control form-control-sm" value={entry.check_out} disabled={submitting}
                                         onChange={(e) => updateEntry(iso, { check_out: e.target.value })} />
                                     </label>
+                                    <div className="small text-muted w-100">Total Duration: <strong>{durationForClockPair(entry.check_in, entry.check_out)}</strong> (Check-out − Check-in)</div>
                                   </div>
                                 ) : <span className="small text-muted">—</span>}
                                 {problem && entry?.requested_status && <div className="small text-danger mt-1">{problem}</div>}
@@ -401,6 +508,7 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                       <span key={iso} className="badge text-bg-light border d-inline-flex align-items-center gap-1 text-wrap text-start">
                         {formatRequestDate(iso)} · {selected[iso].requested_status || "status not selected"}
                         {selected[iso].requested_status === "Present" && timeSuffix(selected[iso].check_in, selected[iso].check_out)}
+                        {selected[iso].requested_status === "Half-Day Present" && ` · First ${selected[iso].first_half_status || "—"} · Second ${selected[iso].second_half_status || "—"}`}
                         <button type="button" className="btn-close" style={{ fontSize: 8 }} aria-label={`Remove ${iso}`} onClick={() => toggleDate(selected[iso].day, false)} disabled={submitting} />
                       </span>
                     ))}

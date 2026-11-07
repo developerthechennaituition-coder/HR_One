@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
+import { HRONE_API_BASE } from "../config/api.js";
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ||
-  `${window.location.protocol}//${window.location.hostname}:8000`).replace(/\/+$/, "");
+// Use the shared API base (same source as notifications, attendance, leave and
+// payroll). The page previously derived its own base from the browser's
+// protocol/host, which produced https://<LAN-IP>:8000 against a plain-HTTP
+// backend and caused "Failed to fetch" / "Invalid HTTP request received".
+const API_BASE_URL = HRONE_API_BASE;
+const CONNECTION_ERROR_MESSAGE = "Unable to connect to the attendance server.";
+const NOT_AUTHORIZED_MESSAGE = "Your account is not authorized.";
+const WFH_DISABLED_MESSAGE = "WFH attendance is not enabled.";
 const configuredPublicFrontendUrl = (import.meta.env.VITE_PUBLIC_FRONTEND_URL || "").trim();
 const configuredFrontendIsLocal = /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(
   configuredPublicFrontendUrl.replace(/\/+$/, ""),
@@ -55,6 +62,9 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
   const [locationResult, setLocationResult] = useState(null);
   const [cameraReady, setCameraReady] = useState(false);
   const [error, setError] = useState("");
+  // Failure to load WFH status (network / authorization). Kept separate from
+  // `error` so a failed request is never rendered as "WFH not enabled".
+  const [statusError, setStatusError] = useState(null);
   const [notice, setNotice] = useState("");
   const [fallbackRequestPurpose, setFallbackRequestPurpose] = useState(null);
   const [showFallbackOptions, setShowFallbackOptions] = useState(false);
@@ -66,6 +76,7 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
   const workingRef = useRef(false);
   const locationCancelRef = useRef(null);
   const mountedRef = useRef(true);
+  const loadInFlightRef = useRef(null);
 
   const headers = useCallback(() => {
     if (!token) {
@@ -79,32 +90,64 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
 
   const apiRequest = useCallback(
     async (path, options = {}) => {
-      const response = await fetch(`${API_BASE_URL}/api/attendance${path}`, {
-        ...options,
-        headers: { ...headers(), ...options.headers },
-      });
+      let response;
+      try {
+        response = await fetch(`${API_BASE_URL}/api/attendance${path}`, {
+          ...options,
+          headers: { ...headers(), ...options.headers },
+        });
+      } catch (networkError) {
+        // fetch() rejects with a TypeError only when no HTTP response was received.
+        if (networkError?.name === "AbortError") throw networkError;
+        const connectionError = new Error(CONNECTION_ERROR_MESSAGE);
+        connectionError.isNetworkError = true;
+        throw connectionError;
+      }
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        if (response.status === 401) {
-          throw new Error("Your session has expired. Please login again.");
-        }
-        throw new Error(
-          formatApiError(data?.detail) || "Unable to complete WFH attendance.",
+        const requestError = new Error(
+          response.status === 401
+            ? "Your session has expired. Please login again."
+            : formatApiError(data?.detail) || "Unable to complete WFH attendance.",
         );
+        requestError.status = response.status;
+        throw requestError;
       }
       return data;
     },
     [headers],
   );
 
-  const loadSettings = useCallback(async () => {
-    try {
-      setSettings(await apiRequest("/wfh/me"));
-    } catch (loadError) {
-      setError(loadError.message || "Unable to load WFH attendance.");
-    } finally {
-      setLoading(false);
-    }
+  const loadSettings = useCallback(() => {
+    // Share one in-flight request so Refresh Status, the polling timer and
+    // React StrictMode's double effect never fire duplicate /wfh/me calls.
+    if (loadInFlightRef.current) return loadInFlightRef.current;
+    const request = (async () => {
+      try {
+        const latest = await apiRequest("/wfh/me");
+        if (!mountedRef.current) return;
+        setSettings(latest);
+        setStatusError(null);
+      } catch (loadError) {
+        if (!mountedRef.current) return;
+        if (loadError.isNetworkError) {
+          setStatusError({ type: "network", message: CONNECTION_ERROR_MESSAGE });
+        } else if (loadError.status === 403) {
+          setSettings(null);
+          setStatusError({ type: "unauthorized", message: NOT_AUTHORIZED_MESSAGE });
+        } else {
+          setStatusError({
+            type: "error",
+            message: loadError.message || "Unable to load WFH attendance.",
+          });
+        }
+      } finally {
+        loadInFlightRef.current = null;
+        if (mountedRef.current) setLoading(false);
+      }
+    })();
+    loadInFlightRef.current = request;
+    return request;
   }, [apiRequest]);
 
   useEffect(() => {
@@ -652,11 +695,14 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
           type="button"
           className="btn btn-outline-secondary"
           onClick={() => {
+            if (loadInFlightRef.current) return;
             setLoading(true);
             setError("");
+            setNotice("");
+            setStatusError(null);
             loadSettings();
           }}
-          disabled={working}
+          disabled={working || loading}
         >
           Refresh status
         </button>
@@ -699,6 +745,7 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
         )
       )}
       {error && <div className="alert alert-danger" role="alert">{error}</div>}
+      {statusError && settings && <div className="alert alert-danger" role="alert">{statusError.message}</div>}
       {notice && <div className="alert alert-success" role="status">{notice}</div>}
       {fallbackRequestPurpose && !fallbackPurpose && !(fallbackRequestPurpose === "check_in" && lateCheckInBlocked) && (
         <div className="alert alert-warning" role="region" aria-label="Alternative WFH verification options">
@@ -761,10 +808,29 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
         </div>
       )}
 
-      {!settings?.is_wfh_enabled ? (
+      {statusError && !settings ? (
+        <div className="card border-0 shadow-sm" role="alert">
+          <div className="card-body">
+            <h3 className="h5">
+              {statusError.type === "unauthorized"
+                ? NOT_AUTHORIZED_MESSAGE
+                : statusError.type === "network"
+                  ? CONNECTION_ERROR_MESSAGE
+                  : "Unable to load WFH attendance."}
+            </h3>
+            <p className="text-muted mb-0">
+              {statusError.type === "unauthorized"
+                ? "WFH attendance is not available for this account role. Contact HR Admin if you need access."
+                : statusError.type === "network"
+                  ? "Check that the HRMS backend is running and reachable, then select Refresh status."
+                  : statusError.message}
+            </p>
+          </div>
+        </div>
+      ) : !settings?.is_wfh_enabled || settings?.wfh_company_enabled === false ? (
         <div className="card border-0 shadow-sm">
           <div className="card-body">
-            <h3 className="h5">WFH attendance is not enabled</h3>
+            <h3 className="h5">{WFH_DISABLED_MESSAGE}</h3>
             <p className="text-muted mb-0">
               Use the existing HR attendance process. Contact HR Admin if you
               need WFH attendance access.

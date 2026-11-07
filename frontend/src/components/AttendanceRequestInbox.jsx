@@ -4,6 +4,7 @@ import {
   REQUEST_STATUS_LABELS,
   formatRequestDate,
   formatRequestDateTime,
+  formatAttendanceClock,
   formatTimeRange,
   getAttendanceRequest,
   listAttendanceRequests,
@@ -18,6 +19,9 @@ function StatusBadge({ value }) {
 }
 
 const timesOrDash = (checkIn, checkOut) => formatTimeRange(checkIn, checkOut) || "—";
+const intervalSummary = (items) => (items || []).map((item) => (
+  `${formatAttendanceClock(item.from_time)}–${formatAttendanceClock(item.to_time)}${item.duration ? ` (${item.duration})` : item.duration_minutes ? ` (${item.duration_minutes} min)` : ""}`
+)).join(", ");
 
 // No date is pre-approved: HR must choose Approve or Reject for each one.
 const initialDecisions = (request) => Object.fromEntries((request.dates || []).map((item) => [item.attendance_date, {
@@ -28,6 +32,12 @@ const initialDecisions = (request) => Object.fromEntries((request.dates || []).m
   permission_start: item.requested_permission_start_time || "",
   permission_end: item.requested_permission_end_time || "",
   permission_reason: item.requested_permission_reason || "",
+  first_half_status: item.requested_first_half_status || item.original_first_half_status || "",
+  second_half_status: item.requested_second_half_status || item.original_second_half_status || "",
+  first_half_check_in: item.requested_first_half_check_in_time || item.original_first_half_check_in_time || "",
+  first_half_check_out: item.requested_first_half_check_out_time || item.original_first_half_check_out_time || "",
+  second_half_check_in: item.requested_second_half_check_in_time || item.original_second_half_check_in_time || "",
+  second_half_check_out: item.requested_second_half_check_out_time || item.original_second_half_check_out_time || "",
 }]));
 
 function decisionProblem(item, decision) {
@@ -37,6 +47,25 @@ function decisionProblem(item, decision) {
   if (decision.final_status === "Permission") {
     if (!decision.permission_start || !decision.permission_end || decision.permission_end <= decision.permission_start) return "Enter valid Permission start and end times.";
     if (!decision.permission_reason?.trim()) return "Enter a Permission reason.";
+    return "";
+  }
+  if (decision.final_status === "Half-Day Present") {
+    if (!decision.first_half_status || !decision.second_half_status) return "Select a status for both halves.";
+    if (!["Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"].includes(decision.first_half_status) ||
+        !["Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"].includes(decision.second_half_status)) {
+      return "Select a supported status for both halves.";
+    }
+    if (decision.first_half_status !== "Present" && decision.second_half_status !== "Present") return "At least one half must be Present.";
+    for (const [label, halfStatus, start, end] of [
+      ["First", decision.first_half_status, decision.first_half_check_in, decision.first_half_check_out],
+      ["Second", decision.second_half_status, decision.second_half_check_in, decision.second_half_check_out],
+    ]) {
+      if (halfStatus !== "Present") continue;
+      if (!start || !end) return `${label} Half requires check-in and check-out times.`;
+      if (end <= start) return `${label} Half check-out must be later than check-in.`;
+    }
+    if (decision.first_half_status === "Present" && decision.second_half_status === "Present" &&
+        decision.first_half_check_out > decision.second_half_check_in) return "First-half and second-half intervals cannot overlap.";
     return "";
   }
   if (decision.final_status !== "Present") return "";
@@ -148,6 +177,7 @@ function AttendanceRequestInbox() {
         review.dates.map((item) => {
           const decision = decisions[item.attendance_date];
           const isPresent = decision.action === "approve" && decision.final_status === "Present";
+          const isHalfDay = decision.action === "approve" && decision.final_status === "Half-Day Present";
           return decision.action === "reject"
             ? { attendance_date: item.attendance_date, action: "reject" }
             : {
@@ -156,6 +186,12 @@ function AttendanceRequestInbox() {
               final_status: decision.final_status,
               final_check_in_time: isPresent ? decision.check_in || null : null,
               final_check_out_time: isPresent ? decision.check_out || null : null,
+              final_first_half_status: isHalfDay ? decision.first_half_status : null,
+              final_second_half_status: isHalfDay ? decision.second_half_status : null,
+              final_first_half_check_in_time: isHalfDay && decision.first_half_status === "Present" ? decision.first_half_check_in || null : null,
+              final_first_half_check_out_time: isHalfDay && decision.first_half_status === "Present" ? decision.first_half_check_out || null : null,
+              final_second_half_check_in_time: isHalfDay && decision.second_half_status === "Present" ? decision.second_half_check_in || null : null,
+              final_second_half_check_out_time: isHalfDay && decision.second_half_status === "Present" ? decision.second_half_check_out || null : null,
               final_permission_start_time: decision.final_status === "Permission" ? decision.permission_start : null,
               final_permission_end_time: decision.final_status === "Permission" ? decision.permission_end : null,
               final_permission_reason: decision.final_status === "Permission" ? decision.permission_reason.trim() : null,
@@ -304,11 +340,29 @@ function AttendanceRequestInbox() {
                               <td>
                                 <div>{item.original_status}</div>
                                 <div className="small text-muted">{timesOrDash(item.original_check_in_time, item.original_check_out_time)}</div>
+                                {(item.original_first_half_status || item.original_second_half_status) && (
+                                  <div className="small">First: {item.original_first_half_status || "—"} · Second: {item.original_second_half_status || "—"}</div>
+                                )}
+                                {item.current_working_intervals?.length > 0 && (
+                                  <div className="small text-muted">Work: {intervalSummary(item.current_working_intervals)} · Net {item.current_working_duration || "—"}</div>
+                                )}
+                                {item.current_break_intervals?.length > 0 && (
+                                  <div className="small text-muted">Breaks: {intervalSummary(item.current_break_intervals)} · {item.current_break_duration}</div>
+                                )}
                                 {item.original_attendance_category && <div className="small text-muted">{item.original_attendance_category}</div>}
                               </td>
                               <td>
                                 <div className="fw-semibold">{item.requested_status}</div>
                                 {item.requested_status === "Present" && <div className="small">Requested: {timesOrDash(item.requested_check_in_time, item.requested_check_out_time)}</div>}
+                                {item.requested_status === "Half-Day Present" && (
+                                  <div className="small">
+                                    First: {item.requested_first_half_status} {timesOrDash(item.requested_first_half_check_in_time, item.requested_first_half_check_out_time)}
+                                    <br />Second: {item.requested_second_half_status} {timesOrDash(item.requested_second_half_check_in_time, item.requested_second_half_check_out_time)}
+                                    <br />Total Duration: {item.requested_total_duration || "—"} · Net Work: {item.requested_actual_working_minutes ?? "—"} min · {item.requested_half_day_eligibility || "—"}
+                                    {item.requested_first_half_working_intervals?.length > 0 && <><br />First-half intervals: {intervalSummary(item.requested_first_half_working_intervals)}</>}
+                                    {item.requested_second_half_working_intervals?.length > 0 && <><br />Second-half intervals: {intervalSummary(item.requested_second_half_working_intervals)}</>}
+                                  </div>
+                                )}
                                 {item.requested_status === "Permission" && <div className="small">Requested: {item.requested_permission_start_time}–{item.requested_permission_end_time}<br />{item.requested_permission_reason}</div>}
                               </td>
                               <td className="small" style={{ minWidth: 150 }}>
@@ -339,6 +393,42 @@ function AttendanceRequestInbox() {
                                         <label className="small mb-0">Permission start<input type="time" className="form-control form-control-sm" value={decision.permission_start} disabled={submitting} onChange={(e) => updateDecision(iso, { permission_start: e.target.value })} /></label>
                                         <label className="small mb-0">Permission end<input type="time" className="form-control form-control-sm" value={decision.permission_end} disabled={submitting} onChange={(e) => updateDecision(iso, { permission_end: e.target.value })} /></label>
                                         <label className="small mb-0 w-100">Reason<input type="text" className="form-control form-control-sm" value={decision.permission_reason} disabled={submitting} onChange={(e) => updateDecision(iso, { permission_reason: e.target.value })} /></label>
+                                      </div>
+                                    )}
+                                    {decision.final_status === "Half-Day Present" && (
+                                      <div className="d-grid gap-2 mt-2">
+                                        {[
+                                          ["first", "First Half"],
+                                          ["second", "Second Half"],
+                                        ].map(([side, label]) => {
+                                          const statusKey = `${side}_half_status`;
+                                          const inKey = `${side}_half_check_in`;
+                                          const outKey = `${side}_half_check_out`;
+                                          return (
+                                            <fieldset className="border rounded p-2" key={side}>
+                                              <legend className="float-none w-auto px-1 small fw-semibold mb-1">{label}</legend>
+                                              <label className="small w-100">Status
+                                                <select className="form-select form-select-sm" value={decision[statusKey] || ""} disabled={submitting}
+                                                  onChange={(e) => updateDecision(iso, { [statusKey]: e.target.value })}>
+                                                  <option value="">Select status...</option>
+                                                  {["Present", "Absent", "Leave", "Medical Leave", "Holiday", "Weekly Off"].map((value) => <option key={value}>{value}</option>)}
+                                                </select>
+                                              </label>
+                                              {decision[statusKey] === "Present" && (
+                                                <div className="d-flex flex-wrap gap-2 mt-2">
+                                                  <label className="small mb-0 flex-fill">Check-in
+                                                    <input type="time" className="form-control form-control-sm" value={decision[inKey] || ""} disabled={submitting}
+                                                      onChange={(e) => updateDecision(iso, { [inKey]: e.target.value })} />
+                                                  </label>
+                                                  <label className="small mb-0 flex-fill">Check-out
+                                                    <input type="time" className="form-control form-control-sm" value={decision[outKey] || ""} disabled={submitting}
+                                                      onChange={(e) => updateDecision(iso, { [outKey]: e.target.value })} />
+                                                  </label>
+                                                </div>
+                                              )}
+                                            </fieldset>
+                                          );
+                                        })}
                                       </div>
                                     )}
                                     {decision.final_status === "Present" && (

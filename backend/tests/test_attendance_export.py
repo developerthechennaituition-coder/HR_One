@@ -287,3 +287,43 @@ def test_working_and_break_intervals_are_numbered_and_include_duration():
     assert "(3h 00m)" in row[headers.index("Working Intervals")]
     assert "B1:" in row[headers.index("Break Details")]
     assert "(0h 30m)" in row[headers.index("Break Details")]
+
+
+
+def test_working_and_break_intervals_are_multiline_wrapped_24_hour_times():
+    report = _report("Intervals Employee", "007")
+    report["rows"][0].update({
+        "check_in_text": "2026-10-10T09:00:00+05:30",
+        "check_out_text": "2026-10-10T18:00:00+05:30",
+        "working_intervals": [
+            {"from_time": "2026-10-10T09:00:00+05:30", "to_time": "2026-10-10T12:00:00+05:30", "duration": "3h 00m"},
+            {"from_time": "2026-10-10T13:00:00+05:30", "to_time": "2026-10-10T15:00:00+05:30", "duration": "2h 00m"},
+            {"from_time": "2026-10-10T15:30:00+05:30", "to_time": "2026-10-10T18:00:00+05:30", "duration": "2h 30m"},
+        ],
+        "break_intervals": [
+            {"from_time": "2026-10-10T12:00:00+05:30", "to_time": "2026-10-10T13:00:00+05:30", "duration": "1h 00m"},
+            {"from_time": "2026-10-10T15:00:00+05:30", "to_time": "2026-10-10T15:30:00+05:30", "duration": "0h 30m"},
+        ],
+    })
+    output = attendance_export.build_multi_employee_attendance_workbook(
+        [report], company_name="Test Company", month=10, year=2026,
+        generated_on="10-Oct-2026 06:00 PM",
+    )
+    sheet = load_workbook(output, data_only=True).active
+    header = next(r for r in range(1, sheet.max_row + 1) if sheet.cell(r, 1).value == "S.No.")
+    row = header + 1
+    assert sheet.cell(row, 4).value == "09:00:00"
+    assert sheet.cell(row, 5).value == "18:00:00"
+    work_lines = sheet.cell(row, 9).value.splitlines()
+    break_lines = sheet.cell(row, 10).value.splitlines()
+    assert len(work_lines) == 3
+    assert work_lines[0].startswith("WI1: 09:00:00 - 12:00:00")
+    assert work_lines[1].startswith("WI2: 13:00:00 - 15:00:00")
+    assert work_lines[2].startswith("WI3: 15:30:00 - 18:00:00")
+    assert len(break_lines) == 2
+    assert break_lines[0].startswith("B1: 12:00:00 - 13:00:00")
+    assert break_lines[1].startswith("B2: 15:00:00 - 15:30:00")
+    assert sheet.cell(row, 9).alignment.wrap_text is True
+    assert sheet.cell(row, 10).alignment.wrap_text is True
+    assert sheet.cell(row, 9).alignment.vertical == "top"
+    assert sheet.row_dimensions[row].height >= 66

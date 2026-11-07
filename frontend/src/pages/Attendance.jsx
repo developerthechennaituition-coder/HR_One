@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
 import HistoricalAttendanceModal from "../components/HistoricalAttendanceModal";
 import { roleLabel } from "../services/roleLabels";
+import { formatAttendanceClock } from "../services/attendanceHistoryFormat.js";
 
 const USERS_API_URL = HRONE_API_BASE + "/api/users";
 const ATTENDANCE_API_URL = HRONE_API_BASE + "/api/attendance";
@@ -124,18 +125,6 @@ const toState = (record) => ({
   remove_permission: false,
 });
 
-const formatAttendanceClock = (value) => {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-  }).format(date);
-};
-
 const getAttendanceSourceLabel = (source) => {
   if (source === "WFH_FACE_GPS") return "WFH · Face + Location";
   if (source === "DEVICE" || source === "BIOMETRIC") {
@@ -159,6 +148,7 @@ function Attendance({ session }) {
   const [users, setUsers] = useState([]);
   const [departmentOptions, setDepartmentOptions] = useState([]);
   const [showHistoricalAttendance, setShowHistoricalAttendance] = useState(false);
+  const [attendanceReloadToken, setAttendanceReloadToken] = useState(0);
   const [selectedDate, setSelectedDate] = useState(getTodayDate());
 
   const [searchTerm, setSearchTerm] = useState("");
@@ -315,7 +305,7 @@ function Attendance({ session }) {
     loadData();
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDate]);
+  }, [selectedDate, attendanceReloadToken]);
 
   /*
    * Change attendance status.
@@ -1434,6 +1424,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
         <HistoricalAttendanceModal
           getHeaders={getHeaders}
           onClose={() => setShowHistoricalAttendance(false)}
+          onWeeklyOffGenerated={() => setAttendanceReloadToken((value) => value + 1)}
         />
       )}
       <AttendanceRequestInbox />

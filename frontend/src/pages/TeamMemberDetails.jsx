@@ -7,6 +7,8 @@ import {
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
 import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
+import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
+import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
 
 const API_URL =
   HRONE_API_BASE + "/api/reporting-manager";
@@ -299,9 +301,19 @@ function TeamMemberDetails({
   ========================================================== */
 
   const statusColors = {
+    halfday: {
+      background: "#dbeafe",
+      text: "#1e40af",
+    },
+
     present: {
       background: "#198754",
       text: "#ffffff",
+    },
+
+    wfh: {
+      background: "#cff4fc",
+      text: "#055160",
     },
 
     absent: {
@@ -312,6 +324,11 @@ function TeamMemberDetails({
     leave: {
       background: "#6f42c1",
       text: "#ffffff",
+    },
+
+    medicalleave: {
+      background: "#f3e8ff",
+      text: "#6b21a8",
     },
 
     holiday: {
@@ -332,6 +349,11 @@ function TeamMemberDetails({
     notmarked: {
       background: "#F0E0C8",
       text: "#7a5a2f",
+    },
+
+    other: {
+      background: "#f8f9fa",
+      text: "#6c757d",
     },
   };
 
@@ -749,60 +771,12 @@ function TeamMemberDetails({
   ========================================================== */
 
   const getStatusKey = (record) => {
-    const status =
-      normalizeStatus(
-        record?.status ||
-          record?.attendance_status
-      );
-
-    if (
-      status === "present"
-    ) {
-      return "present";
-    }
-
-    if (
-      status === "absent"
-    ) {
-      return "absent";
-    }
-
-    if (
-      status === "leave"
-    ) {
-      return "leave";
-    }
-
-    if (
-      status === "holiday"
-    ) {
-      return "holiday";
-    }
-
-    if (status === "weeklyoff") {
-      return "weeklyoff";
-    }
-
-    if (status === "notapplicable") {
-      return "notapplicable";
-    }
-
-    return "notmarked";
+    return attendanceCalendarStatusKey(record);
   };
 
   // Card label: leave type code (CL, ML) for leave, otherwise the status.
   const getCalendarLabel = (record) => {
-    const statusKey = getStatusKey(record);
-    if (statusKey === "notmarked") return "";
-    if (statusKey === "leave") return record.leave_type_code || "Leave";
-    if (statusKey === "holiday" && record.holiday_name) return record.holiday_name;
-    return {
-      present: "Present",
-      absent: "Absent",
-      holiday: "Holiday",
-      weeklyoff: "Weekly Off",
-      notapplicable: "Not Applicable",
-    }[statusKey];
+    return attendanceCalendarLabel(record);
   };
 
   /* ==========================================================
@@ -863,14 +837,19 @@ function TeamMemberDetails({
     ).length;
   };
 
-  const presentCount =
-    getCountByStatus("present");
+  const presentCount = monthDateKeys.reduce((total, date) => (
+    total + attendanceCalendarPortions(getAttendanceForDate(date)).present
+  ), 0);
 
-  const absentCount =
-    getCountByStatus("absent");
+  const absentCount = monthDateKeys.reduce((total, date) => (
+    total + attendanceCalendarPortions(getAttendanceForDate(date)).absent
+  ), 0);
 
-  const leaveCount =
-    getCountByStatus("leave");
+  const leaveCount = monthDateKeys.reduce((total, date) => {
+    const record = getAttendanceForDate(date);
+    const portions = attendanceCalendarPortions(record).leave;
+    return total + (portions || (approvedLeaveByDate[date] ? 1 : 0));
+  }, 0);
 
   const holidayCount =
     getCountByStatus("holiday");
@@ -917,6 +896,13 @@ function TeamMemberDetails({
           selectedDate
         )
       : null;
+  const hasHalfDayDetails = Boolean(selectedRecord && (
+    getStatusKey(selectedRecord) === "halfday" ||
+    (selectedRecord.first_half_status && selectedRecord.second_half_status &&
+      selectedRecord.first_half_status !== selectedRecord.second_half_status) ||
+    selectedRecord.first_half_check_in_time ||
+    selectedRecord.second_half_check_in_time
+  ));
 
   /* ==========================================================
      CALENDAR DAY
@@ -1040,6 +1026,10 @@ function TeamMemberDetails({
             }}
           />
         )}
+        <div className="team-attendance-legend-item">
+          <span style={{ backgroundColor: "transparent", color: "#1e40af" }}>◐</span>
+          <span>First Half Present · ◑ Second Half Present · ⚠ Attendance Issue</span>
+        </div>
 
         {getCalendarLabel(record) && (
           <span className="team-calendar-status">
@@ -1047,9 +1037,21 @@ function TeamMemberDetails({
           </span>
         )}
 
+        {statusKey === "halfday" && (
+          <span className="team-calendar-status fw-bold" aria-label={attendanceCalendarLabel(record)} title={attendanceCalendarLabel(record)}>
+            {attendanceCalendarHalfSymbol(record)}
+          </span>
+        )}
+
+        {record?.has_attendance_issue && (
+          <span className="team-calendar-status text-warning-emphasis" title={(record.attendance_issue_details || []).join(", ") || "Attendance issue"}>
+            ⚠ Issue
+          </span>
+        )}
+
         {(permissionsByDate[dateString] || []).length > 0 && (
           <span className="team-calendar-status" style={{ fontWeight: 700 }}>
-            P {permissionsByDate[dateString][0].start_time}–{permissionsByDate[dateString][0].end_time}
+            P {formatAttendanceClock(permissionsByDate[dateString][0].start_time)}–{formatAttendanceClock(permissionsByDate[dateString][0].end_time)}
             {permissionsByDate[dateString].length > 1 ? ` +${permissionsByDate[dateString].length - 1}` : ""}
           </span>
         )}
@@ -2022,8 +2024,20 @@ function TeamMemberDetails({
               label: "Present",
             },
             {
+              key: "wfh",
+              label: "Work From Home",
+            },
+            {
+              key: "halfday",
+              label: "Half-Day Present",
+            },
+            {
               key: "absent",
               label: "Absent",
+            },
+            {
+              key: "medicalleave",
+              label: "Medical Leave (ML)",
             },
             {
               key: "leave",
@@ -2178,7 +2192,8 @@ function TeamMemberDetails({
                   )}`
                 }
               >
-                {selectedRecord?.status ||
+                {getCalendarLabel(selectedRecord) ||
+                  selectedRecord?.status ||
                   selectedRecord?.attendance_status ||
                   "Not Marked"}
               </span>
@@ -2227,9 +2242,10 @@ function TeamMemberDetails({
                     </span>
 
                     <strong>
-                      {displayValue(
+                      {formatAttendanceClock(
                         selectedRecord.check_in ||
-                          selectedRecord.check_in_time
+                          selectedRecord.check_in_time ||
+                          selectedRecord.first_half_check_in_time
                       )}
                     </strong>
 
@@ -2246,9 +2262,10 @@ function TeamMemberDetails({
                     </span>
 
                     <strong>
-                      {displayValue(
+                      {formatAttendanceClock(
                         selectedRecord.check_out ||
-                          selectedRecord.check_out_time
+                          selectedRecord.check_out_time ||
+                          selectedRecord.second_half_check_out_time
                       )}
                     </strong>
 
@@ -2313,6 +2330,77 @@ function TeamMemberDetails({
               </div>
             )}
 
+            {selectedRecord && getStatusKey(selectedRecord) === "medicalleave" && (
+              <div className="alert alert-secondary mt-3 mb-0">
+                <strong>Medical Leave (ML)</strong>
+                <div>{selectedRecord.leave_type_name || "Medical Leave"}{selectedRecord.leave_type_code ? ` (${selectedRecord.leave_type_code})` : ""}</div>
+              </div>
+            )}
+
+            {hasHalfDayDetails && (
+              <div className="card border-info mt-3">
+                <div className="card-body">
+                  <h6 className="text-info mb-3">First / Second Half Attendance Details</h6>
+                  <div className="row g-3">
+                    <div className="col-12 col-md-4">
+                      <div className="team-selected-info">
+                        <span>First Half</span>
+                        <strong>{displayValue(selectedRecord.first_half_status)}</strong>
+                      </div>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="team-selected-info">
+                        <span>First Half Check-in / Check-out</span>
+                        <strong>{formatAttendanceClock(selectedRecord.first_half_check_in_time)} – {formatAttendanceClock(selectedRecord.first_half_check_out_time)}</strong>
+                      </div>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="team-selected-info">
+                        <span>Second Half</span>
+                        <strong>{displayValue(selectedRecord.second_half_status)}</strong>
+                      </div>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="team-selected-info">
+                        <span>Second Half Check-in / Check-out</span>
+                        <strong>{formatAttendanceClock(selectedRecord.second_half_check_in_time)} – {formatAttendanceClock(selectedRecord.second_half_check_out_time)}</strong>
+                      </div>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="team-selected-info">
+                        <span>Actual Working Duration</span>
+                        <strong>{displayValue(selectedRecord.working_duration || selectedRecord.total_duration)}</strong>
+                      </div>
+                    </div>
+                    <div className="col-12 col-md-4">
+                      <div className="team-selected-info">
+                        <span>Break Duration</span>
+                        <strong>{displayValue(selectedRecord.break_duration)}</strong>
+                      </div>
+                    </div>
+                  </div>
+                  {Array.isArray(selectedRecord.working_intervals) && selectedRecord.working_intervals.length > 0 && (
+                    <div className="mt-3">
+                      <span className="small text-muted d-block mb-1">Working intervals</span>
+                      {selectedRecord.working_intervals.map((interval, index) => (
+                        <div className="small" key={`${interval.from_time}-${index}`}>
+                          {formatAttendanceClock(interval.from_time)} – {formatAttendanceClock(interval.to_time)}
+                          {interval.duration ? ` (${interval.duration})` : ""}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {selectedRecord?.has_attendance_issue && (
+              <div className="alert alert-warning py-2 mt-3 mb-0">
+                <strong>⚠ Attendance Issue:</strong>{" "}
+                {(selectedRecord.attendance_issue_details || []).join(", ") || "Please review the attendance punches."}
+              </div>
+            )}
+
             {(permissionsByDate[selectedDate] || []).length > 0 && (
               <div className="team-selected-info mt-3">
                 <span>
@@ -2321,7 +2409,7 @@ function TeamMemberDetails({
 
                 {permissionsByDate[selectedDate].map((item, index) => (
                   <strong className="d-block" key={`${item.start_time}-${index}`}>
-                    {item.start_time} – {item.end_time} ({item.status === "approved" ? "Approved" : "Pending"})
+                    {formatAttendanceClock(item.start_time)} – {formatAttendanceClock(item.end_time)} ({item.status === "approved" ? "Approved" : "Pending"})
                   </strong>
                 ))}
               </div>

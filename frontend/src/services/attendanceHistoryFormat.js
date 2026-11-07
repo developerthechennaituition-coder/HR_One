@@ -36,17 +36,27 @@ export const formatIST = (value) => {
 
 const isBlank = (value) => value === null || value === undefined || (typeof value === "string" && value.trim() === "");
 
-// "14:48" -> "02:48 PM"; ISO timestamps -> IST; anything else as plain text.
-export const formatClockTime = (value) => {
-  const text = String(value).trim();
+// Attendance clocks use 24-hour HH:mm; timestamps are converted to IST.
+export const formatClockTime = (value) => formatAttendanceClock(value);
+
+export const formatAttendanceClock = (value) => {
+  const text = String(value ?? "").trim();
+  if (!text) return "—";
   const match = CLOCK.exec(text);
   if (match) {
     const hours = Number(match[1]);
-    if (hours > 23 || Number(match[2]) > 59) return text;
-    return `${String(hours % 12 || 12).padStart(2, "0")}:${match[2]} ${hours >= 12 ? "PM" : "AM"}`;
+    if (hours > 23 || Number(match[2]) > 59) return "—";
+    return `${String(hours).padStart(2, "0")}:${match[2]}`;
   }
-  if (ISO_DATETIME.test(text)) return formatIST(text);
-  return text;
+  if (!ISO_DATETIME.test(text)) return text;
+  const date = parseInstant(text);
+  if (!date) return text;
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
 };
 
 const SOURCE_LABELS = { ESSL: "ESSL", MANUAL: "Manual", WFH: "WFH", WFH_FACE_GPS: "WFH (Face & GPS)", BIOMETRIC: "Biometric" };

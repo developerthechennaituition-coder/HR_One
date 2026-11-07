@@ -12,6 +12,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -19,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import DuplicateKeyError
 
@@ -30,6 +31,7 @@ from app.attendance import (
     company_today,
     employee_joining_date,
     users_collection,
+    refresh_automatic_attendance_calculation,
 )
 from app.db.mongodb import db
 
@@ -557,6 +559,18 @@ def _save_raw_punch(
     now: datetime,
     source: str = "ESSL",
 ) -> None:
+    """Store one raw punch for the employee currently mapped to its ESSL ID.
+
+    ``punch_key`` identifies a physical punch (ESSL ID + timestamp + ids) and is
+    unique across the collection. It deliberately does not contain the HRMS
+    database ID, so when an employee is deleted and re-created with the same
+    ESSL ID the same punch maps to the same key. The owner fields are therefore
+    refreshed with ``$set`` on every save: if they were only written on insert,
+    the punch would stay attached to the deleted employee's old ObjectId and
+    never be found for the new employee (reported as EMPTY_PUNCHES).
+    ESSL IDs are unique per HRMS user (unique index), so the user mapped to the
+    ID now is the only valid owner of its punches.
+    """
     key = _issue_key(
         essl_employee_id,
         punch_at.isoformat(),
@@ -566,12 +580,15 @@ def _save_raw_punch(
     essl_raw_punches_collection.update_one(
         {"punch_key": key},
         {
-            "$set": {"last_sync_id": sync_id, "last_seen_at": now},
-            "$setOnInsert": {
-                "punch_key": key,
+            "$set": {
+                "last_sync_id": sync_id,
+                "last_seen_at": now,
                 "user_id": str(user["_id"]),
                 "employee_id": user.get("employee_id", ""),
                 "essl_employee_id": essl_employee_id,
+            },
+            "$setOnInsert": {
+                "punch_key": key,
                 "punch_at": punch_at.astimezone(timezone.utc),
                 "punch_id": str(punch_id)[:256] if punch_id is not None else None,
                 "device_id": str(device_id)[:128] if device_id is not None else None,
@@ -618,9 +635,25 @@ def _save_daily_attendance(
     group: list[dict[str, Any]],
     sync_id: str,
     now: datetime,
-) -> Literal["created", "updated", "unchanged", "protected"]:
-    punches_by_time = {item["timestamp"]: item for item in group}
+) -> Literal["created", "updated", "unchanged", "protected", "empty"]:
+    # A daily attendance row must never be created or overwritten from an
+    # empty/invalid punch set. This can occur if raw-punch persistence fails
+    # or an imported day is filtered during reload.
+    valid_punches = [
+        item for item in (group or [])
+        if isinstance(item, dict) and isinstance(item.get("timestamp"), datetime)
+    ]
+    if not valid_punches:
+        logger.warning(
+            "Skipping ESSL attendance with no valid punches: employee_id=%s date=%s sync_id=%s",
+            user.get("employee_id", ""), attendance_date, sync_id,
+        )
+        return "empty"
+
+    punches_by_time = {item["timestamp"]: item for item in valid_punches}
     punches = sorted(punches_by_time.values(), key=lambda item: item["timestamp"])
+    if not punches:
+        return "empty"
     first = punches[0]["timestamp"]
     last = punches[-1]["timestamp"] if len(punches) > 1 else None
     key = {
@@ -643,13 +676,18 @@ def _save_daily_attendance(
     existing = attendance_collection.find_one(key)
     if existing:
         if existing.get("attendance_source") != "ESSL":
-            return "protected"
+            old_status = str(existing.get("status") or "").strip().casefold().replace("_", " ")
+            reconcilable_status = old_status in {
+                "weekly off", "weeklyoff", "holiday", "absent", "not marked", "not marked yet",
+                "leave", "half day present", "first half present", "second half present",
+            }
+            source = str(existing.get("attendance_source") or "").upper()
+            protected = source in {"MANUAL", "WFH", "ADMIN", "APPROVED_REQUEST"} or bool(existing.get("is_manually_modified"))
+            if protected or not reconcilable_status or str(existing.get("attendance_type") or "").upper() in {"WFH", "WORK_FROM_HOME"}:
+                return "protected"
         if _daily_values_match(existing, values):
             return "unchanged"
-        attendance_collection.update_one(
-            {**key, "attendance_source": "ESSL"},
-            {"$set": values},
-        )
+        attendance_collection.update_one(key, {"$set": values})
         return "updated"
 
     try:
@@ -664,14 +702,16 @@ def _save_daily_attendance(
         return "created"
     except DuplicateKeyError:
         raced = attendance_collection.find_one(key)
-        if not raced or raced.get("attendance_source") != "ESSL":
+        if not raced:
             return "protected"
+        if raced.get("attendance_source") != "ESSL":
+            raced_status = str(raced.get("status") or "").strip().casefold().replace("_", " ")
+            raced_source = str(raced.get("attendance_source") or "").upper()
+            if raced_status not in {"weekly off", "weeklyoff", "holiday", "absent", "not marked", "not marked yet", "leave", "half day present", "first half present", "second half present"} or raced_source in {"MANUAL", "WFH", "ADMIN", "APPROVED_REQUEST"} or raced.get("is_manually_modified"):
+                return "protected"
         if _daily_values_match(raced, values):
             return "unchanged"
-        attendance_collection.update_one(
-            {**key, "attendance_source": "ESSL"},
-            {"$set": values},
-        )
+        attendance_collection.update_one(key, {"$set": values})
         return "updated"
 
 
@@ -750,24 +790,70 @@ def _parse_excel_datetime(value: Any, selected_date: Any = None) -> datetime | N
     return result.astimezone(COMPANY_TZ)
 
 
+def _detect_attendance_file_type(content: bytes) -> str:
+    """Identify the workbook/container from its signature, not its filename."""
+    if not content:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded attendance file is empty.")
+    # OOXML workbooks are ZIP containers. Validate the central directory too.
+    if content.startswith(b"PK\x03\x04"):
+        if not zipfile.is_zipfile(io.BytesIO(content)):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded Excel workbook is damaged or incomplete.")
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                names = set(archive.namelist())
+                if "[Content_Types].xml" not in names or not any(name.startswith("xl/") for name in names):
+                    raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "The uploaded ZIP file is not a supported Excel workbook.")
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded Excel workbook is damaged or incomplete.") from exc
+        return "xlsx"
+    # OLE Compound File signature used by legacy BIFF .xls workbooks.
+    if content.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+        return "xls"
+    # Text exports (CSV/TSV) have no fixed magic number. Reject binary data.
+    sample = content[:4096]
+    if b"\x00" not in sample:
+        try:
+            sample.decode("utf-8-sig")
+            return "csv"
+        except UnicodeDecodeError:
+            try:
+                sample.decode("cp1252")
+                return "csv"
+            except UnicodeDecodeError:
+                pass
+    raise HTTPException(
+        status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+        "Unsupported attendance file content. Upload a readable .xls, .xlsx, or .csv export.",
+    )
+
+
 def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[str, Any]], int]:
     """Read raw ESSL logs and repeated-date eTimeTrackLite daily reports."""
     ext = os.path.splitext(filename.casefold())[1]
+    actual_type = _detect_attendance_file_type(content)
+    allowed_exts = {".csv": "csv", ".xls": "xls", ".xlsx": "xlsx"}
+    if ext not in allowed_exts:
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Upload a .csv, .xls, or .xlsx file.")
+    # Use the file signature to choose the parser. A mislabeled workbook can
+    # still be read safely, but the caller receives a clear diagnostic.
+    if ext != f".{actual_type}":
+        logger.warning("ESSL upload extension/content mismatch: filename=%s extension=%s detected=%s",
+                       filename, ext, actual_type)
     try:
-        if ext == ".csv":
+        if actual_type == "csv":
             text = content.decode("utf-8-sig", errors="replace")
             try:
                 dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
             except csv.Error:
                 dialect = csv.excel
             rows = list(csv.reader(io.StringIO(text), dialect))
-        elif ext == ".xlsx":
+        elif actual_type == "xlsx":
             from openpyxl import load_workbook
             workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
             sheet = workbook.active
             rows = [list(row) for row in sheet.iter_rows(values_only=True)]
             workbook.close()
-        elif ext == ".xls":
+        elif actual_type == "xls":
             import xlrd
             workbook = xlrd.open_workbook(file_contents=content)
             sheet = workbook.sheet_by_index(0)
@@ -785,7 +871,14 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The uploaded attendance file could not be read.") from exc
+        logger.exception("Unable to parse ESSL attendance upload: filename=%s detected_type=%s", filename, actual_type)
+        message = (
+            "The uploaded legacy .xls workbook is malformed or unsupported. "
+            "Open it in Excel/eTimeTrackLite and export a fresh .xls or .xlsx file."
+            if actual_type == "xls"
+            else "The uploaded attendance workbook could not be read. Verify that it opens correctly in Excel and export it again."
+        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, message) from exc
 
     if not rows:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The uploaded file is empty.")
@@ -943,9 +1036,12 @@ def _read_attendance_upload(filename: str, content: bytes) -> tuple[list[dict[st
     return result, invalid
 
 
-def _read_essl_report_employee_metadata(filename: str, content: bytes) -> dict[str, dict[str, str]]:
+def _read_essl_report_employee_metadata(filename: str, content: bytes) -> dict[str, dict[str, Any]]:
     """Collect employee rows, including people who have no punches in the report."""
-    if os.path.splitext(filename.casefold())[1] != ".xlsx":
+    try:
+        if _detect_attendance_file_type(content) != "xlsx":
+            return {}
+    except HTTPException:
         return {}
     try:
         from openpyxl import load_workbook
@@ -954,9 +1050,19 @@ def _read_essl_report_employee_metadata(filename: str, content: bytes) -> dict[s
         workbook.close()
     except Exception:
         return {}
-    metadata: dict[str, dict[str, str]] = {}
+    metadata: dict[str, dict[str, Any]] = {}
     for idx, row in enumerate(rows):
         if not row or _header_key(row[0]) != "date":
+            continue
+        report_day = None
+        for value in row[1:]:
+            if value is None or not str(value).strip():
+                continue
+            parsed_day = _parse_excel_datetime(value)
+            if parsed_day is not None:
+                report_day = parsed_day.date().isoformat()
+                break
+        if report_day is None:
             continue
         header_map: dict[str, int] | None = None
         for header_idx in range(idx + 1, min(idx + 8, len(rows))):
@@ -980,12 +1086,15 @@ def _read_essl_report_employee_metadata(filename: str, content: bytes) -> dict[s
             def cell(field: str) -> str:
                 col = header_map.get(field)
                 return str(data_row[col]).strip() if col is not None and col < len(data_row) and data_row[col] is not None else ""
-            metadata.setdefault(code, {
+            item = metadata.setdefault(code, {
                 "essl_employee_id": code,
                 "name": cell("name"),
                 "department": cell("department"),
                 "shift": cell("shift"),
+                "attendance_dates": [],
             })
+            if report_day not in item["attendance_dates"]:
+                item["attendance_dates"].append(report_day)
     return metadata
 
 
@@ -1040,6 +1149,11 @@ async def preview_essl_attendance_file(
         department_name = str(item.get("department", "") or "").strip()
         if employee_key and department_name:
             departments[employee_key] = department_name
+    stamps = [punch["punch_at"].date().isoformat() for punch in punches]
+    report_days = sorted({day for meta in unique_employees.values() for day in meta.get("attendance_dates", [])} | set(stamps))
+    period_dates = report_days or stamps
+    if not period_dates:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The ESSL document contains no recognizable attendance dates or valid punch records.")
     employee_rows = []
     for code, item in sorted(unique_employees.items(), key=lambda pair: pair[0].casefold()):
         mapped = mapping.get(_normalise_employee_id(code))
@@ -1047,19 +1161,38 @@ async def preview_essl_attendance_file(
         essl_department = str(item.get("department") or "").strip()
         department_mismatch = bool(essl_department and hrms_department and
                                    essl_department.casefold() != hrms_department.casefold())
+        preview_payroll_status = "Not Found"
+        if mapped:
+            employee_code = str(mapped.get("employee_id") or "")
+            preview_period = min(period_dates)[:7] if period_dates else ""
+            preview_payroll = db["monthly_payroll_records"].find_one(
+                {"employee_id": employee_code, "period": preview_period}, {"status": 1}
+            ) if employee_code and preview_period else None
+            preview_payroll_status = str((preview_payroll or {}).get("status") or "Not Finalized")
         employee_rows.append({
             **item,
+            "hrms_user_id": str(mapped.get("_id")) if mapped else "",
+            "payroll_status": preview_payroll_status,
+            "payroll_locked": preview_payroll_status.strip().casefold() in {"approved", "finalized", "finalised", "processed", "paid", "complete", "completed"},
             "mapping_status": "unmapped" if not mapped else ("department_mismatch" if department_mismatch else "mapped"),
             "hrms_employee_id": mapped.get("employee_id", "") if mapped else "",
             "hrms_employee_name": mapped.get("name", "") if mapped else "",
             "hrms_department": hrms_department,
             "department_mismatch": department_mismatch,
         })
-    stamps = [punch["punch_at"].date().isoformat() for punch in punches]
+    coverage_months = sorted({day[:7] for day in report_days})
+    coverage_complete = False
+    if len(coverage_months) == 1:
+        year, month = (int(part) for part in coverage_months[0].split("-"))
+        month_start = date(year, month, 1)
+        month_end = date(year + (month == 12), 1 if month == 12 else month + 1, 1) - timedelta(days=1)
+        covered = set(report_days)
+        coverage_complete = all((month_start + timedelta(days=offset)).isoformat() in covered for offset in range((month_end - month_start).days + 1))
     return {
         "filename": filename,
         "status": "VALIDATED",
-        "reporting_period": {"from_date": min(stamps), "to_date": max(stamps)},
+        "reporting_period": {"from_date": min(period_dates), "to_date": max(period_dates), "month": min(period_dates)[:7]},
+        "document_coverage": {"complete_month": coverage_complete, "covered_dates": len(report_days), "months": coverage_months},
         "employee_count": len(unique_employees),
         "daily_employee_records": len(daily_keys),
         "valid_punches": len(punches),
@@ -1088,14 +1221,25 @@ async def preview_essl_attendance_file(
 @router.post("/import-file")
 async def import_essl_attendance_file(
     file: UploadFile = File(...),
+    selected_employee_ids: str = Form(default="[]"),
     authorization: str | None = Header(default=None),
 ):
     admin = _require_essl_admin(authorization)
+    try:
+        selected_ids_raw = json.loads(selected_employee_ids)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected employee list is invalid.") from exc
+    if not isinstance(selected_ids_raw, list) or not selected_ids_raw:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Please select at least one mapped employee to import attendance.")
+    selected_ids = {str(value).strip() for value in selected_ids_raw if str(value).strip()}
+    if not selected_ids or any(not ObjectId.is_valid(value) for value in selected_ids):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected employee IDs are invalid.")
     filename = file.filename or "attendance.csv"
     content = await file.read()
     if len(content) > 15 * 1024 * 1024:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "File size must not exceed 15 MB.")
     punches, invalid_values = _read_attendance_upload(filename, content)
+    report_employee_metadata = _read_essl_report_employee_metadata(filename, content)
     now = datetime.now(timezone.utc)
     sync_id = str(ObjectId())
     import_id = create_excel_import_id()
@@ -1106,6 +1250,20 @@ async def import_essl_attendance_file(
             "essl_employee_id_normalized": {"$type": "string"},
         })
     }
+    selected_users = {
+        str(user["_id"]): user
+        for user in users_collection.find({"_id": {"$in": [ObjectId(value) for value in selected_ids]}})
+    }
+    if set(selected_users) != selected_ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "One or more selected employees no longer exist. Refresh the mapping list.")
+    mapped_selected_ids = {str(user["_id"]) for user in mapping.values()}
+    invalid_selected = selected_ids - mapped_selected_ids
+    inactive_selected = {
+        user_id for user_id, user in selected_users.items()
+        if user.get("is_active") is False or str(user.get("status") or "Active").strip().casefold() in {"inactive", "terminated", "disabled"}
+    }
+    if invalid_selected or inactive_selected:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only active employees with valid saved ESSL mappings can be imported.")
 
     # Build the complete upload snapshot first. Do not mutate stored punches while
     # parsing/mapping the file: a later row error must not leave a partially
@@ -1149,6 +1307,8 @@ async def import_essl_attendance_file(
             continue
         stamp = punch["punch_at"]
         user_id = str(user["_id"])
+        if user_id not in selected_ids:
+            continue
         unique = (user_id, stamp)
         if unique in seen:
             duplicate_in_file += 1
@@ -1159,71 +1319,254 @@ async def import_essl_attendance_file(
 
     created = updated = protected = unchanged = 0
     imported = 0
-    for (user_id, day), day_punches in grouped.items():
-        user = users_by_id[user_id]
-        attendance_key = {"user_id": user_id, "attendance_date": day}
-        existing_attendance = attendance_collection.find_one(attendance_key)
-        # Manual and WFH attendance is deliberately protected. Do not inject ESSL
-        # punches behind a protected record, because the daily breakdown reads the
-        # raw-punch collection as its source for office intervals.
-        if existing_attendance and existing_attendance.get("attendance_source") != "ESSL":
-            protected += 1
+    payroll_locked_records = 0
+    payroll_locked_employee_ids: set[str] = set()
+    eligible_employee_ids: set[str] = set()
+    skipped_records = 0
+    recalculated_records = 0
+    empty_punch_records = 0
+    valid_punch_records = 0
+    failed_records = 0
+    import_row_results: list[dict[str, Any]] = []
+    empty_report_combinations = 0
+    for essl_code, metadata in report_employee_metadata.items():
+        normalized = _normalise_employee_id(essl_code)
+        user = mapping.get(normalized)
+        if not user or str(user["_id"]) not in selected_ids:
             continue
-
-        selected = date.fromisoformat(day)
-        day_start = datetime.combine(selected, time.min, tzinfo=COMPANY_TZ)
-        day_end = day_start + timedelta(days=1)
-        utc_start = day_start.astimezone(timezone.utc)
-        utc_end = day_end.astimezone(timezone.utc)
-
-        # An uploaded workbook is the authoritative snapshot for each employee/day
-        # it contains. Remove obsolete file-import punches for that day before
-        # saving the corrected snapshot. Preserve API-synchronized punches: API sync
-        # runs have a matching essl_sync_history record, while legacy file imports
-        # did not create one. This also cleans up legacy file-import records created
-        # before source="ESSL_FILE" was introduced.
-        old_raw = list(essl_raw_punches_collection.find(
-            {
-                "user_id": user_id,
-                "punch_at": {"$gte": utc_start, "$lt": utc_end},
-            },
-            {"_id": 1, "source": 1, "first_sync_id": 1},
-        ))
-        candidate_sync_ids = []
-        for old in old_raw:
-            if old.get("source") == "ESSL_FILE":
+        for report_day in metadata.get("attendance_dates", []):
+            if user and (str(user["_id"]), report_day) in grouped:
                 continue
-            try:
-                candidate_sync_ids.append(ObjectId(str(old.get("first_sync_id", ""))))
-            except Exception:
-                pass
-        api_sync_ids = set()
-        if candidate_sync_ids:
-            api_sync_ids = {
-                str(item["_id"])
-                for item in essl_sync_history_collection.find(
-                    {"_id": {"$in": candidate_sync_ids}}, {"_id": 1}
-                )
+            empty_report_combinations += 1
+            empty_punch_records += 1
+            skipped_records += 1
+            if user:
+                import_row_results.append({
+                    "employee_id": str(user.get("employee_id") or ""),
+                    "employee_name": str(user.get("name") or metadata.get("name") or ""),
+                    "attendance_date": report_day,
+                    "result": "EMPTY_PUNCHES",
+                    "reason": "The ESSL report contains this employee/date but no valid IN/OUT punch values. Existing attendance was left unchanged.",
+                })
+            else:
+                unmatched.add(essl_code)
+                import_row_results.append({
+                    "employee_id": essl_code,
+                    "employee_name": str(metadata.get("name") or ""),
+                    "attendance_date": report_day,
+                    "result": "UNMAPPED_EMPTY_PUNCHES",
+                    "reason": "No HRMS employee is mapped to this ESSL employee ID, and the report contains no valid punches.",
+                })
+
+    for (user_id, day), day_punches in grouped.items():
+        employee_id = ""
+        try:
+            user = users_by_id[user_id]
+            employee_id = str(user.get("employee_id") or "")
+            period = day[:7]
+            payroll = db["monthly_payroll_records"].find_one(
+                {"employee_id": employee_id, "period": period}, {"status": 1}
+            ) if employee_id else None
+            payroll_status = str((payroll or {}).get("status") or "").strip().casefold()
+            if payroll_status in {"approved", "finalized", "finalised", "processed", "paid", "complete", "completed"}:
+                payroll_locked_records += 1
+                payroll_locked_employee_ids.add(user_id)
+                protected += 1
+                skipped_records += 1
+                import_row_results.append({"employee_id": employee_id, "attendance_date": day,
+                                           "result": "PAYROLL_LOCKED", "reason": f"Payroll is {payroll_status}; attendance was not changed."})
+                continue
+            eligible_employee_ids.add(user_id)
+            attendance_key = {"user_id": user_id, "attendance_date": day}
+            existing_attendance = attendance_collection.find_one(attendance_key)
+            # Manual and WFH attendance is deliberately protected. Do not inject ESSL
+            # punches behind a protected record, because the daily breakdown reads the
+            # raw-punch collection as its source for office intervals.
+            if existing_attendance and existing_attendance.get("attendance_source") != "ESSL":
+                old_status = str(existing_attendance.get("status") or "").strip().casefold().replace("_", " ")
+                system_reconcilable = old_status in {
+                    "weekly off", "weeklyoff", "holiday", "absent", "not marked", "not marked yet",
+                    "leave", "half day present", "first half present", "second half present",
+                } and str(existing_attendance.get("attendance_type") or "").upper() not in {"WFH", "WORK_FROM_HOME"}
+                protected_source = str(existing_attendance.get("attendance_source") or "").upper()
+                explicitly_manual = protected_source in {"MANUAL", "WFH", "ADMIN", "APPROVED_REQUEST"} or bool(existing_attendance.get("is_manually_modified"))
+                if explicitly_manual or not system_reconcilable:
+                    protected += 1
+                    skipped_records += 1
+                    import_row_results.append({"employee_id": employee_id, "attendance_date": day,
+                                               "result": "PROTECTED", "reason": "Existing manual, WFH, or administratively protected attendance is preserved."})
+                    continue
+
+            selected = date.fromisoformat(day)
+            day_start = datetime.combine(selected, time.min, tzinfo=COMPANY_TZ)
+            day_end = day_start + timedelta(days=1)
+            utc_start = day_start.astimezone(timezone.utc)
+            utc_end = day_end.astimezone(timezone.utc)
+
+            # An uploaded workbook is the authoritative snapshot for each employee/day
+            # it contains. Remove obsolete file-import punches for that day before
+            # saving the corrected snapshot. Preserve API-synchronized punches: API sync
+            # runs have a matching essl_sync_history record, while legacy file imports
+            # did not create one. This also cleans up legacy file-import records created
+            # before source="ESSL_FILE" was introduced.
+            old_raw = list(essl_raw_punches_collection.find(
+                {
+                    "user_id": user_id,
+                    "punch_at": {"$gte": utc_start, "$lt": utc_end},
+                },
+                {"_id": 1, "source": 1, "first_sync_id": 1, "punch_at": 1},
+            ))
+            candidate_sync_ids = []
+            for old in old_raw:
+                if old.get("source") == "ESSL_FILE":
+                    continue
+                try:
+                    candidate_sync_ids.append(ObjectId(str(old.get("first_sync_id", ""))))
+                except Exception:
+                    pass
+            api_sync_ids = set()
+            if candidate_sync_ids:
+                api_sync_ids = {
+                    str(item["_id"])
+                    for item in essl_sync_history_collection.find(
+                        {"_id": {"$in": candidate_sync_ids}}, {"_id": 1}
+                    )
+                }
+            incoming_utc_stamps = {
+                item["timestamp"].astimezone(timezone.utc)
+                for item in day_punches
+                if isinstance(item.get("timestamp"), datetime)
             }
-        obsolete_ids = []
-        for old in old_raw:
-            first_sync_id = str(old.get("first_sync_id", ""))
-            if old.get("source") == "ESSL_FILE" or first_sync_id not in api_sync_ids:
-                obsolete_ids.append(old["_id"])
-        if obsolete_ids:
-            essl_raw_punches_collection.delete_many({"_id": {"$in": obsolete_ids}})
+            obsolete_ids = []
+            for old in old_raw:
+                old_stamp = old.get("punch_at")
+                if isinstance(old_stamp, datetime):
+                    if old_stamp.tzinfo is None:
+                        old_stamp = old_stamp.replace(tzinfo=timezone.utc)
+                    else:
+                        old_stamp = old_stamp.astimezone(timezone.utc)
+                    # An identical incoming punch may have upserted this existing
+                    # row instead of inserting a new one. Never delete that match.
+                    if old_stamp in incoming_utc_stamps:
+                        continue
+                first_sync_id = str(old.get("first_sync_id", ""))
+                if old.get("source") == "ESSL_FILE" or first_sync_id not in api_sync_ids:
+                    obsolete_ids.append(old["_id"])
 
-        for item in sorted(day_punches, key=lambda entry: entry["timestamp"]):
-            stamp = item["timestamp"]
-            _save_raw_punch(sync_id, user, str(item["essl_employee_id"]), stamp, None, None, now, source="ESSL_FILE")
-            _resolve_punch_issue(sync_id, item["essl_employee_id"], stamp.isoformat(), None, None, now)
-            imported += 1
+            # Persist the incoming punches first, then verify that the day's complete
+            # punch set can be reloaded. Only after this succeeds may obsolete file
+            # punches be removed. This prevents an empty reload/save failure from
+            # destroying the previously imported attendance source data.
+            for item in sorted(day_punches, key=lambda entry: entry["timestamp"]):
+                stamp = item["timestamp"]
+                _save_raw_punch(sync_id, user, str(item["essl_employee_id"]), stamp, None, None, now, source="ESSL_FILE")
+                _resolve_punch_issue(sync_id, item["essl_employee_id"], stamp.isoformat(), None, None, now)
+                imported += 1
 
-        result = _save_daily_attendance(user, day, _load_daily_raw_punches(user_id, day), sync_id, now)
-        if result == "created": created += 1
-        elif result == "updated": updated += 1
-        elif result == "unchanged": unchanged += 1
-        elif result == "protected": protected += 1
+            loaded_punches = _load_daily_raw_punches(user_id, day)
+            if not loaded_punches:
+                # The file DID contain punches for this employee/date and they were just
+                # saved for this employee, so an empty reload is a storage problem, not an
+                # empty report. Never label it EMPTY_PUNCHES.
+                failed_records += 1
+                skipped_records += 1
+                logger.error(
+                    "ESSL import: %d punch(es) saved but none reload for user_id=%s employee_id=%s date=%s import_id=%s",
+                    len(day_punches), user_id, employee_id, day, import_id,
+                )
+                import_row_results.append({
+                    "employee_id": employee_id,
+                    "attendance_date": day,
+                    "result": "FAILED",
+                    "reason": "Punches in the file could not be stored against this employee; existing attendance was preserved. Check server logs using the import ID.",
+                })
+                continue
+
+            if obsolete_ids:
+                essl_raw_punches_collection.delete_many({"_id": {"$in": obsolete_ids}})
+
+            # Re-read after replacement so daily attendance reflects the final
+            # retained raw punch set, including API-synchronized punches.
+            loaded_punches = _load_daily_raw_punches(user_id, day)
+            if not loaded_punches:
+                empty_punch_records += 1
+                skipped_records += 1
+                import_row_results.append({
+                    "employee_id": employee_id,
+                    "attendance_date": day,
+                    "result": "EMPTY_PUNCHES",
+                    "reason": "Punch records were unavailable after source reconciliation; attendance was not overwritten.",
+                })
+                continue
+
+            valid_punch_records += len(loaded_punches)
+            result = _save_daily_attendance(user, day, loaded_punches, sync_id, now)
+            if result == "updated" and existing_attendance:
+                try:
+                    final_attendance = attendance_collection.find_one(attendance_key) or {}
+                    db["attendance_modification_history"].insert_one({
+                        "user_id": user_id,
+                        "employee_id": employee_id,
+                        "employee_name": str(user.get("name") or ""),
+                        "attendance_date": day,
+                        "modified_by": str(admin.get("_id", "")),
+                        "modified_by_name": str(admin.get("name") or admin.get("work_email") or "HR Admin"),
+                        "modified_by_role": str(admin.get("role") or "HR Admin"),
+                        "action": "ESSL_ATTENDANCE_RECONCILED",
+                        "old_status": existing_attendance.get("status"),
+                        "new_status": final_attendance.get("status"),
+                        "changes": {
+                            "status": {"before": existing_attendance.get("status"), "after": final_attendance.get("status")},
+                            "attendance_source": {"before": existing_attendance.get("attendance_source"), "after": final_attendance.get("attendance_source")},
+                            "check_in_time": {"before": existing_attendance.get("check_in_time"), "after": final_attendance.get("check_in_time")},
+                            "check_out_time": {"before": existing_attendance.get("check_out_time"), "after": final_attendance.get("check_out_time")},
+                        },
+                        "reason": "Attendance reconciled from a selected employee's valid ESSL import.",
+                        "import_id": import_id,
+                        "modified_at": now,
+                    })
+                except Exception:
+                    logger.exception("Unable to write ESSL attendance modification history for %s on %s", employee_id, day)
+            if result in {"created", "updated", "unchanged"}:
+                try:
+                    if refresh_automatic_attendance_calculation(user_id, selected):
+                        recalculated_records += 1
+                except Exception:
+                    logger.exception("Unable to recalculate imported attendance for %s on %s", employee_id, day)
+                    import_row_results.append({"employee_id": employee_id, "attendance_date": day,
+                                               "result": "RECALCULATION_PENDING", "reason": "Punches imported, but attendance calculation refresh failed; reopen attendance to recalculate."})
+            if result == "created":
+                created += 1
+                import_row_results.append({"employee_id": employee_id, "attendance_date": day, "result": "CREATED"})
+            elif result == "updated":
+                updated += 1
+                import_row_results.append({"employee_id": employee_id, "attendance_date": day, "result": "UPDATED"})
+            elif result == "unchanged":
+                unchanged += 1
+                import_row_results.append({"employee_id": employee_id, "attendance_date": day, "result": "UNCHANGED"})
+            elif result == "protected":
+                protected += 1
+                skipped_records += 1
+                import_row_results.append({"employee_id": employee_id, "attendance_date": day, "result": "PROTECTED", "reason": "Existing attendance record is protected."})
+            elif result == "empty":
+                empty_punch_records += 1
+                skipped_records += 1
+                import_row_results.append({"employee_id": employee_id, "attendance_date": day, "result": "EMPTY_PUNCHES",
+                                           "reason": "No valid punch records were available; existing attendance was not changed."})
+
+        except Exception as exc:
+            failed_records += 1
+            logger.exception(
+                "ESSL employee/date import failed: import_id=%s employee_id=%s user_id=%s attendance_date=%s stage=employee_date",
+                import_id, employee_id, user_id, day,
+            )
+            import_row_results.append({
+                "employee_id": employee_id,
+                "employee_name": str(user.get("name", "")) if "user" in locals() and isinstance(user, dict) else "",
+                "attendance_date": day,
+                "result": "FAILED",
+                "reason": "This employee/date could not be processed. Other records continued; check server logs using the import ID.",
+            })
 
     # Mark the import as latest only after the file has been processed.
     # Historical issue documents are retained, but the UI endpoint below filters
@@ -1235,7 +1578,21 @@ async def import_essl_attendance_file(
         "import_id": import_id,
         "filename": filename,
         "rows_with_punches": len(punches),
+        "total_employees": len(
+            {str(item.get("essl_employee_id", "")).strip() for item in punches}
+            | set(report_employee_metadata.keys())
+        ),
+        "total_mapped_employees": len(mapping),
+        "selected_employees": len(selected_ids),
+        "eligible_employees": len(eligible_employee_ids),
+        "payroll_locked_employees": len(payroll_locked_employee_ids),
+        "unselected_employees": max(0, len(mapping) - len(selected_ids)),
+        "selected_employee_ids": sorted(selected_ids),
+        "total_attendance_dates": len(grouped) + empty_report_combinations,
         "punches_imported": imported,
+        "valid_punch_records": valid_punch_records,
+        "empty_punch_records": empty_punch_records,
+        "failed_records": failed_records,
         "duplicate_punches_in_file": duplicate_in_file,
         "invalid_punch_values": invalid_values,
         "unmatched_employee_ids": sorted(unmatched),
@@ -1244,8 +1601,17 @@ async def import_essl_attendance_file(
         "attendance_records_updated": updated,
         "attendance_records_unchanged": unchanged,
         "attendance_records_protected": protected,
+        "total_excel_rows": len(punches) + invalid_values,
+        "successfully_imported_records": created + updated + unchanged,
+        "successfully_updated_records": updated,
+        "recalculated_attendance_records": recalculated_records,
+        "skipped_records": skipped_records + skipped_before_joining + len(unmatched),
+        "payroll_locked_records": payroll_locked_records,
+        "invalid_records": invalid_values + skipped_before_joining,
+        "duplicate_records": duplicate_in_file,
+        "row_results": import_row_results,
         "requested_by": str(admin.get("_id", "")),
-        "import_behavior": "The uploaded file replaces prior file-import punches only for employee/date pairs present in the file; API-synchronized punches and manual/WFH attendance are preserved.",
+        "import_behavior": "Only explicitly selected, currently mapped employees are processed. Valid imported punches replace conflicting system-generated attendance for represented employee/date pairs. Missing punch dates are never deleted or fabricated; manual/WFH/administratively protected attendance and payroll-finalized periods are preserved.",
     }
 
 

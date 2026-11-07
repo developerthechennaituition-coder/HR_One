@@ -77,6 +77,33 @@ class EsslPunchProcessingTests(unittest.TestCase):
         self.assertEqual(values["attendance_type"], "OFFICE")
         self.assertEqual(values["attendance_source"], "ESSL")
 
+
+    def test_empty_punch_group_is_skipped_without_creating_or_overwriting_attendance(self):
+        user = {"_id": ObjectId(), "employee_id": "26IT004"}
+        with (
+            patch.object(essl.attendance_collection, "find_one") as find_one,
+            patch.object(essl.attendance_collection, "update_one") as update,
+        ):
+            result = essl._save_daily_attendance(
+                user, "2026-10-07", [], "sync-empty", self.now
+            )
+        self.assertEqual(result, "empty")
+        find_one.assert_not_called()
+        update.assert_not_called()
+
+    def test_invalid_timestamp_items_are_treated_as_empty_punch_group(self):
+        user = {"_id": ObjectId(), "employee_id": "26IT004"}
+        with (
+            patch.object(essl.attendance_collection, "find_one") as find_one,
+            patch.object(essl.attendance_collection, "update_one") as update,
+        ):
+            result = essl._save_daily_attendance(
+                user, "2026-10-07", [{"timestamp": "not-a-date"}], "sync-empty", self.now
+            )
+        self.assertEqual(result, "empty")
+        find_one.assert_not_called()
+        update.assert_not_called()
+
     def test_many_punches_select_first_and_last(self):
         user = {"_id": ObjectId(), "employee_id": "26IT004"}
         times = [
