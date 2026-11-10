@@ -89,6 +89,7 @@ def serialize_details(record: dict | None) -> dict:
             "scheduled_work_duration": 0,
             "half_day_working_duration": 0,
             "schedule_effective_from": "",
+            "working_schedule_starting_date": "",
             "working_schedule_history": [],
         }
 
@@ -114,6 +115,7 @@ def serialize_details(record: dict | None) -> dict:
         "scheduled_work_duration": int(record.get("scheduled_work_duration") or 0),
         "half_day_working_duration": int(record.get("half_day_working_duration") or 0),
         "schedule_effective_from": serialize_date(record.get("schedule_effective_from")) or "",
+        "working_schedule_starting_date": serialize_date(record.get("schedule_effective_from")) or "",
         "working_schedule_history": record.get("working_schedule_history") or [],
     }
 
@@ -205,6 +207,8 @@ class EmployeeExtraDetailsPayload(BaseModel):
     working_type: str = ""
     scheduled_work_start_time: str = ""
     scheduled_work_end_time: str = ""
+    working_schedule_starting_date: date | None = None
+    working_details_update: bool | None = None
     work_stage: str = "Employee"
     work_field: str = ""
     nationality: str = ""
@@ -392,20 +396,67 @@ def save_employee_details(
     now = datetime.now(timezone.utc)
 
     values = payload.model_dump(mode="json")
+    working_details_update = values.pop("working_details_update", None)
+    values.pop("working_schedule_starting_date", None)
     from app.working_details import record_schedule_change
     existing_details = employee_details_collection.find_one({"user_id": str(target_user["_id"])}) or {}
     from app.attendance import company_today
-    schedule_effective_date = (
-        company_today()
-        if existing_details.get("schedule_effective_from")
-        else (payload.date_of_joining or company_today())
+
+    has_working_schedule = bool(
+        payload.working_type or payload.scheduled_work_start_time or payload.scheduled_work_end_time
     )
-    schedule_fields = record_schedule_change(
-        existing_details,
-        values,
-        schedule_effective_date,
+    schedule_effective_date = payload.working_schedule_starting_date
+    if has_working_schedule and schedule_effective_date is None:
+        # Backward compatibility for older API clients: retain the current
+        # effective date when editing an existing schedule; otherwise use today.
+        schedule_effective_date = (
+            date.fromisoformat(str(existing_details.get("schedule_effective_from"))[:10])
+            if existing_details.get("schedule_effective_from")
+            else company_today()
+        )
+    old_schedule_values = (
+        existing_details.get("working_type") or "",
+        existing_details.get("scheduled_work_start_time") or "",
+        existing_details.get("scheduled_work_end_time") or "",
     )
-    values.update(schedule_fields)
+    new_schedule_values = (
+        values.get("working_type") or "",
+        values.get("scheduled_work_start_time") or "",
+        values.get("scheduled_work_end_time") or "",
+    )
+    should_update_schedule = (
+        working_details_update is True
+        or (working_details_update is None and old_schedule_values != new_schedule_values)
+    )
+    payroll_schedule_notice = None
+    if schedule_effective_date is not None and should_update_schedule:
+        # The selected effective date is authoritative, including dates before
+        # Date of Joining and dates in finalized payroll periods. Saving a
+        # schedule does not rewrite attendance or finalized payroll snapshots;
+        # payroll-protected records remain immutable in their existing flows.
+        try:
+            schedule_fields = record_schedule_change(
+                existing_details,
+                values,
+                schedule_effective_date,
+                force_effective_date=(
+                    payload.working_schedule_starting_date is not None
+                    and str(payload.working_schedule_starting_date)
+                    != str(existing_details.get("schedule_effective_from") or "")[:10]
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        values.update(schedule_fields)
+    else:
+        # Do not alter a previously configured schedule when this save did not
+        # intentionally edit Working Details.
+        for key in (
+            "working_type", "scheduled_work_start_time", "scheduled_work_end_time",
+            "scheduled_work_duration", "half_day_working_duration",
+            "schedule_effective_from", "working_schedule_history",
+        ):
+            values.pop(key, None)
     values["updated_at"] = now
 
     employee_details_collection.update_one(
@@ -428,4 +479,5 @@ def save_employee_details(
         "message": "Employee details saved successfully.",
         "user": serialize_user(target_user),
         "details": serialize_details(saved),
+        "schedule_effective_date_notice": payroll_schedule_notice,
     }

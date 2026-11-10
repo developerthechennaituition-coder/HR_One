@@ -4877,6 +4877,23 @@ def _calculate_daily_attendance(
     # scheduled end so a late checkout is retained without absorbing the
     # next day's normal shift.
     scheduled = applicable_schedule(user_id, selected_date)
+    # Attendance records may already contain a schedule snapshot from an earlier
+    # automatic calculation. Prefer the effective employee schedule, but use the
+    # saved day snapshot when legacy employee history is incomplete.
+    if record:
+        snapshot = {}
+        for field in (
+            "working_type", "scheduled_work_start_time", "scheduled_work_end_time",
+            "scheduled_work_duration", "half_day_working_duration",
+        ):
+            if record.get(field) not in (None, "") and scheduled.get(field) in (None, "", 0):
+                snapshot[field] = record[field]
+        if snapshot:
+            scheduled = {**scheduled, **snapshot}
+            threshold = int(scheduled.get("half_day_working_duration") or 0)
+            scheduled["half_day_working_duration_text"] = (
+                format_hours_minutes(threshold) if threshold else ""
+            )
     schedule_start = _hhmm_minutes(scheduled.get("scheduled_work_start_time"))
     schedule_end = _hhmm_minutes(scheduled.get("scheduled_work_end_time"))
     if schedule_start is not None and schedule_end is not None and schedule_end <= schedule_start:
@@ -5271,6 +5288,12 @@ def refresh_automatic_attendance_calculation(user_id: str, selected_date: date) 
         "second_half_status": half.get("second_half_status"),
         "actual_working_minutes": int(details.get("working_minutes") or 0),
         "half_day_working_duration": int(details.get("half_day_working_duration") or 0),
+        # Preserve the schedule used for this day's calculation so later
+        # employee schedule edits cannot erase historical attendance context.
+        "working_type": details.get("working_type") or "",
+        "scheduled_work_start_time": details.get("scheduled_work_start_time") or "",
+        "scheduled_work_end_time": details.get("scheduled_work_end_time") or "",
+        "scheduled_work_duration": int(details.get("scheduled_work_duration") or 0),
         "attendance_calculation_updated_at": now,
         "attendance_calculation_version": "current",
         "updated_at": now,

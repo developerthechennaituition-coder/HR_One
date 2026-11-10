@@ -126,6 +126,14 @@ function formatScheduleDuration(totalMinutes) {
   return `${String(hours).padStart(2, "0")} Hours ${String(remainder).padStart(2, "0")} Minutes`;
 }
 
+function getLocalDateString() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function getDisplayValue(value) {
   if (
     value === null ||
@@ -237,6 +245,7 @@ function normalizeEmployeeDetails(data) {
     working_type: details?.working_type || "",
     scheduled_work_start_time: details?.scheduled_work_start_time || "",
     scheduled_work_end_time: details?.scheduled_work_end_time || "",
+    working_schedule_starting_date: details?.schedule_effective_from || getLocalDateString(),
     scheduled_work_duration: Number(details?.scheduled_work_duration || 0),
     half_day_working_duration: Number(details?.half_day_working_duration || 0),
 
@@ -312,6 +321,7 @@ function Field({
   onChange,
   disabled = false,
   placeholder = "",
+  min,
 }) {
   return (
     <div className="employee-details-field">
@@ -328,10 +338,11 @@ function Field({
           onChange={onChange}
           disabled={disabled}
           placeholder={placeholder}
+          min={min}
         />
       ) : (
         <div className="employee-details-value">
-          {getDisplayValue(value)}
+          {type === "date" ? formatDate(value) : getDisplayValue(value)}
         </div>
       )}
     </div>
@@ -465,6 +476,7 @@ export default function EmployeeDetails({
     useState("");
 
   const [isEditing, setIsEditing] = useState(false);
+  const [workingDetailsTouched, setWorkingDetailsTouched] = useState(false);
 
   const canEditDetails = Boolean(
     canEdit && !readOnly
@@ -753,6 +765,10 @@ export default function EmployeeDetails({
       checked,
     } = event.target;
 
+    if (["working_type", "scheduled_work_start_time", "scheduled_work_end_time", "working_schedule_starting_date"].includes(name)) {
+      setWorkingDetailsTouched(true);
+    }
+
     setEmployee((previous) => ({
       ...(previous || {}),
       [name]:
@@ -819,6 +835,7 @@ export default function EmployeeDetails({
 
     setError("");
     setSuccessMessage("");
+    setWorkingDetailsTouched(false);
     setIsEditing(true);
   }
 
@@ -830,6 +847,7 @@ export default function EmployeeDetails({
     setError("");
     setSuccessMessage("");
     setIsEditing(false);
+    setWorkingDetailsTouched(false);
 
     loadEmployeeDetails();
   }
@@ -956,6 +974,8 @@ export default function EmployeeDetails({
       working_type: employee?.working_type || "",
       scheduled_work_start_time: employee?.scheduled_work_start_time || "",
       scheduled_work_end_time: employee?.scheduled_work_end_time || "",
+      working_schedule_starting_date: employee?.working_schedule_starting_date || getLocalDateString(),
+      working_details_update: workingDetailsTouched,
 
       work_stage:
         employee?.work_stage || "Employee",
@@ -1129,7 +1149,11 @@ export default function EmployeeDetails({
       setError("Please select a valid Working Type.");
       return;
     }
-
+    const scheduleStartingDate = employee?.working_schedule_starting_date || "";
+    if ((employee?.working_type || startTime || endTime) && !scheduleStartingDate) {
+      setError("Please select the Working Details Starting Date.");
+      return;
+    }
     setSaving(true);
     setError("");
     setSuccessMessage("");
@@ -1153,9 +1177,16 @@ export default function EmployeeDetails({
       /*
        * 2. Save new Employee Master information
        */
-      await saveExtraEmployeeInformation(
-        token
-      );
+      const extraSaveResult = await saveExtraEmployeeInformation(token);
+      if (extraSaveResult?.details?.working_schedule_starting_date) {
+        setEmployee((previous) => ({
+          ...(previous || {}),
+          working_schedule_starting_date: extraSaveResult.details.working_schedule_starting_date,
+        }));
+      }
+      if (extraSaveResult?.schedule_effective_date_notice) {
+        setSuccessMessage(extraSaveResult.schedule_effective_date_notice);
+      }
 
       /*
        * 3. Save Reporting Manager, HOD and HR Admin (HR Admin only)
@@ -1166,9 +1197,7 @@ export default function EmployeeDetails({
         );
       }
 
-      setSuccessMessage(
-        "Employee details updated successfully."
-      );
+      setSuccessMessage((previous) => previous || "Employee details updated successfully.");
 
       setIsEditing(false);
 
@@ -1871,6 +1900,14 @@ export default function EmployeeDetails({
             name="scheduled_work_end_time"
             type="time"
             value={employee.scheduled_work_end_time || ""}
+            editing={isEditing}
+            onChange={handleChange}
+          />
+          <Field
+            label="Starting Date"
+            name="working_schedule_starting_date"
+            type="date"
+            value={employee.working_schedule_starting_date || ""}
             editing={isEditing}
             onChange={handleChange}
           />

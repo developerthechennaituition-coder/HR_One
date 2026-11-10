@@ -58,12 +58,17 @@ def _snapshot(details: dict[str, Any], effective_from: Any = None) -> dict[str, 
     start = details.get("scheduled_work_start_time") or ""
     end = details.get("scheduled_work_end_time") or ""
     duration = schedule_duration(start, end)
+    stored_duration = int(details.get("scheduled_work_duration") or 0)
+    effective_duration = duration or stored_duration
+    stored_half_day = int(details.get("half_day_working_duration") or 0)
     return {
         "working_type": details.get("working_type") or "Full Time",
         "scheduled_work_start_time": start,
         "scheduled_work_end_time": end,
-        "scheduled_work_duration": duration or int(details.get("scheduled_work_duration") or 0),
-        "half_day_working_duration": (duration or int(details.get("scheduled_work_duration") or 0)) // 2,
+        "scheduled_work_duration": effective_duration,
+        # Keep an explicitly stored threshold for legacy/partially migrated
+        # records. Derive it from the schedule only when no threshold exists.
+        "half_day_working_duration": stored_half_day or effective_duration // 2,
         "effective_from": str(effective_from or details.get("schedule_effective_from") or "1900-01-01")[:10],
     }
 
@@ -100,50 +105,124 @@ def applicable_schedule(user_id: str, attendance_date: date, user: dict[str, Any
     duration = int(chosen.get("scheduled_work_duration") or schedule_duration(
         chosen.get("scheduled_work_start_time"), chosen.get("scheduled_work_end_time")
     ))
+    half_day_duration = int(chosen.get("half_day_working_duration") or duration // 2)
     result = {
         **chosen,
         "scheduled_work_duration": duration,
-        "half_day_working_duration": int(chosen.get("half_day_working_duration") or duration // 2),
+        "half_day_working_duration": half_day_duration,
         "scheduled_work_duration_text": format_hours_minutes(duration) if duration else "",
-        "half_day_working_duration_text": format_hours_minutes(duration // 2) if duration else "",
+        # The text shown in attendance must represent the exact numeric
+        # threshold used by classify_half_day(), including legacy snapshots.
+        "half_day_working_duration_text": format_hours_minutes(half_day_duration) if half_day_duration else "",
     }
     return result
 
 
-def record_schedule_change(details: dict[str, Any] | None, new_values: dict[str, Any], effective_from: date) -> dict[str, Any]:
-    """Return update fields while preserving the old schedule's effective range."""
-    old = details or {}
-    old_start = old.get("scheduled_work_start_time") or ""
-    old_end = old.get("scheduled_work_end_time") or ""
-    new_start = new_values.get("scheduled_work_start_time") or ""
-    new_end = new_values.get("scheduled_work_end_time") or ""
-    old_type = old.get("working_type") or "Full Time"
-    new_type = new_values.get("working_type") or "Full Time"
-    old_duration = schedule_duration(old_start, old_end)
-    new_duration = schedule_duration(new_start, new_end)
-    history = list(old.get("working_schedule_history") or [])
-    current_from = _as_date(old.get("schedule_effective_from")) or _as_date(old.get("date_of_joining")) or effective_from
-    schedule_changed = (old_start, old_end, old_type) != (new_start, new_end, new_type)
-    if schedule_changed and (old_start or old_end):
-        if effective_from > current_from:
-            history.append({
-                "working_type": old_type,
-                "scheduled_work_start_time": old_start,
-                "scheduled_work_end_time": old_end,
-                "scheduled_work_duration": old_duration,
-                "half_day_working_duration": old_duration // 2,
-                "effective_from": current_from.isoformat(),
-                "effective_to": (effective_from - timedelta(days=1)).isoformat(),
-            })
+def _schedule_record(values: dict[str, Any], effective_from: date) -> dict[str, Any]:
+    start = values.get("scheduled_work_start_time") or ""
+    end = values.get("scheduled_work_end_time") or ""
+    duration = schedule_duration(start, end)
     return {
-        "working_type": new_type,
-        "scheduled_work_start_time": new_start,
-        "scheduled_work_end_time": new_end,
-        "scheduled_work_duration": new_duration,
-        "half_day_working_duration": new_duration // 2,
-        "schedule_effective_from": (
-            effective_from.isoformat() if schedule_changed
-            else str(old.get("schedule_effective_from") or current_from.isoformat())[:10]
-        ),
+        "working_type": values.get("working_type") or "Full Time",
+        "scheduled_work_start_time": start,
+        "scheduled_work_end_time": end,
+        "scheduled_work_duration": duration,
+        "half_day_working_duration": duration // 2,
+        "effective_from": effective_from.isoformat(),
+    }
+
+
+def record_schedule_change(
+    details: dict[str, Any] | None,
+    new_values: dict[str, Any],
+    effective_from: date,
+    *,
+    force_effective_date: bool = False,
+) -> dict[str, Any]:
+    """Insert/replace a schedule at an effective date without losing later history.
+
+    The top-level fields always represent the latest effective schedule. All earlier
+    schedules are retained as closed ranges in working_schedule_history.
+    """
+    old = details or {}
+    old_history = old.get("working_schedule_history") or []
+    schedules: list[dict[str, Any]] = []
+    for item in old_history:
+        if not isinstance(item, dict):
+            continue
+        item_from = _as_date(item.get("effective_from"))
+        if not item_from:
+            continue
+        schedules.append({
+            **_snapshot(item, item_from),
+            "effective_from": item_from.isoformat(),
+        })
+
+    current_from = (
+        _as_date(old.get("schedule_effective_from"))
+        or _as_date(old.get("date_of_joining"))
+        or joining_date
+    )
+    if current_from and (
+        old.get("scheduled_work_start_time")
+        or old.get("scheduled_work_end_time")
+        or old.get("working_type")
+    ):
+        schedules.append({
+            **_snapshot(old, current_from),
+            "effective_from": current_from.isoformat(),
+        })
+
+    # Collapse duplicate effective dates deterministically, keeping the latest
+    # current/top-level record where it shares a date with a history entry.
+    by_date: dict[str, dict[str, Any]] = {}
+    for item in sorted(schedules, key=lambda x: x["effective_from"]):
+        by_date[item["effective_from"]] = item
+
+    new_record = _schedule_record(new_values, effective_from)
+    ordered_before = [by_date[key] for key in sorted(by_date)]
+    if ordered_before:
+        latest_before = ordered_before[-1]
+        same_configuration = (
+            latest_before.get("working_type") == new_record.get("working_type")
+            and latest_before.get("scheduled_work_start_time") == new_record.get("scheduled_work_start_time")
+            and latest_before.get("scheduled_work_end_time") == new_record.get("scheduled_work_end_time")
+        )
+        if same_configuration and not force_effective_date and effective_from >= date.fromisoformat(latest_before["effective_from"]):
+            return {
+                "working_type": old.get("working_type") or latest_before["working_type"],
+                "scheduled_work_start_time": old.get("scheduled_work_start_time") or latest_before["scheduled_work_start_time"],
+                "scheduled_work_end_time": old.get("scheduled_work_end_time") or latest_before["scheduled_work_end_time"],
+                "scheduled_work_duration": int(old.get("scheduled_work_duration") or latest_before["scheduled_work_duration"] or 0),
+                "half_day_working_duration": int(old.get("half_day_working_duration") or latest_before["half_day_working_duration"] or 0),
+                "schedule_effective_from": str(old.get("schedule_effective_from") or latest_before["effective_from"])[:10],
+                "working_schedule_history": list(old_history),
+            }
+    by_date[effective_from.isoformat()] = new_record
+    ordered = [by_date[key] for key in sorted(by_date)]
+
+    # Rebuild closed intervals. This also preserves schedules that were already
+    # planned for dates after the newly inserted effective date.
+    history: list[dict[str, Any]] = []
+    for index, item in enumerate(ordered[:-1]):
+        next_from = date.fromisoformat(ordered[index + 1]["effective_from"])
+        history.append({
+            "working_type": item["working_type"],
+            "scheduled_work_start_time": item["scheduled_work_start_time"],
+            "scheduled_work_end_time": item["scheduled_work_end_time"],
+            "scheduled_work_duration": int(item["scheduled_work_duration"] or 0),
+            "half_day_working_duration": int(item["half_day_working_duration"] or 0),
+            "effective_from": item["effective_from"],
+            "effective_to": (next_from - timedelta(days=1)).isoformat(),
+        })
+
+    latest = ordered[-1]
+    return {
+        "working_type": latest["working_type"],
+        "scheduled_work_start_time": latest["scheduled_work_start_time"],
+        "scheduled_work_end_time": latest["scheduled_work_end_time"],
+        "scheduled_work_duration": int(latest["scheduled_work_duration"] or 0),
+        "half_day_working_duration": int(latest["half_day_working_duration"] or 0),
+        "schedule_effective_from": latest["effective_from"],
         "working_schedule_history": history,
     }
