@@ -138,6 +138,7 @@ def record_schedule_change(
     effective_from: date,
     *,
     force_effective_date: bool = False,
+    joining_date: date | datetime | str | None = None,
 ) -> dict[str, Any]:
     """Insert/replace a schedule at an effective date without losing later history.
 
@@ -158,10 +159,14 @@ def record_schedule_change(
             "effective_from": item_from.isoformat(),
         })
 
+    # Prefer the schedule's own effective date. For legacy records without
+    # schedule metadata, use the employee's joining date as the baseline so
+    # their existing schedule is retained in history when a new one is saved.
     current_from = (
         _as_date(old.get("schedule_effective_from"))
         or _as_date(old.get("date_of_joining"))
-        or joining_date
+        or _as_date(old.get("joining_date"))
+        or _as_date(joining_date)
     )
     if current_from and (
         old.get("scheduled_work_start_time")
@@ -180,6 +185,25 @@ def record_schedule_change(
         by_date[item["effective_from"]] = item
 
     new_record = _schedule_record(new_values, effective_from)
+
+    # The Working Details form edits the *current* schedule. When the saved
+    # values describe a correction of it - the same schedule moved to another
+    # date, or changed values with a starting date on/before the current one -
+    # replace the current entry instead of keeping it alongside the new one.
+    # Otherwise the old entry (still the latest by date) would win and the
+    # previous values would reappear after saving.
+    if current_from:
+        current_key = current_from.isoformat()
+        current_entry = by_date.get(current_key)
+        if current_entry is not None and current_key != effective_from.isoformat():
+            unchanged_values = (
+                current_entry.get("working_type") == new_record.get("working_type")
+                and current_entry.get("scheduled_work_start_time") == new_record.get("scheduled_work_start_time")
+                and current_entry.get("scheduled_work_end_time") == new_record.get("scheduled_work_end_time")
+            )
+            if unchanged_values or effective_from < current_from:
+                del by_date[current_key]
+
     ordered_before = [by_date[key] for key in sorted(by_date)]
     if ordered_before:
         latest_before = ordered_before[-1]

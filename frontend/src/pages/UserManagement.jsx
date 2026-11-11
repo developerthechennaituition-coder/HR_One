@@ -5,10 +5,11 @@ import { parsePhoneNumberFromString } from "libphonenumber-js/max";
 // phone-number lengths are detected dynamically for each selected country.
 import { Metadata } from "libphonenumber-js";
 import { roleLabel } from "../services/roleLabels";
+import Pagination from "../components/Pagination";
 
 // HR administrators create, activate, edit and filter application users here.
 const API_URL = HRONE_API_BASE + "/api/users";
-const ROLE_OPTIONS = ["HR Admin", "Administrator", "HR Manager", "Employee"];
+const ROLE_OPTIONS = ["HR Admin", "HOD", "Employee"];
 const emptyUser = {
   employee_id: "",
   name: "",
@@ -55,6 +56,7 @@ function UserManagement() {
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [roleFilter, setRoleFilter] = useState("all");
+  const [page, setPage] = useState(1);
   const [formValues, setFormValues] = useState(emptyUser);
   const [isFormOpen, setIsFormOpen] = useState(() =>
     window.location.pathname.endsWith("/admin/users/new"),
@@ -143,9 +145,12 @@ function UserManagement() {
     const matchesStatus =
       statusFilter === "all" ||
       (statusFilter === "active" ? user.is_active : !user.is_active);
-    const matchesRole = roleFilter === "all" || user.role === roleFilter;
+    const matchesRole = roleFilter === "all" || roleLabel(user.role) === roleFilter;
     return matchesSearch && matchesStatus && matchesRole;
   });
+  useEffect(() => { setPage(1); }, [searchTerm, statusFilter, roleFilter]);
+  const pageSize = 10;
+  const pageUsers = filteredUsers.slice((page - 1) * pageSize, page * pageSize);
 
   //Reset search and filters to default values
   const handleReset = () => {
@@ -846,7 +851,7 @@ function UserManagement() {
                     </td>
                   </tr>
                 ) : (
-                  filteredUsers.map((user) => (
+                  pageUsers.map((user) => (
                     <tr key={user.id}>
                       <td>{user.employee_id}</td>
                       <td>{user.name}</td>
@@ -939,6 +944,7 @@ function UserManagement() {
               </tbody>
             </table>
           </div>
+          <Pagination page={page} totalItems={filteredUsers.length} pageSize={pageSize} onPageChange={setPage} />
         </div>
       </div>
     </section>

@@ -1,6 +1,7 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useState } from "react";
 import { roleLabel } from "../services/roleLabels";
+import Pagination from "./Pagination";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
@@ -79,6 +80,7 @@ function EsslAdminSettings({ session }) {
   const [mappingSearch, setMappingSearch] = useState("");
   const [mappingDepartment, setMappingDepartment] = useState("all");
   const [selectedEmployeeIds, setSelectedEmployeeIds] = useState(() => new Set());
+  const [mappingPage, setMappingPage] = useState(1);
   const [savingMappingId, setSavingMappingId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -90,7 +92,7 @@ function EsslAdminSettings({ session }) {
     employees.map((employee) => String(employee.department || "").trim()).filter(Boolean),
   )].sort((a, b) => a.localeCompare(b));
   const mappedEmployees = employees.filter((employee) => Boolean(String(employee.saved_essl_employee_id || "").trim()) && employee.is_active !== false && String(employee.essl_employee_id || "").trim() === String(employee.saved_essl_employee_id || "").trim());
-  const selectedMappedCount = mappedEmployees.filter((employee) => selectedEmployeeIds.has(employee.user_id)).length;
+  const mappingPageSize = 10;
   const filteredEmployees = employees.filter((employee) => {
     const query = mappingSearch.trim().toLocaleLowerCase();
     const searchable = [
@@ -100,6 +102,8 @@ function EsslAdminSettings({ session }) {
     return (!query || searchable) &&
       (mappingDepartment === "all" || employee.department === mappingDepartment);
   });
+  const pageFilteredEmployees = filteredEmployees.slice((mappingPage - 1) * mappingPageSize, mappingPage * mappingPageSize);
+  const selectedMappedCount = mappedEmployees.filter((employee) => selectedEmployeeIds.has(employee.user_id)).length;
 
   const headers = useCallback(() => {
     if (!token) throw new Error("Login session not found. Please login again.");
@@ -561,7 +565,7 @@ function EsslAdminSettings({ session }) {
                 <tr><th><input type="checkbox" className="form-check-input" aria-label="Select all mapped employees" checked={mappedEmployees.length > 0 && selectedMappedCount === mappedEmployees.length} onChange={(event) => setSelectedEmployeeIds(event.target.checked ? new Set(mappedEmployees.map((item) => item.user_id)) : new Set())} /></th><th>Employee Name</th><th>Employee ID</th><th>Role</th><th>Department</th><th>ESSL Employee Code</th><th>Mapping Status</th><th>Action</th></tr>
               </thead>
               <tbody>
-                {filteredEmployees.map((employee) => (
+                {pageFilteredEmployees.map((employee) => (
                   <tr key={employee.user_id} className={selectedEmployeeIds.has(employee.user_id) ? "table-primary" : ""}>
                     <td><input type="checkbox" className="form-check-input" aria-label={`Select ${employee.name || employee.employee_id}`} disabled={!String(employee.saved_essl_employee_id || "").trim() || String(employee.essl_employee_id || "").trim() !== String(employee.saved_essl_employee_id || "").trim() || employee.is_active === false} checked={selectedEmployeeIds.has(employee.user_id)} onChange={(event) => setSelectedEmployeeIds((current) => { const next = new Set(current); if (event.target.checked) next.add(employee.user_id); else next.delete(employee.user_id); return next; })} /></td>
                     <td>{employee.name || "—"}{!employee.is_active && <span className="badge text-bg-secondary ms-2">Inactive</span>}</td>
@@ -587,6 +591,7 @@ function EsslAdminSettings({ session }) {
                 {filteredEmployees.length === 0 && <tr><td colSpan="8" className="text-center text-muted py-4">No employees match the selected search or department.</td></tr>}
               </tbody>
             </table>
+          <Pagination page={mappingPage} totalItems={filteredEmployees.length} pageSize={mappingPageSize} onPageChange={setMappingPage} />
           </div>
         </div>
 

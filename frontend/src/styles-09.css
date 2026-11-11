@@ -1450,3 +1450,162 @@ button[style*="min-height: 64px"] .badge {
   .modal.d-block,
   .modal.show { -webkit-backdrop-filter: none; backdrop-filter: none; animation: none; }
 }
+
+/* ===== Notification target multi-select ===== */
+.nts { position: relative; min-width: 0; }
+.nts-control { text-align: left; display: flex; align-items: center; cursor: pointer; }
+.nts-control.is-open { border-color: #86b7fe; box-shadow: 0 0 0 .2rem rgba(13, 110, 253, .15); }
+.nts-control-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nts-placeholder { color: #6c757d; }
+.nts-panel { position: absolute; z-index: 1050; left: 0; right: 0; margin-top: 4px; background: #fff; border: 1px solid #d6e0ec; border-radius: 8px; box-shadow: 0 10px 28px rgba(16, 24, 40, .16); overflow: hidden; }
+.nts-search { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #eef2f7; color: #8090a4; }
+.nts-search input { flex: 1; min-width: 0; border: 0; outline: 0; font-size: 14px; background: transparent; }
+.nts-all { display: block; width: 100%; padding: 7px 12px; text-align: left; border: 0; border-bottom: 1px solid #eef2f7; background: #f8fafc; color: #0d6efd; font-size: 13px; font-weight: 600; }
+.nts-options { list-style: none; margin: 0; padding: 4px; max-height: 260px; overflow-y: auto; }
+.nts-option { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 14px; margin: 0; }
+.nts-option:hover { background: #f1f5fb; }
+.nts-option.is-selected { background: #e8f1ff; }
+.nts-option-label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.nts-option-meta { color: #667085; font-size: 12px; white-space: nowrap; }
+.nts-empty { padding: 14px; text-align: center; color: #667085; font-size: 13px; }
+.nts-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; max-height: 150px; overflow-y: auto; }
+.nts-chip { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; padding: 3px 4px 3px 10px; border-radius: 999px; background: #e8f1ff; color: #174ea6; font-size: 13px; font-weight: 500; }
+.nts-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.nts-chip-remove { display: inline-grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font-size: 16px; line-height: 1; }
+.nts-chip-remove:hover { background: rgba(23, 78, 166, .15); }
+.nts-clear { border: 0; background: transparent; color: #b42318; font-size: 12px; font-weight: 600; padding: 4px 6px; }
+@media (max-width: 575.98px) {
+  .nts-options { max-height: 220px; }
+  .nts-chip-text { max-width: 160px; }
+}
+
+/* =========================================================================
+   13. ATTENDANCE CALENDAR MONTH/YEAR SELECT FIX
+   Keep the complete month label visible in the closed select control.
+   This overrides the earlier mobile flex: 1 1 0 / min-width: 0 rules,
+   which could shrink the month select until its label was clipped.
+   Presentation-only; no React or attendance logic changes.
+   ========================================================================= */
+ section[aria-label="Monthly attendance calendar"]
+  > .card-body > .d-flex:first-child > .d-flex {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  gap: 8px !important;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* Month selector */
+section[aria-label="Monthly attendance calendar"]
+  .form-select-sm[aria-label="Month"] {
+  flex: 0 1 170px !important;
+  width: 170px;
+  min-width: 0 !important;
+  max-width: 100%;
+  white-space: nowrap;
+  padding-left: 12px;
+  padding-right: 28px;
+}
+
+/* Year selector */
+section[aria-label="Monthly attendance calendar"]
+  .form-select-sm[aria-label="Year"] {
+  flex: 0 0 100px !important;
+  width: 100px;
+  min-width: 0 !important;
+  padding-left: 12px;
+  padding-right: 25px;
+}
+
+/* Previous and Next buttons */
+section[aria-label="Monthly attendance calendar"]
+  > .card-body > .d-flex:first-child > .d-flex > button {
+  flex: 0 0 38px !important;
+  width: 38px;
+  min-width: 38px;
+  height: 40px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Tablet and mobile */
+@media (max-width: 767.98px) {
+  section[aria-label="Monthly attendance calendar"]
+    > .card-body > .d-flex:first-child {
+    align-items: center !important;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    > .card-body > .d-flex:first-child > .d-flex {
+    display: grid !important;
+    grid-template-columns: 34px minmax(0, 1fr) 92px 34px;
+    grid-template-rows: 40px;
+    align-items: center;
+    justify-content: stretch !important;
+    gap: 6px !important;
+    width: 100%;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    > .card-body > .d-flex:first-child > .d-flex > button:first-child {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    .form-select-sm[aria-label="Month"] {
+    grid-column: 2;
+    grid-row: 1;
+    width: 100%;
+    min-width: 0 !important;
+    flex: none !important;
+    padding-left: 10px;
+    padding-right: 25px;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    .form-select-sm[aria-label="Year"] {
+    grid-column: 3;
+    grid-row: 1;
+    width: 100%;
+    min-width: 0 !important;
+    flex: none !important;
+    padding-left: 8px;
+    padding-right: 20px;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    > .card-body > .d-flex:first-child > .d-flex > button:last-child {
+    grid-column: 4;
+    grid-row: 1;
+  }
+}
+
+/* Small mobile screens */
+@media (max-width: 359.98px) {
+  section[aria-label="Monthly attendance calendar"]
+    > .card-body > .d-flex:first-child > .d-flex {
+    grid-template-columns: 30px minmax(0, 1fr) 78px 30px;
+    gap: 4px !important;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    > .card-body > .d-flex:first-child > .d-flex > button {
+    width: 30px;
+    min-width: 30px;
+    height: 36px;
+  }
+
+  section[aria-label="Monthly attendance calendar"]
+    .form-select-sm[aria-label="Month"],
+  section[aria-label="Monthly attendance calendar"]
+    .form-select-sm[aria-label="Year"] {
+    font-size: 12px;
+  }
+}

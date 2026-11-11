@@ -34,8 +34,7 @@ departments_collection = db["departments"]
 
 ALLOWED_NOTIFICATION_ROLES = {
     "hr admin",
-    "manager",
-    "administrator",
+    "hr manager",
 }
 
 
@@ -165,8 +164,7 @@ def require_notification_manager(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                "Only HR Admin, Manager or Administrator "
-                "can manage notifications"
+                "Only HR Admin or HOD can manage notifications"
             ),
         )
 
@@ -623,11 +621,14 @@ def resolve_recipient_user_ids(audience: NotificationAudience):
         return list(dict.fromkeys(user_ids))
 
     if audience.type == "teams":
-
+        # "Specific Teams" = Reporting Managers. Each selected value is a
+        # reporting manager's user id (or employee ID); recipients are the
+        # manager plus every active user whose reporting_manager_id points to
+        # that manager. Legacy team_id / team values are still honoured.
         if not audience.team_ids:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Please select at least one team",
+                detail="Please select at least one reporting manager",
             )
 
         team_values = [
@@ -635,40 +636,54 @@ def resolve_recipient_user_ids(audience: NotificationAudience):
             for value in audience.team_ids
             if str(value).strip()
         ]
-
-        users = users_collection.find(
+        object_values = [value for value in team_values if ObjectId.is_valid(value)]
+        manager_docs = list(users_collection.find(
             {
                 "is_active": True,
                 "$or": [
-                    {
-                        "team_id": {
-                            "$in": team_values
-                        }
-                    },
-                    {
-                        "team": {
-                            "$in": team_values
-                        }
-                    },
+                    {"_id": {"$in": [ObjectId(value) for value in object_values]}},
+                    {"employee_id": {"$in": team_values}},
                 ],
             },
-            {
-                "_id": 1,
-            },
+            {"_id": 1},
+        ))
+        manager_ids = [str(item["_id"]) for item in manager_docs]
+
+        recipient_ids = list(manager_ids)
+        if manager_ids:
+            recipient_ids.extend(
+                str(item["_id"])
+                for item in users_collection.find(
+                    {"is_active": True, "reporting_manager_id": {"$in": manager_ids}},
+                    {"_id": 1},
+                )
+            )
+        # Legacy team identifiers stored on user documents.
+        recipient_ids.extend(
+            str(item["_id"])
+            for item in users_collection.find(
+                {
+                    "is_active": True,
+                    "$or": [
+                        {"team_id": {"$in": team_values}},
+                        {"team": {"$in": team_values}},
+                    ],
+                },
+                {"_id": 1},
+            )
         )
 
-        user_ids = [
-            str(user["_id"])
-            for user in users
-        ]
+        # dict.fromkeys keeps order and guarantees one notification per user,
+        # even when a manager is also a member of another selected team.
+        user_ids = list(dict.fromkeys(recipient_ids))
 
         if not user_ids:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No active users found for selected team",
+                detail="No active users found for the selected reporting managers",
             )
 
-        return list(dict.fromkeys(user_ids))
+        return user_ids
 
     if audience.type == "departments":
         if not audience.department_ids:
@@ -682,14 +697,17 @@ def resolve_recipient_user_ids(audience: NotificationAudience):
         valid_department_ids = []
         for department_id in department_ids:
             department = departments_collection.find_one(
-                {"_id": ObjectId(department_id), "is_active": True}
+                {"_id": ObjectId(department_id), "is_active": {"$ne": False}}
                 if ObjectId.is_valid(department_id)
-                else {"department_name": department_id, "is_active": True},
+                else {"department_name": department_id, "is_active": {"$ne": False}},
                 {"department_name": 1},
             )
             if department:
                 valid_department_ids.append(str(department["_id"]))
                 department_names.append(department.get("department_name", ""))
+            elif not ObjectId.is_valid(department_id):
+                # Legacy department strings are valid audience selectors too.
+                department_names.append(department_id)
 
         detail_user_ids = [
             detail.get("user_id")
@@ -1246,24 +1264,29 @@ def notification_lookups(
 ):
     user = get_authenticated_user(authorization)
     require_notification_manager(user)
-    roles = [
-        {
-            "id": str(item.get("role_id") or item.get("name", "")).strip().lower().replace(" ", "_"),
-            "name": item.get("name", ""),
-        }
-        for item in db["roles"].find({"status": {"$ne": "Inactive"}}, {"name": 1}).sort("name", 1)
-        if item.get("name")
+    allowed_roles = [
+        {"id": "hr_admin", "name": "HR Admin"},
+        {"id": "hr_manager", "name": "HOD"},
+        {"id": "employee", "name": "Employee"},
     ]
-    role_names = {item["name"].strip().lower() for item in roles}
-    for role in db["users"].distinct("role", {"is_active": True}):
-        if role and role.strip().lower() not in role_names:
-            roles.append({"id": role, "name": role})
-            role_names.add(role.strip().lower())
-    departments = [
-        {"id": str(item["_id"]), "name": item.get("department_name", "")}
-        for item in departments_collection.find({"is_active": True}, {"department_name": 1}).sort("department_name", 1)
-        if item.get("department_name")
-    ]
+    roles = allowed_roles
+    department_by_name = {}
+    for item in departments_collection.find(
+        {"is_active": {"$ne": False}}, {"department_name": 1}
+    ).sort("department_name", 1):
+        name = str(item.get("department_name") or "").strip()
+        if name:
+            department_by_name[name.casefold()] = {
+                "id": str(item["_id"]), "name": name,
+            }
+    # Older HRMS records may store a department directly on employee/user
+    # documents without a matching departments collection document.
+    for collection in (employee_details_collection, notifications_users_collection()):
+        for name in collection.distinct("department"):
+            name = str(name or "").strip()
+            if name and name.casefold() not in department_by_name:
+                department_by_name[name.casefold()] = {"id": name, "name": name}
+    departments = sorted(department_by_name.values(), key=lambda item: item["name"].casefold())
     employees = [
         {
             "id": str(item["_id"]),
@@ -1275,7 +1298,37 @@ def notification_lookups(
             {"employee_id": 1, "name": 1},
         ).sort("employee_id", 1)
     ]
-    return {"roles": roles, "departments": departments, "employees": employees}
+    # Reporting managers: users that at least one active employee reports to.
+    users_col = notifications_users_collection()
+    manager_object_ids = [
+        ObjectId(value)
+        for value in users_col.distinct("reporting_manager_id", {"is_active": True})
+        if isinstance(value, str) and ObjectId.is_valid(value)
+    ]
+    team_sizes = {}
+    for item in users_col.aggregate([
+        {"$match": {"is_active": True, "reporting_manager_id": {"$in": [str(v) for v in manager_object_ids]}}},
+        {"$group": {"_id": "$reporting_manager_id", "count": {"$sum": 1}}},
+    ]):
+        team_sizes[item["_id"]] = item["count"]
+    reporting_managers = [
+        {
+            "id": str(item["_id"]),
+            "employee_id": item.get("employee_id", ""),
+            "name": item.get("name", ""),
+            "team_size": team_sizes.get(str(item["_id"]), 0),
+        }
+        for item in users_col.find(
+            {"_id": {"$in": manager_object_ids}, "is_active": True},
+            {"employee_id": 1, "name": 1},
+        ).sort("name", 1)
+    ]
+    return {
+        "roles": roles,
+        "departments": departments,
+        "employees": employees,
+        "reporting_managers": reporting_managers,
+    }
 
 
 # ============================================================

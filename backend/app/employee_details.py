@@ -430,15 +430,70 @@ def save_employee_details(
     )
     payroll_schedule_notice = None
     if schedule_effective_date is not None and should_update_schedule:
-        # The selected effective date is authoritative, including dates before
-        # Date of Joining and dates in finalized payroll periods. Saving a
-        # schedule does not rewrite attendance or finalized payroll snapshots;
-        # payroll-protected records remain immutable in their existing flows.
+        joining_date_value = (
+            payload.date_of_joining
+            or target_user.get("joining_date")
+            or target_user.get("date_of_joining")
+            or existing_details.get("date_of_joining")
+            or existing_details.get("joining_date")
+        )
+        from app.working_details import _as_date
+        joining_date = _as_date(joining_date_value)
+        if joining_date and schedule_effective_date < joining_date:
+            raise HTTPException(
+                status_code=422,
+                detail="Working Details Starting Date cannot be earlier than the Date of Joining.",
+            )
+
+        # A schedule effective-date change must not rewrite any month already
+        # approved, processed, or paid in payroll. Check the full date span
+        # whose effective schedule would change, including the selected month.
+        employee_id = str(target_user.get("employee_id") or "").strip()
+        if not employee_id:
+            employee_master = db["employees"].find_one(
+                {"user_id": str(target_user["_id"])}, {"employee_id": 1}
+            ) or {}
+            employee_id = str(employee_master.get("employee_id") or "").strip()
+        old_effective_date = _as_date(existing_details.get("schedule_effective_from"))
+        affected_start = min(old_effective_date, schedule_effective_date) if old_effective_date else schedule_effective_date
+        # A schedule applies forward until the next effective-dated schedule.
+        # Include that full interval so a change cannot alter an approved future
+        # payroll month indirectly.
+        later_schedule_dates = [
+            parsed for item in (existing_details.get("working_schedule_history") or [])
+            if isinstance(item, dict)
+            for parsed in [_as_date(item.get("effective_from"))]
+            if parsed and parsed > schedule_effective_date
+        ]
+        affected_end = min(later_schedule_dates) - __import__("datetime").timedelta(days=1) if later_schedule_dates else date.max
+        if employee_id:
+            locked_payrolls = db["monthly_payroll_records"].find({
+                "employee_id": employee_id,
+                "status": {"$regex": "^(approved|processed|paid)$", "$options": "i"},
+            }, {"period": 1, "month": 1, "year": 1, "status": 1})
+            for payroll_row in locked_payrolls:
+                period = str(payroll_row.get("period") or "").strip()
+                try:
+                    period_year, period_month = (int(part) for part in period[:7].split("-"))
+                    period_start = date(period_year, period_month, 1)
+                    from calendar import monthrange
+                    period_end = date(period_year, period_month, monthrange(period_year, period_month)[1])
+                except (ValueError, TypeError):
+                    continue
+                if period_start <= affected_end and period_end >= affected_start:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Working Details cannot be changed because the affected date range includes {period_start.strftime('%B %Y')} payroll, which is {payroll_row.get('status')}.",
+                    )
+
         try:
             schedule_fields = record_schedule_change(
                 existing_details,
                 values,
                 schedule_effective_date,
+                joining_date=(
+                    joining_date_value
+                ),
                 force_effective_date=(
                     payload.working_schedule_starting_date is not None
                     and str(payload.working_schedule_starting_date)

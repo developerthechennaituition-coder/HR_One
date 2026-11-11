@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import NotificationTargetSelect from "../components/NotificationTargetSelect";
 
 import {
   acknowledgeNotification,
@@ -20,9 +21,9 @@ import {
 const emptyForm = {
   title: "",
   message: "",
-  audienceType: "all",
+  audienceType: "roles",
   roleIds: [],
-  teamIds: "",
+  teamIds: [],
   departmentIds: [],
   userIds: [],
   validityValue: "1",
@@ -30,19 +31,20 @@ const emptyForm = {
   status: "ACTIVE",
 };
 
-const parseIdList = (value) => value.split(",").map((item) => item.trim()).filter(Boolean);
 
 function NotificationManagement({ user = {}, onNavigate }) {
   const [notifications, setNotifications] = useState([]);
-  const [lookups, setLookups] = useState({ roles: [], departments: [], employees: [] });
+  const [lookups, setLookups] = useState({ roles: [], departments: [], employees: [], reporting_managers: [] });
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [dateFilter, setDateFilter] = useState("");
+  const [starFilter, setStarFilter] = useState("all");
 
-  const canManage = ["hr admin", "manager", "administrator"].includes(
+  const canManage = ["hr admin", "hr manager", "hod"].includes(
     String(user?.role || "").trim().toLowerCase(),
   );
 
@@ -78,15 +80,35 @@ function NotificationManagement({ user = {}, onNavigate }) {
     };
   }, [canManage]);
 
+  const filteredNotifications = notifications.filter((item) => {
+    const created = item.created_at ? new Date(item.created_at) : null;
+    const dateMatches = !dateFilter || (created && !Number.isNaN(created.getTime()) &&
+      new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(created) === dateFilter);
+    const starredMatches = starFilter === "all" ||
+      (starFilter === "starred" ? Boolean(item.is_starred) : !item.is_starred);
+    return dateMatches && starredMatches;
+  });
+
   const updateForm = (event) => {
     const { name, value } = event.target;
     setForm((current) => ({ ...current, [name]: value }));
   };
 
-  const updateMultiple = (event) => {
-    const values = Array.from(event.target.selectedOptions, (option) => option.value);
-    setForm((current) => ({ ...current, [event.target.name]: values }));
-  };
+  const setSelection = (name) => (values) => setForm((current) => ({ ...current, [name]: values }));
+
+  // Options for the four target selectors, all built from the backend lookups.
+  const roleOptions = useMemo(() => (lookups.roles || []).map((role) => ({ id: role.id, label: role.name })), [lookups.roles]);
+  const departmentOptions = useMemo(() => (lookups.departments || []).map((department) => ({ id: department.id, label: department.name })), [lookups.departments]);
+  const employeeOptions = useMemo(() => (lookups.employees || []).map((employee) => ({
+    id: employee.id,
+    label: employee.name || "Unnamed employee",
+    meta: employee.employee_id || "No employee ID",
+  })), [lookups.employees]);
+  const managerOptions = useMemo(() => (lookups.reporting_managers || []).map((manager) => ({
+    id: manager.id,
+    label: manager.name || "Unnamed manager",
+    meta: `${manager.employee_id || "No employee ID"}${manager.team_size ? ` · ${manager.team_size} member${manager.team_size === 1 ? "" : "s"}` : ""}`,
+  })), [lookups.reporting_managers]);
 
   const resetForm = () => {
     setForm(emptyForm);
@@ -101,7 +123,7 @@ function NotificationManagement({ user = {}, onNavigate }) {
     audience: {
       type: form.audienceType,
       role_ids: form.audienceType === "roles" ? form.roleIds : [],
-      team_ids: form.audienceType === "teams" ? parseIdList(form.teamIds) : [],
+      team_ids: form.audienceType === "teams" ? form.teamIds : [],
       department_ids: form.audienceType === "departments" ? form.departmentIds : [],
       user_ids: form.audienceType === "users" ? form.userIds : [],
     },
@@ -120,8 +142,8 @@ function NotificationManagement({ user = {}, onNavigate }) {
     if (form.audienceType === "roles" && form.roleIds.length === 0) {
       return "Select at least one role.";
     }
-    if (form.audienceType === "teams" && parseIdList(form.teamIds).length === 0) {
-      return "Enter at least one team ID.";
+    if (form.audienceType === "teams" && form.teamIds.length === 0) {
+      return "Select at least one reporting manager.";
     }
     if (form.audienceType === "departments" && form.departmentIds.length === 0) {
       return "Select at least one department.";
@@ -169,7 +191,7 @@ function NotificationManagement({ user = {}, onNavigate }) {
       message: item.message || "",
       audienceType: audience.type || "all",
       roleIds: audience.role_ids || [],
-      teamIds: (audience.team_ids || []).join(", "),
+      teamIds: audience.team_ids || [],
       departmentIds: audience.department_ids || [],
       userIds: audience.user_ids || [],
       validityValue: String(item.validity_value || 1),
@@ -269,45 +291,32 @@ function NotificationManagement({ user = {}, onNavigate }) {
               <div className="col-lg-6">
                 <label className="form-label" htmlFor="notification-target">Target type</label>
                 <select id="notification-target" className="form-select" name="audienceType" value={form.audienceType} onChange={updateForm} disabled={saving}>
-                  <option value="all">All Employees</option>
+                  
                   <option value="roles">Specific Role</option>
                   <option value="departments">Specific Department</option>
                   <option value="users">Specific Employees</option>
-                  <option value="teams">Specific Teams (legacy)</option>
+                  <option value="teams">Specific Teams</option>
                 </select>
               </div>
               {form.audienceType === "roles" && (
                 <div className="col-lg-6">
-                  <label className="form-label" htmlFor="notification-roles">Roles</label>
-                  <select id="notification-roles" className="form-select" name="roleIds" multiple value={form.roleIds} onChange={updateMultiple} disabled={saving}>
-                    {lookups.roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
-                  </select>
-                </div>
-              )}
-              {form.audienceType === "teams" && (
-                <div className="col-lg-6">
-                  <label className="form-label" htmlFor="notification-teams">Team IDs</label>
-                  <input id="notification-teams" className="form-control" name="teamIds" value={form.teamIds} onChange={updateForm} disabled={saving} placeholder="Comma-separated team IDs" />
+                  <NotificationTargetSelect id="notification-roles" label="Roles" noun="role" options={roleOptions} value={form.roleIds} onChange={setSelection("roleIds")} placeholder="Select one or more roles" searchPlaceholder="Search roles" emptyText="No roles available" disabled={saving} />
                 </div>
               )}
               {form.audienceType === "departments" && (
                 <div className="col-lg-6">
-                  <label className="form-label" htmlFor="notification-departments">Departments</label>
-                  <select id="notification-departments" className="form-select" name="departmentIds" multiple value={form.departmentIds} onChange={updateMultiple} disabled={saving}>
-                    {lookups.departments.map((department) => <option key={department.id} value={department.id}>{department.name}</option>)}
-                  </select>
+                  <NotificationTargetSelect id="notification-departments" label="Departments" noun="department" options={departmentOptions} value={form.departmentIds} onChange={setSelection("departmentIds")} placeholder="Select one or more departments" searchPlaceholder="Search departments" emptyText="No departments available" disabled={saving} />
                 </div>
               )}
               {form.audienceType === "users" && (
                 <div className="col-lg-6">
-                  <label className="form-label" htmlFor="notification-employees">Employees</label>
-                  <select id="notification-employees" className="form-select" name="userIds" multiple value={form.userIds} onChange={updateMultiple} disabled={saving}>
-                    {lookups.employees.map((employee) => (
-                      <option key={employee.id} value={employee.id}>
-                        {employee.employee_id || "No employee ID"} — {employee.name}
-                      </option>
-                    ))}
-                  </select>
+                  <NotificationTargetSelect id="notification-employees" label="Employees" noun="employee" options={employeeOptions} value={form.userIds} onChange={setSelection("userIds")} placeholder="Select one or more employees" searchPlaceholder="Search employee name or ID" emptyText="No employees available" disabled={saving} />
+                </div>
+              )}
+              {form.audienceType === "teams" && (
+                <div className="col-lg-6">
+                  <NotificationTargetSelect id="notification-teams" label="Reporting Managers" noun="manager" options={managerOptions} value={form.teamIds} onChange={setSelection("teamIds")} placeholder="Select one or more reporting managers" searchPlaceholder="Search manager name or ID" emptyText="No reporting managers found" disabled={saving} />
+                  <div className="form-text">The selected managers and everyone reporting to them will be notified.</div>
                 </div>
               )}
               <div className="col-12">
@@ -351,15 +360,31 @@ function NotificationManagement({ user = {}, onNavigate }) {
             <i className="bi bi-arrow-clockwise me-1" /> Refresh
           </button>
         </div>
+        <div className="card-body border-bottom">
+          <div className="row g-2 align-items-end">
+            <div className="col-sm-6 col-lg-3">
+              <label className="form-label" htmlFor="notification-date-filter">Notification date</label>
+              <input id="notification-date-filter" type="date" className="form-control" value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} />
+            </div>
+            <div className="col-sm-6 col-lg-3">
+              <label className="form-label" htmlFor="notification-star-filter">Starred status</label>
+              <select id="notification-star-filter" className="form-select" value={starFilter} onChange={(event) => setStarFilter(event.target.value)}>
+                <option value="all">All notifications</option>
+                <option value="starred">Starred</option>
+                <option value="unstarred">Unstarred</option>
+              </select>
+            </div>
+          </div>
+        </div>
         <div className="list-group list-group-flush">
           {loading ? (
             <div className="text-center py-5"><span className="spinner-border spinner-border-sm me-2" />Loading notifications...</div>
-          ) : notifications.length === 0 ? (
+          ) : filteredNotifications.length === 0 ? (
             <div className="text-center text-muted py-5">
               <i className="bi bi-bell-slash fs-2 d-block mb-2" />
               No active notifications.
             </div>
-          ) : notifications.map((item) => {
+          ) : filteredNotifications.map((item) => {
             const isHeld = item.status === "HOLD";
             const canActOnInbox = item.is_recipient && !isHeld;
             return (

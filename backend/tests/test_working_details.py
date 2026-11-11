@@ -205,3 +205,31 @@ def test_schedule_effective_date_can_precede_joining_date_and_account_creation()
 
     assert saved["schedule_effective_from"] == "2026-01-01"
     assert saved["scheduled_work_start_time"] == "09:00"
+
+
+def test_legacy_schedule_uses_employee_joining_date_when_schedule_date_is_missing():
+    saved = record_schedule_change(
+        {
+            "working_type": "Full Time",
+            "scheduled_work_start_time": "09:00",
+            "scheduled_work_end_time": "18:00",
+        },
+        {
+            "working_type": "Part Time",
+            "scheduled_work_start_time": "10:00",
+            "scheduled_work_end_time": "15:00",
+        },
+        date(2026, 6, 1),
+        joining_date="2026-01-15",
+    )
+
+    assert saved["schedule_effective_from"] == "2026-06-01"
+    assert saved["working_schedule_history"] == [{
+        "working_type": "Full Time",
+        "scheduled_work_start_time": "09:00",
+        "scheduled_work_end_time": "18:00",
+        "scheduled_work_duration": 540,
+        "half_day_working_duration": 270,
+        "effective_from": "2026-01-15",
+        "effective_to": "2026-05-31",
+    }]

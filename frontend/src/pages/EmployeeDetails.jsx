@@ -553,10 +553,10 @@ export default function EmployeeDetails({
      LOAD EMPLOYEE DETAILS
   ========================================================= */
 
-  async function loadEmployeeDetails() {
+  async function loadEmployeeDetails(options) {
     setLoading(true);
     setError("");
-    setSuccessMessage("");
+    if (!options?.keepMessage) setSuccessMessage("");
 
     try {
       const storedSession =
@@ -1032,16 +1032,26 @@ export default function EmployeeDetails({
       let message =
         "Failed to save Employee Master extra information.";
 
-      try {
-        const errorData =
-          await response.json();
-
+      const responseText = await response.text();
+      if (responseText) {
+        try {
+          const errorData = JSON.parse(responseText);
+          message =
+            errorData?.detail ||
+            errorData?.message ||
+            message;
+        } catch {
+          // FastAPI/proxy errors may return plain text instead of JSON.
+          if (response.status >= 500) {
+            message =
+              "The server could not save Employee Master information. Please try again or contact the administrator.";
+          } else {
+            message = responseText;
+          }
+        }
+      } else if (response.status >= 500) {
         message =
-          errorData?.detail ||
-          errorData?.message ||
-          message;
-      } catch {
-        // Ignore JSON parsing error.
+          "The server could not save Employee Master information. Please try again or contact the administrator.";
       }
 
       throw new Error(message);
@@ -1154,6 +1164,11 @@ export default function EmployeeDetails({
       setError("Please select the Working Details Starting Date.");
       return;
     }
+    const joiningDate = employee?.date_of_joining || "";
+    if (scheduleStartingDate && joiningDate && scheduleStartingDate < joiningDate) {
+      setError("Working Details Starting Date cannot be earlier than the Date of Joining.");
+      return;
+    }
     setSaving(true);
     setError("");
     setSuccessMessage("");
@@ -1200,13 +1215,15 @@ export default function EmployeeDetails({
       setSuccessMessage((previous) => previous || "Employee details updated successfully.");
 
       setIsEditing(false);
+      setWorkingDetailsTouched(false);
 
       /*
        * Reload everything from MongoDB.
        * This ensures the UI displays the actual
        * saved values instead of only local state.
+       * The success message is kept visible after the reload.
        */
-      await loadEmployeeDetails();
+      await loadEmployeeDetails({ keepMessage: true });
     } catch (err) {
       console.error(
         "Employee details save error:",
@@ -1902,6 +1919,7 @@ export default function EmployeeDetails({
             value={employee.scheduled_work_end_time || ""}
             editing={isEditing}
             onChange={handleChange}
+            disabled={!employee.scheduled_work_start_time}
           />
           <Field
             label="Starting Date"
@@ -1910,6 +1928,7 @@ export default function EmployeeDetails({
             value={employee.working_schedule_starting_date || ""}
             editing={isEditing}
             onChange={handleChange}
+            min={employee.date_of_joining || undefined}
           />
           <div className="employee-details-field">
             <label className="employee-details-label">Office Day Duration</label>

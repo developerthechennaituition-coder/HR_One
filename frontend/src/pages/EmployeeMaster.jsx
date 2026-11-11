@@ -1,16 +1,11 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useMemo, useState } from "react";
 import { roleLabel } from "../services/roleLabels";
+import Pagination from "../components/Pagination";
 
 const API_URL = HRONE_API_BASE + "/api/users";
 
-const ROLE_OPTIONS = [
-  "Super Admin",
-  "HR Admin",
-  "Administrator",
-  "HR Manager",
-  "Employee",
-];
+const ROLE_OPTIONS = ["HR Admin", "HOD", "Employee"];
 
 function readStoredSession() {
   try {
@@ -33,6 +28,7 @@ function EmployeeMaster({
     useState("all");
   const [roleFilter, setRoleFilter] =
     useState("all");
+  const [page, setPage] = useState(1);
 
   const [isLoading, setIsLoading] =
     useState(true);
@@ -212,7 +208,7 @@ function EmployeeMaster({
 
         const matchesRole =
           roleFilter === "all" ||
-          user.role === roleFilter;
+          roleLabel(user.role) === roleFilter;
 
         return (
           matchesSearch &&
@@ -227,6 +223,9 @@ function EmployeeMaster({
     statusFilter,
     roleFilter,
   ]);
+  useEffect(() => { setPage(1); }, [searchTerm, statusFilter, roleFilter]);
+  const pageSize = 10;
+  const pageUsers = filteredUsers.slice((page - 1) * pageSize, page * pageSize);
 
   /* ========================================================
      RESET
@@ -504,7 +503,7 @@ function EmployeeMaster({
                     </td>
                   </tr>
                 ) : (
-                  filteredUsers.map(
+                  pageUsers.map(
                     (employee) => (
                       <tr
                         key={
@@ -599,6 +598,7 @@ function EmployeeMaster({
               </tbody>
 
             </table>
+<Pagination page={page} totalItems={filteredUsers.length} pageSize={pageSize} onPageChange={setPage} />
 
           </div>
 

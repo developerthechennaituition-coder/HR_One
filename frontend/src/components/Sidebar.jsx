@@ -31,7 +31,7 @@ function Sidebar({
   ];
   const [isAttendanceOpen, setIsAttendanceOpen] = useState(attendancePages.includes(activePage));
   const [isOrganizationOpen, setIsOrganizationOpen] = useState(
-    ["company-setup", "organization-setup", "holiday-calendar"].includes(activePage),
+    ["company-setup", "holiday-calendar"].includes(activePage),
   );
 
   useEffect(() => {
@@ -41,7 +41,7 @@ function Sidebar({
     if (["employee-salary-setup", "payroll-dashboard", "monthly-payroll", "payslip-management"].includes(activePage)) {
       setIsPayrollOpen(true);
     }
-    if (["company-setup", "organization-setup", "holiday-calendar"].includes(activePage)) {
+    if (["company-setup", "holiday-calendar"].includes(activePage)) {
       setIsOrganizationOpen(true);
     }
   }, [activePage]);
@@ -83,7 +83,6 @@ function Sidebar({
             {isOrganizationOpen && <div className="sidebar-submenu">
               {item("company-setup", "Company / Legal Entity", "building")}
               {item("holiday-calendar", "Holiday Calendar", "calendar-event")}
-              {item("organization-setup", "Organization Structure", "diagram-3")}
             </div>}
           </div>
         )}

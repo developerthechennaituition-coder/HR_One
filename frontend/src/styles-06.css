@@ -263,12 +263,46 @@
 /* Print the payslip copy rendered outside the app shell so it flows across as many pages as it needs. */
 @media print {
   html, body { height: auto !important; overflow: visible !important; background: #fff !important; }
-  body > *:not(.payslip-print-root) { display: none !important; }
+
+  /* Isolate the document only when the payslip print portal is present.
+     Otherwise, normal application pages (including Team Member Details)
+     must remain printable through the browser print command. */
+  body:has(.payslip-print-root) > *:not(.payslip-print-root) { display: none !important; }
   .payslip-print-root { display: block !important; }
   .payslip-print-root .payslip-sheet { max-width: none; border: 0; border-radius: 0; padding: 0; }
   .payslip-print-root .payslip-sheet-head, .payslip-print-root .payslip-net-card, .payslip-print-root .payslip-details > div,
   .payslip-print-root .payslip-attendance > div, .payslip-print-root .payslip-component-card li, .payslip-print-root .payslip-net-row { break-inside: avoid; }
   .payslip-print-root h4 { break-after: avoid; }
+
+  /* Keep selected attendance labels AND their values visible in print. */
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card,
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card .row,
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card .team-selected-info {
+    display: block !important;
+    visibility: visible !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    break-inside: avoid;
+  }
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card .row {
+    display: flex !important;
+    flex-wrap: wrap !important;
+  }
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card .team-selected-info span,
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card .team-selected-info strong {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    color: #111 !important;
+    -webkit-text-fill-color: #111 !important;
+    overflow: visible !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+  }
+  body:not(:has(.payslip-print-root)) .team-selected-attendance-card .team-selected-info strong {
+    font-weight: 700 !important;
+  }
 }
 
 /* =========================================================
@@ -531,3 +565,9 @@
     transform: none;
   }
 }
+
+/* Column-based filters inside table headers (Payroll) */
+.payroll-th-filter { min-width: 150px; }
+.payroll-th-filter > span { display: block; margin-bottom: 4px; }
+.payroll-column-filter { width: 100%; max-width: 100%; padding: 4px 6px; font-size: 11px; font-weight: 500; color: #344054; background: #fff; border: 1px solid #d6e0ec; border-radius: 6px; text-transform: none; letter-spacing: 0; }
+.payroll-column-filter:focus { outline: 0; border-color: #3984e8; box-shadow: 0 0 0 3px rgba(39, 123, 235, .12); }

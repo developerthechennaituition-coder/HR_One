@@ -1,6 +1,7 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
+import Pagination from "../components/Pagination";
 import HistoricalAttendanceModal from "../components/HistoricalAttendanceModal";
 import { roleLabel } from "../services/roleLabels";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat.js";
@@ -152,6 +153,7 @@ function Attendance({ session }) {
   const [selectedDate, setSelectedDate] = useState(getTodayDate());
 
   const [searchTerm, setSearchTerm] = useState("");
+  const [page, setPage] = useState(1);
   const [statusFilter, setStatusFilter] = useState("all");
   const [attendanceFilter, setAttendanceFilter] = useState("all");
   const [sourceFilter, setSourceFilter] = useState("all");
@@ -718,6 +720,9 @@ function Attendance({ session }) {
     departmentEmployeeIds,
     selectedEmployeeFilter,
   ]);
+  const pageSize = 10;
+  const pageUsers = filteredUsers.slice((page - 1) * pageSize, page * pageSize);
+  useEffect(() => { setPage(1); }, [searchTerm, statusFilter, attendanceFilter, sourceFilter, departmentFilter, selectedEmployeeFilter]);
 
   const departments = useMemo(() => {
     const byId = new Map();
@@ -1108,7 +1113,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                     </td>
                   </tr>
                 ) : (
-                  filteredUsers.map((user) => {
+                  pageUsers.map((user) => {
                     const current =
                       attendanceState[user.id] ||
                       EMPTY;
@@ -1416,6 +1421,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                 )}
               </tbody>
             </table>
+            <Pagination page={page} totalItems={filteredUsers.length} pageSize={pageSize} onPageChange={setPage} />
           </div>
         </div>
       </div>

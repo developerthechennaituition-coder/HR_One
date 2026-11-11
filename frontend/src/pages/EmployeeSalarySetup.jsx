@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getPayrollEmployees, getSalaryProfiles, saveSalaryProfile } from "../services/payrollApi";
+import Pagination from "../components/Pagination";
 
 const monthStart = () => `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}-01`;
 const defaultDeductions = () => [
@@ -27,6 +28,7 @@ export default function EmployeeSalarySetup() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [employeeSearch, setEmployeeSearch] = useState("");
+  const [employeePage, setEmployeePage] = useState(1);
   const [departmentFilter, setDepartmentFilter] = useState("");
   const [activePanel, setActivePanel] = useState("");
 
@@ -51,7 +53,7 @@ export default function EmployeeSalarySetup() {
     try {
       const [employeeRows, profileRows] = await Promise.all([getPayrollEmployees(), getSalaryProfiles()]);
       setEmployees(employeeRows); setProfiles(profileRows);
-      setForm((current) => current.employee_id ? current : emptyForm(employeeRows[0]?.employee_id || ""));
+      setForm((current) => current.employee_id ? current : emptyForm(""));
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   }
@@ -99,6 +101,9 @@ export default function EmployeeSalarySetup() {
     finally { setSaving(false); }
   }
   const filteredEmployees = departmentEmployees.filter((e) => [e.employee_id, e.name, e.department, e.designation].some((v) => String(v || "").toLowerCase().includes(employeeSearch.trim().toLowerCase())));
+  const pageSize = 10;
+  const pageFilteredEmployees = filteredEmployees.slice((employeePage - 1) * pageSize, employeePage * pageSize);
+  useEffect(() => { setEmployeePage(1); }, [employeeSearch, departmentFilter]);
   if (loading) return <div style={{ padding: 24 }}>Loading employee salary setup…</div>;
 
   return <div style={{ padding: "22px 24px", maxWidth: 1320, margin: "0 auto", color: "#182230" }}>
@@ -158,7 +163,7 @@ export default function EmployeeSalarySetup() {
         <button type="submit" disabled={saving || !form.employee_id} style={{ padding: "12px 16px", border: 0, borderRadius: 8, background: saving ? "#98a2b3" : "#2457c5", color: "white", fontWeight: 700, cursor: saving ? "wait" : "pointer" }}>{saving ? "Saving…" : "Save Salary Details"}</button>
       </aside>
     </form>}
-    {!!employees.length && <section className="payroll-panel salary-profile-list-panel" style={{ marginTop: 20 }}><div className="payroll-section-heading"><div><h2><i className="bi bi-people-fill" style={{ marginRight: 7 }} />Employee Salary Profiles</h2><p>Review saved salary details and select an employee to update their profile.</p></div><span className="payroll-result-count">{profiles.length} saved profile(s) / {employees.length} employee(s)</span></div><label className="payroll-search"><i className="bi bi-search" aria-hidden="true" /><input value={employeeSearch} onChange={(e) => setEmployeeSearch(e.target.value)} placeholder="Search employee ID, name, department or designation…" /></label><div className="payroll-table-wrap" style={{ marginTop: 13 }}><table className="payroll-table"><thead><tr><th>Employee ID</th><th>Employee Name</th><th>Department</th><th>Designation</th><th>Monthly Salary</th><th>Effective From</th><th>Status</th><th>Action</th></tr></thead><tbody>{filteredEmployees.map((e) => { const p = profiles.find((x) => x.employee_id === e.employee_id); return <tr key={e.employee_id}><td className="payroll-id">{e.employee_id}</td><td>{e.name || "—"}</td><td>{e.department || "—"}</td><td>{e.designation || "—"}</td><td>{p ? money(p.monthly_salary, p.currency || "INR") : "—"}</td><td>{p?.effective_from || "—"}</td><td><span className={`payroll-status ${p ? "payroll-status-approved" : "payroll-status-pending"}`}>{p ? "Configured" : "Not configured"}</span></td><td><button type="button" className="payroll-button payroll-button-outline" onClick={() => { chooseEmployee(e.employee_id); window.scrollTo({ top: 0, behavior: "smooth" }); }}><i className="bi bi-pencil-square" /> {p ? "Edit" : "Set salary"}</button></td></tr>; })}{!filteredEmployees.length && <tr><td colSpan="8" className="payroll-empty">No employees match this search.</td></tr>}</tbody></table></div></section>}
+    {!!employees.length && <section className="payroll-panel salary-profile-list-panel" style={{ marginTop: 20 }}><div className="payroll-section-heading"><div><h2><i className="bi bi-people-fill" style={{ marginRight: 7 }} />Employee Salary Profiles</h2><p>Review saved salary details and select an employee to update their profile.</p></div><span className="payroll-result-count">{profiles.length} saved profile(s) / {employees.length} employee(s)</span></div><label className="payroll-search"><i className="bi bi-search" aria-hidden="true" /><input value={employeeSearch} onChange={(e) => setEmployeeSearch(e.target.value)} placeholder="Search employee ID, name, department or designation…" /></label><div className="payroll-table-wrap" style={{ marginTop: 13 }}><table className="payroll-table"><thead><tr><th>Employee ID</th><th>Employee Name</th><th>Department</th><th>Designation</th><th>Monthly Salary</th><th>Effective From</th><th>Status</th><th>Action</th></tr></thead><tbody>{pageFilteredEmployees.map((e) => { const p = profiles.find((x) => x.employee_id === e.employee_id); return <tr key={e.employee_id}><td className="payroll-id">{e.employee_id}</td><td>{e.name || "—"}</td><td>{e.department || "—"}</td><td>{e.designation || "—"}</td><td>{p ? money(p.monthly_salary, p.currency || "INR") : "—"}</td><td>{p?.effective_from || "—"}</td><td><span className={`payroll-status ${p ? "payroll-status-approved" : "payroll-status-pending"}`}>{p ? "Configured" : "Not configured"}</span></td><td><button type="button" className="payroll-button payroll-button-outline" onClick={() => { chooseEmployee(e.employee_id); window.scrollTo({ top: 0, behavior: "smooth" }); }}><i className="bi bi-pencil-square" /> {p ? "Edit" : "Set salary"}</button></td></tr>; })}{!filteredEmployees.length && <tr><td colSpan="8" className="payroll-empty">No employees match this search.</td></tr>}</tbody></table></div><Pagination page={employeePage} totalItems={filteredEmployees.length} pageSize={pageSize} onPageChange={setEmployeePage} /></section>}
   </div>;
 }
 const cell = { padding: 8, verticalAlign: "middle" };

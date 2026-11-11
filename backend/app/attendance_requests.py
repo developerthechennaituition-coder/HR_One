@@ -631,7 +631,13 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             "status": resolved_day_status,
             "status_label": "Medical Leave" if record and record.get("medical_leave") else resolved_day_status,
             "attendance_category": _attendance_category(record),
+            # Expose the source/type and persisted modification timestamp to
+            # read-only calendar consumers (including Team Member Details).
+            # The calendar previously returned only the category/source, so
+            # the detail panel rendered '-' for fields it expected on the row.
+            "attendance_type": (record or {}).get("attendance_type") or _attendance_category(record),
             "attendance_source": record.get("attendance_source") if record else None,
+            "updated_at": (record or {}).get("updated_at") or (record or {}).get("attendance_calculation_updated_at") or (record or {}).get("created_at"),
             "check_in_time": _attendance_clock_hhmm(day_check_in),
             "check_out_time": _attendance_clock_hhmm(day_check_out),
             "working_duration": daily_metrics.get("working_duration") or "0h 00m",
@@ -825,6 +831,25 @@ def employee_attendance_calendar(
     if not employee:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee not found.")
     return _build_calendar(employee, year, month)
+
+
+@router.get("/calendar/team-member/{user_id}")
+def team_member_attendance_calendar(
+    user_id: str,
+    year: int = Query(...),
+    month: int = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    """The same monthly calendar for a direct team member; read-only for the Reporting Manager."""
+    manager = _current_user(authorization)
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid user ID.")
+    member = users_collection.find_one(
+        {"_id": ObjectId(user_id), "reporting_manager_id": str(manager["_id"]), "is_active": True}
+    )
+    if not member:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee is not a member of your team")
+    return _build_calendar(member, year, month)
 
 
 @router.get("/eligible-dates")

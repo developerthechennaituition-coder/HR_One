@@ -432,9 +432,9 @@ class UserPayload(BaseModel):
         # stored identifier so permissions and role_id never split in two.
         if value.casefold() == "hod":
             value = "HR Manager"
-        allowed_roles = {"HR Admin", "Administrator", "HR Manager", "Employee"}
+        allowed_roles = {"HR Admin", "HR Manager", "Employee"}
         if value not in allowed_roles:
-            raise ValueError("role must be one of HR Admin, Administrator, HOD, or Employee")
+            raise ValueError("role must be one of HR Admin, HOD, or Employee")
         return value
 
     @field_validator("country", "country_code")

@@ -10,7 +10,6 @@ import EmployeeSalarySetup from "../pages/EmployeeSalarySetup";
 import PayrollWorkspace from "../pages/PayrollWorkspace";
 import EmployeePayslips from "../pages/EmployeePayslips";
 import EmployeeDetails from "../pages/EmployeeDetails";
-import OrganizationSetup from "../pages/OrganizationSetup";
 import HolidayCalendarSetup from "../pages/HolidayCalendarSetup";
 import UserManagement from "../pages/UserManagement";
 import Attendance from "../pages/Attendance";
@@ -67,7 +66,6 @@ function getInitialPage() {
   const allowedPages = new Set([
     "dashboard",
     "company-setup",
-    "organization-setup",
     "holiday-calendar",
     "employees",
     "employee-salary-setup",
@@ -733,7 +731,6 @@ function MainLayout({ session, onLogout }) {
 
     const protectedPages = {
       "company-setup": true,
-      "organization-setup": true,
       "holiday-calendar": true,
       "notifications": true,
       "dashboard": true,
@@ -952,14 +949,6 @@ function MainLayout({ session, onLogout }) {
      * ORGANIZATION SETUP
      * =====================================================
      */
-
-    if (
-      activePage ===
-      "organization-setup"
-    ) {
-      if (!canManageOrganization) return <AccessDenied onNavigate={handleNavigate} />;
-      return <OrganizationSetup currentUser={currentUser} />;
-    }
 
     /*
      * =====================================================

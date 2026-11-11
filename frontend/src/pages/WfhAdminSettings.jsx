@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { HRONE_API_BASE } from "../config/api.js";
 import { roleLabel } from "../services/roleLabels";
+import Pagination from "../components/Pagination";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE).replace(/\/+$/, "");
 const todayIso = () => {
@@ -12,6 +13,7 @@ const todayIso = () => {
 function WfhAdminSettings({ session }) {
   const token = session?.token;
   const [employees, setEmployees] = useState([]);
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState("");
   const [busyAction, setBusyAction] = useState("");
@@ -41,6 +43,10 @@ function WfhAdminSettings({ session }) {
   }, [headers]);
 
   useEffect(() => { loadEmployees(); }, [loadEmployees]);
+
+  const pageSize = 10;
+  const pageEmployees = employees.slice((page - 1) * pageSize, page * pageSize);
+  useEffect(() => { setPage(1); }, [employees.length]);
 
   const updateEmployee = (userId, field, value) => {
     setEmployees((rows) => rows.map((row) => row.user_id === userId ? { ...row, [field]: value } : row));
@@ -173,7 +179,7 @@ function WfhAdminSettings({ session }) {
           <div className="table-responsive">
             <table className="table table-sm align-middle mb-0">
               <thead><tr><th>Employee / Role</th><th>WFH Enabled</th><th>Permit From</th><th>Permit Until</th><th>Required Start Time</th><th>Required End Time</th><th>Face</th><th>Location</th><th>Actions</th></tr></thead>
-              <tbody>{employees.map((employee) => {
+              <tbody>{pageEmployees.map((employee) => {
                 const locationRegistered = employee.home_latitude != null && employee.home_longitude != null;
                 const busy = busyAction.startsWith(`${employee.user_id}:`);
                 return <tr key={employee.user_id}>
@@ -189,6 +195,7 @@ function WfhAdminSettings({ session }) {
                 </tr>;
               })}</tbody>
             </table>
+<Pagination page={page} totalItems={employees.length} pageSize={pageSize} onPageChange={setPage} />
           </div>
         )}
       </div>

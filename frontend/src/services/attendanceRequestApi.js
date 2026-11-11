@@ -46,6 +46,10 @@ export const getAttendanceCalendar = (year, month) =>
 export const getEmployeeAttendanceCalendar = (userId, year, month) =>
   request(`/calendar/user/${encodeURIComponent(userId)}?year=${year}&month=${month}`, {}, "Unable to load the attendance calendar.");
 
+// Reporting Manager: the same calendar for a direct team member (read-only).
+export const getTeamMemberAttendanceCalendar = (userId, year, month) =>
+  request(`/calendar/team-member/${encodeURIComponent(userId)}?year=${year}&month=${month}`, {}, "Unable to load the attendance calendar.");
+
 export const createAttendanceRequest = (dates, remarks) =>
   request("", { method: "POST", body: JSON.stringify({ dates, remarks: remarks || null }) }, "Unable to submit the attendance request.");
 

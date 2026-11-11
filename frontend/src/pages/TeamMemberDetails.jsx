@@ -5,8 +5,10 @@ import {
   useState,
 } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
+import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
+import { getTeamMemberAttendanceCalendar } from "../services/attendanceRequestApi";
 import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
-import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
+import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate } from "../services/attendanceCalendarRange";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
 import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
 
@@ -73,7 +75,14 @@ function formatDateTime(value) {
   if (!value) return "-";
 
   try {
-    const date = new Date(value);
+    // Attendance API timestamps are stored/returned as naive UTC in some
+    // legacy records. Explicitly interpret those values as UTC before showing
+    // India-local time; otherwise browsers can display an incorrect offset.
+    const timestamp = String(value);
+    const normalizedTimestamp = /[zZ]|[+-]\d{2}:?\d{2}$/.test(timestamp)
+      ? timestamp
+      : `${timestamp.replace(" ", "T")}Z`;
+    const date = new Date(normalizedTimestamp);
 
     if (Number.isNaN(date.getTime())) {
       return value;
@@ -222,6 +231,11 @@ function TeamMemberDetails({
 
   const [selectedDate, setSelectedDate] =
     useState(null);
+
+  // Same Monthly Attendance Calendar data as My Attendance, for this member.
+  const [memberCalendar, setMemberCalendar] = useState(null);
+  const [memberCalendarLoading, setMemberCalendarLoading] = useState(false);
+  const [memberCalendarError, setMemberCalendarError] = useState("");
 
   const [loading, setLoading] =
     useState(true);
@@ -604,6 +618,23 @@ function TeamMemberDetails({
     selectedYear,
     selectedMonth,
   ]);
+
+  useEffect(() => {
+    if (!memberId) return undefined;
+    let cancelled = false;
+    setMemberCalendarLoading(true);
+    setMemberCalendarError("");
+    getTeamMemberAttendanceCalendar(memberId, selectedYear, selectedMonth)
+      .then((data) => { if (!cancelled) setMemberCalendar(data); })
+      .catch((err) => {
+        if (!cancelled) {
+          setMemberCalendar(null);
+          setMemberCalendarError(err?.message || "Unable to load the attendance calendar.");
+        }
+      })
+      .finally(() => { if (!cancelled) setMemberCalendarLoading(false); });
+    return () => { cancelled = true; };
+  }, [memberId, selectedYear, selectedMonth]);
 
   /* ==========================================================
      ATTENDANCE DATE MAP
@@ -1862,65 +1893,6 @@ function TeamMemberDetails({
               </p>
             </div>
           </div>
-            <div className="team-attendance-filters">
-
-              {/* Joining month/year through the 90-day window only. */}
-              <select
-                className="form-select"
-                aria-label="Month"
-                value={selectedMonth}
-                onChange={(event) => {
-                  changeCalendarMonth(
-                    selectedYear,
-                    Number(
-                      event.target.value
-                    )
-                  );
-                }}
-              >
-                {monthOptions(
-                  calendarRange,
-                  selectedYear
-                ).map(
-                  (item) => (
-                    <option
-                      key={item.value}
-                      value={item.value}
-                    >
-                      {item.label}
-                    </option>
-                  )
-                )}
-              </select>
-
-              <select
-                className="form-select"
-                aria-label="Year"
-                value={selectedYear}
-                onChange={(event) => {
-                  changeCalendarMonth(
-                    Number(
-                      event.target.value
-                    ),
-                    selectedMonth
-                  );
-                }}
-              >
-                {yearOptions(
-                  calendarRange
-                ).map(
-                  (year) => (
-                    <option
-                      key={year}
-                      value={year}
-                    >
-                      {year}
-                    </option>
-                  )
-                )}
-              </select>
-            </div>
-
           
 
         </div>
@@ -2013,154 +1985,20 @@ function TeamMemberDetails({
         </div>
 
         {/* ====================================================
-            LEGEND
-        ==================================================== */}
-
-        <div className="team-attendance-legend">
-
-          {[
-            {
-              key: "present",
-              label: "Present",
-            },
-            {
-              key: "wfh",
-              label: "Work From Home",
-            },
-            {
-              key: "halfday",
-              label: "Half-Day Present",
-            },
-            {
-              key: "absent",
-              label: "Absent",
-            },
-            {
-              key: "medicalleave",
-              label: "Medical Leave (ML)",
-            },
-            {
-              key: "leave",
-              label: "Leave",
-            },
-            {
-              key: "holiday",
-              label: "Holiday",
-            },
-            {
-              key: "weeklyoff",
-              label: "Weekly Off",
-            },
-            {
-              key: "notapplicable",
-              label: "Not Applicable",
-            },
-            {
-              key: "notmarked",
-              label: "Not Marked",
-            },
-          ].map(
-            (item) => (
-              <div
-                key={item.key}
-                className="team-attendance-legend-item"
-              >
-
-                <span
-                  style={{
-                    backgroundColor:
-                      statusColors[
-                        item.key
-                      ].background,
-                  }}
-                />
-
-                <span>
-                  {item.label}
-                </span>
-
-              </div>
-            )
-          )}
-
-        </div>
-
-        {/* ====================================================
             ATTENDANCE CALENDAR
         ==================================================== */}
 
-        {attendanceLoading ? (
-          <div className="team-member-attendance-loading">
-
-            <div
-              className="spinner-border spinner-border-sm text-primary"
-              role="status"
-            />
-
-            <span>
-              Loading attendance...
-            </span>
-
-          </div>
-        ) : (
-          <div className="team-attendance-calendar-wrapper">
-
-            <div className="team-attendance-calendar-title">
-              {monthNames[
-                selectedMonth - 1
-              ]}{" "}
-              {selectedYear}
-            </div>
-
-            {/* WEEK HEADER */}
-
-            <div className="team-attendance-week-header">
-
-              {[
-                "Sun",
-                "Mon",
-                "Tue",
-                "Wed",
-                "Thu",
-                "Fri",
-                "Sat",
-              ].map(
-                (day) => (
-                  <div key={day}>
-                    {day}
-                  </div>
-                )
-              )}
-
-            </div>
-
-            {/* CALENDAR GRID */}
-
-            <div className="team-attendance-calendar-grid">
-
-              {calendarCells.map(
-                (
-                  day,
-                  index
-                ) => (
-                  <div
-                    key={
-                      day
-                        ? `day-${day}`
-                        : `empty-${index}`
-                    }
-                  >
-                    {renderCalendarDay(
-                      day
-                    )}
-                  </div>
-                )
-              )}
-
-            </div>
-
-          </div>
-        )}
+        {memberCalendarError && <div className="alert alert-warning py-2 small">{memberCalendarError}</div>}
+        <MyAttendanceCalendar
+          year={selectedYear}
+          month={selectedMonth}
+          range={calendarRange}
+          calendar={memberCalendar}
+          loading={memberCalendarLoading || attendanceLoading}
+          selectedDate={selectedDate}
+          onSelectDate={selectCalendarDate}
+          onMonthChange={changeCalendarMonth}
+        />
 
         {/* ====================================================
             SELECTED DATE
@@ -2282,8 +2120,11 @@ function TeamMemberDetails({
                     </span>
 
                     <strong>
-                      {selectedRecord.attendance_type ||   
-                        "-"}
+                      {displayValue(
+                        selectedRecord.attendance_category ||
+                          selectedRecord.attendance_type ||
+                          selectedRecord.attendance_source
+                      )}
                     </strong>
 
                   </div>
@@ -2319,7 +2160,10 @@ function TeamMemberDetails({
 
                     <strong>
                       {formatDateTime(
-                        selectedRecord.updated_at
+                        selectedRecord.updated_at ||
+                          selectedRecord.last_updated ||
+                          selectedRecord.attendance_calculation_updated_at ||
+                          selectedRecord.created_at
                       )}
                     </strong>
 
