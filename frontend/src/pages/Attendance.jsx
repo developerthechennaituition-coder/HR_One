@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AttendanceRequestInbox from "../components/AttendanceRequestInbox";
 import Pagination from "../components/Pagination";
 import HistoricalAttendanceModal from "../components/HistoricalAttendanceModal";
-import { roleLabel } from "../services/roleLabels";
+import { roleLabel, ROLE_OPTIONS } from "../services/roleLabels";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat.js";
 
 const USERS_API_URL = HRONE_API_BASE + "/api/users";
@@ -158,6 +158,7 @@ function Attendance({ session }) {
   const [attendanceFilter, setAttendanceFilter] = useState("all");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [departmentFilter, setDepartmentFilter] = useState("all");
+  const [roleFilter, setRoleFilter] = useState("all");
   const [selectedEmployeeFilter, setSelectedEmployeeFilter] = useState("all");
   // Employees of the selected department, resolved by the server (null while loading).
   const [departmentEmployeeIds, setDepartmentEmployeeIds] = useState(null);
@@ -699,6 +700,8 @@ function Attendance({ session }) {
       const matchesEmployee =
         selectedEmployeeFilter === "all" ||
         String(user.id) === String(selectedEmployeeFilter);
+      const matchesRole =
+        roleFilter === "all" || roleLabel(user.role) === roleFilter;
 
       return (
         matchesSearch &&
@@ -706,6 +709,7 @@ function Attendance({ session }) {
         matchesAttendance &&
         matchesSource &&
         matchesDepartment &&
+        matchesRole &&
         matchesEmployee
       );
     });
@@ -718,11 +722,12 @@ function Attendance({ session }) {
     sourceFilter,
     departmentFilter,
     departmentEmployeeIds,
+    roleFilter,
     selectedEmployeeFilter,
   ]);
   const pageSize = 10;
   const pageUsers = filteredUsers.slice((page - 1) * pageSize, page * pageSize);
-  useEffect(() => { setPage(1); }, [searchTerm, statusFilter, attendanceFilter, sourceFilter, departmentFilter, selectedEmployeeFilter]);
+  useEffect(() => { setPage(1); }, [searchTerm, statusFilter, attendanceFilter, sourceFilter, departmentFilter, roleFilter, selectedEmployeeFilter]);
 
   const departments = useMemo(() => {
     const byId = new Map();
@@ -887,7 +892,7 @@ function Attendance({ session }) {
             className="col-6 col-md"
             key={card.label}
           >
-            <div className="card border-0 shadow-sm">
+            <div className="card border-0 shadow-sm h-100">
               <div className="card-body">
                 <small className="text-muted">
                   {card.label}
@@ -909,8 +914,8 @@ function Attendance({ session }) {
 
       <div className="card border-0 shadow-sm mb-4">
         <div className="card-body">
-          <div className="row g-3 align-items-end">
-            <div className="col-md-3">
+          <div className="row g-3 align-items-start">
+            <div className="col-12 col-md-6 col-xl-3">
               <label className="form-label">
                 Attendance Date
               </label>
@@ -928,7 +933,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               </small>
             </div>
 
-              <div className="col-md-2">
+              <div className="col-6 col-md-4 col-xl-2">
               <label className="form-label">Department</label>
               <select
                 className="form-select"
@@ -947,7 +952,21 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               {departmentError && <div className="small text-danger mt-1">{departmentError}</div>}
             </div>
 
-            <div className="col-md-3">
+            <div className="col-6 col-md-4 col-xl-2">
+              <label className="form-label">Role</label>
+              <select
+                className="form-select"
+                value={roleFilter}
+                onChange={(e) => setRoleFilter(e.target.value)}
+              >
+                <option value="all">All Roles</option>
+                {ROLE_OPTIONS.map((role) => (
+                  <option key={role} value={role}>{role}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="col-12 col-md-6 col-xl-3">
               <label className="form-label">
                 Search Employee
               </label>
@@ -963,7 +982,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               />
             </div>
 
-            <div className="col-md-2">
+            <div className="col-6 col-md-4 col-xl-2">
               <label className="form-label">Employee</label>
               <select
                 className="form-select"
@@ -976,7 +995,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               </select>
             </div>
 
-            <div className="col-md-2">
+            <div className="col-6 col-md-4 col-xl-2">
               <label className="form-label">
                 User Status
               </label>
@@ -1002,7 +1021,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               </select>
             </div>
 
-            <div className="col-md-2">
+            <div className="col-6 col-md-4 col-xl-2">
               <label className="form-label">
                 Attendance
               </label>
@@ -1040,7 +1059,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               </select>
             </div>
 
-            <div className="col-md-2">
+            <div className="col-6 col-md-4 col-xl-2">
               <label className="form-label">Source</label>
               <select
                 className="form-select"
@@ -1054,7 +1073,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
               </select>
             </div>
 
-            <div className="col-md-2">
+            <div className="col-6 col-md-4 col-xl-2 attendance-filter-reset">
               <button
                 type="button"
                 className="btn btn-outline-secondary w-100"
@@ -1064,6 +1083,7 @@ Daily Attendance manages today's records. Historical Attendance Modification sup
                   setAttendanceFilter("all");
                   setSourceFilter("all");
                   setDepartmentFilter("all");
+                  setRoleFilter("all");
                   setSelectedEmployeeFilter("all");
                 }}
               >

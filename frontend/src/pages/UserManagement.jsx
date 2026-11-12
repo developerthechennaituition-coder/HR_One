@@ -4,12 +4,11 @@ import { parsePhoneNumberFromString } from "libphonenumber-js/max";
 // Purpose: Read libphonenumber-js numbering-plan metadata so the allowed
 // phone-number lengths are detected dynamically for each selected country.
 import { Metadata } from "libphonenumber-js";
-import { roleLabel } from "../services/roleLabels";
+import { roleLabel, ROLE_OPTIONS } from "../services/roleLabels";
 import Pagination from "../components/Pagination";
 
 // HR administrators create, activate, edit and filter application users here.
 const API_URL = HRONE_API_BASE + "/api/users";
-const ROLE_OPTIONS = ["HR Admin", "HOD", "Employee"];
 const emptyUser = {
   employee_id: "",
   name: "",
@@ -198,7 +197,8 @@ function UserManagement() {
       mobile:
         parsedNationalNumber ||
         String(user.mobile || "").replace(/\D/g, ""),
-      role: user.role || "",
+      // Show the stored value under its display name so the dropdown preselects it.
+      role: roleLabel(user.role) || "",
       password: "",
     });
     setFeedback({ type: "", message: "" });
@@ -439,6 +439,189 @@ function UserManagement() {
     }
   };
 
+  // Purpose: One set of form fields shared by Add User (inline card) and the
+  // Edit User popup, so validation and behaviour stay identical.
+  const renderUserFormFields = () => (
+        <div className="row g-3">
+          {editingId && (
+            <div className="col-md-6">
+              <label htmlFor="user-id" className="form-label">
+                User ID
+              </label>
+              <input
+                id="user-id"
+                type="text"
+                className="form-control"
+                value={editingId}
+                readOnly
+                aria-readonly="true"
+              />
+            </div>
+          )}
+          {userFields.map(([name, label, type]) => (
+            <div className="col-md-6" key={name}>
+              <label htmlFor={`user-${name}`} className="form-label">
+                {label}
+              </label>
+              <input
+                id={`user-${name}`}
+                name={name}
+                type={type}
+                required
+                className={`form-control ${fieldErrors[name] ? "is-invalid" : ""}`}
+                value={formValues[name]}
+                onChange={(event) => {
+                  setFormValues({
+                    ...formValues,
+                    [name]: event.target.value,
+                  });
+                  setFieldErrors({ ...fieldErrors, [name]: "" });
+                }}
+              />
+              {fieldErrors[name] && (
+                <div className="invalid-feedback">
+                  {fieldErrors[name]}
+                </div>
+              )}
+            </div>
+          ))}                    
+          {/* Purpose: Let HR select the employee's country so the country-specific
+              mobile validation and country calling code stay synchronized. */}
+          <div className="col-md-6">
+            <label htmlFor="user-country" className="form-label">
+              Country
+            </label>
+            <select
+              id="user-country"
+              name="country_iso"
+              required
+              className="form-select"
+              value={formValues.country_iso}
+              onChange={(event) => {
+                const selectedCountry = countries.find(
+                  (country) => country.iso === event.target.value,
+                );
+
+                setFormValues({
+                  ...formValues,
+                  country_iso: selectedCountry?.iso || "",
+                  country_code: selectedCountry?.code || "",
+                  mobile: "",
+                });
+
+                setFieldErrors({ ...fieldErrors, mobile: "" });
+              }}
+            >
+              {countries.map((country) => (
+                <option key={country.iso} value={country.iso}>
+                  {country.name} ({country.code})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Purpose: Show the selected country calling code separately and accept
+              only the national mobile number from the employee. */}
+          <div className="col-md-6">
+            <label htmlFor="user-mobile" className="form-label">
+              Mobile Number
+            </label>
+            <div className="input-group">
+              <span className="input-group-text">
+                {formValues.country_code}
+              </span>
+              <input
+                id="user-mobile"
+                name="mobile"
+                type="tel"
+                inputMode="numeric"
+                autoComplete="tel-national"
+                required
+                className={`form-control ${fieldErrors.mobile ? "is-invalid" : ""}`}
+                value={formValues.mobile}
+                placeholder="Enter mobile number"
+                onChange={(event) => {
+                  // Purpose: Keep the stored mobile value numeric-only because the
+                  // selected country code is already stored separately.
+                  const value = event.target.value.replace(/\D/g, "");
+
+                  setFormValues({
+                    ...formValues,
+                    mobile: value,
+                  });
+
+                  setFieldErrors({ ...fieldErrors, mobile: "" });
+                }}
+              />
+            </div>
+            {fieldErrors.mobile && (
+              <div className="invalid-feedback d-block">
+                {fieldErrors.mobile}
+              </div>
+            )}
+          </div>
+
+          {!editingId && (
+            <div className="col-md-6">
+              <label htmlFor="user-password" className="form-label">
+                Password
+              </label>
+              <input
+                id="user-password"
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                required
+                minLength="8"
+                className={`form-control ${fieldErrors.password ? "is-invalid" : ""}`}
+                value={formValues.password}
+                onChange={(event) => {
+                  setFormValues({
+                    ...formValues,
+                    password: event.target.value,
+                  });
+                  setFieldErrors({ ...fieldErrors, password: "" });
+                }}
+              />
+              {fieldErrors.password && (
+                <div className="invalid-feedback">
+                  {fieldErrors.password}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="col-md-6">
+            <label htmlFor="user-role" className="form-label">
+              Role
+            </label>
+            <select
+              id="user-role"
+              name="role"
+              required
+              className={`form-select ${fieldErrors.role ? "is-invalid" : ""}`}
+              value={formValues.role}
+              onChange={(event) => {
+                setFormValues({
+                  ...formValues,
+                  role: event.target.value,
+                });
+                setFieldErrors({ ...fieldErrors, role: "" });
+              }}
+            >
+              <option value="">Select a role</option>
+              {ROLE_OPTIONS.map((role) => (
+                <option key={role} value={role}>
+                  {roleLabel(role)}
+                </option>
+              ))}
+            </select>
+            {fieldErrors.role && (
+              <div className="invalid-feedback">{fieldErrors.role}</div>
+            )}
+          </div>
+        </div>
+  );
+
   return (
     <section className="user-management-page">
       {/* Purpose: Display the selected user's complete information when View is clicked. */}
@@ -543,6 +726,62 @@ function UserManagement() {
         </div>
       )}
 
+      {/* Purpose: Edit User popup, styled like the View User popup above. */}
+      {isFormOpen && editingId && (
+        <div
+          className="modal d-block"
+          tabIndex="-1"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-user-title"
+          style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
+        >
+          <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+            <div className="modal-content">
+              <div className="modal-header">
+                <h5 className="modal-title" id="edit-user-title">Edit User</h5>
+                <button
+                  type="button"
+                  className="btn-close"
+                  onClick={closeForm}
+                  aria-label="Close"
+                  disabled={isSaving}
+                ></button>
+              </div>
+
+              <form id="edit-user-form" onSubmit={handleSubmit}>
+                <div className="modal-body">
+                  {feedback.type === "danger" && feedback.message && (
+                    <div className="alert alert-danger py-2" role="alert" aria-live="polite">
+                      {feedback.message}
+                    </div>
+                  )}
+                  {renderUserFormFields()}
+                </div>
+
+                <div className="modal-footer">
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={closeForm}
+                    disabled={isSaving}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={isSaving}
+                  >
+                    {isSaving ? "Saving..." : "Save"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="user-management-toolbar d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
         <h2 className="mb-0">User Management</h2>
         <button type="button" className="btn btn-primary" onClick={openAddForm}>
@@ -550,7 +789,7 @@ function UserManagement() {
         </button>
       </div>
 
-      {feedback.message && (
+      {feedback.message && !(editingId && isFormOpen && feedback.type === "danger") && (
         <div
           className={`alert alert-${feedback.type}`}
           role="alert"
@@ -560,191 +799,13 @@ function UserManagement() {
         </div>
       )}
 
-      {isFormOpen && (
+      {/* Purpose: Add User keeps the existing inline form. */}
+      {isFormOpen && !editingId && (
         <div className="card border-0 shadow-sm mb-4">
           <div className="card-body p-4">
-            <h5 className="card-title mb-4">
-              {editingId ? "Edit User" : "Add User"}
-            </h5>
+            <h5 className="card-title mb-4">Add User</h5>
             <form onSubmit={handleSubmit}>
-              <div className="row g-3">
-                {editingId && (
-                  <div className="col-md-6">
-                    <label htmlFor="user-id" className="form-label">
-                      User ID
-                    </label>
-                    <input
-                      id="user-id"
-                      type="text"
-                      className="form-control"
-                      value={editingId}
-                      readOnly
-                      aria-readonly="true"
-                    />
-                  </div>
-                )}
-                {userFields.map(([name, label, type]) => (
-                  <div className="col-md-6" key={name}>
-                    <label htmlFor={`user-${name}`} className="form-label">
-                      {label}
-                    </label>
-                    <input
-                      id={`user-${name}`}
-                      name={name}
-                      type={type}
-                      required
-                      className={`form-control ${fieldErrors[name] ? "is-invalid" : ""}`}
-                      value={formValues[name]}
-                      onChange={(event) => {
-                        setFormValues({
-                          ...formValues,
-                          [name]: event.target.value,
-                        });
-                        setFieldErrors({ ...fieldErrors, [name]: "" });
-                      }}
-                    />
-                    {fieldErrors[name] && (
-                      <div className="invalid-feedback">
-                        {fieldErrors[name]}
-                      </div>
-                    )}
-                  </div>
-                ))}                    
-                {/* Purpose: Let HR select the employee's country so the country-specific
-                    mobile validation and country calling code stay synchronized. */}
-                <div className="col-md-6">
-                  <label htmlFor="user-country" className="form-label">
-                    Country
-                  </label>
-                  <select
-                    id="user-country"
-                    name="country_iso"
-                    required
-                    className="form-select"
-                    value={formValues.country_iso}
-                    onChange={(event) => {
-                      const selectedCountry = countries.find(
-                        (country) => country.iso === event.target.value,
-                      );
-
-                      setFormValues({
-                        ...formValues,
-                        country_iso: selectedCountry?.iso || "",
-                        country_code: selectedCountry?.code || "",
-                        mobile: "",
-                      });
-
-                      setFieldErrors({ ...fieldErrors, mobile: "" });
-                    }}
-                  >
-                    {countries.map((country) => (
-                      <option key={country.iso} value={country.iso}>
-                        {country.name} ({country.code})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Purpose: Show the selected country calling code separately and accept
-                    only the national mobile number from the employee. */}
-                <div className="col-md-6">
-                  <label htmlFor="user-mobile" className="form-label">
-                    Mobile Number
-                  </label>
-                  <div className="input-group">
-                    <span className="input-group-text">
-                      {formValues.country_code}
-                    </span>
-                    <input
-                      id="user-mobile"
-                      name="mobile"
-                      type="tel"
-                      inputMode="numeric"
-                      autoComplete="tel-national"
-                      required
-                      className={`form-control ${fieldErrors.mobile ? "is-invalid" : ""}`}
-                      value={formValues.mobile}
-                      placeholder="Enter mobile number"
-                      onChange={(event) => {
-                        // Purpose: Keep the stored mobile value numeric-only because the
-                        // selected country code is already stored separately.
-                        const value = event.target.value.replace(/\D/g, "");
-
-                        setFormValues({
-                          ...formValues,
-                          mobile: value,
-                        });
-
-                        setFieldErrors({ ...fieldErrors, mobile: "" });
-                      }}
-                    />
-                  </div>
-                  {fieldErrors.mobile && (
-                    <div className="invalid-feedback d-block">
-                      {fieldErrors.mobile}
-                    </div>
-                  )}
-                </div>
-
-                {!editingId && (
-                  <div className="col-md-6">
-                    <label htmlFor="user-password" className="form-label">
-                      Password
-                    </label>
-                    <input
-                      id="user-password"
-                      name="password"
-                      type="password"
-                      autoComplete="new-password"
-                      required
-                      minLength="8"
-                      className={`form-control ${fieldErrors.password ? "is-invalid" : ""}`}
-                      value={formValues.password}
-                      onChange={(event) => {
-                        setFormValues({
-                          ...formValues,
-                          password: event.target.value,
-                        });
-                        setFieldErrors({ ...fieldErrors, password: "" });
-                      }}
-                    />
-                    {fieldErrors.password && (
-                      <div className="invalid-feedback">
-                        {fieldErrors.password}
-                      </div>
-                    )}
-                  </div>
-                )}
-                <div className="col-md-6">
-                  <label htmlFor="user-role" className="form-label">
-                    Role
-                  </label>
-                  <select
-                    id="user-role"
-                    name="role"
-                    required
-                    className={`form-select ${fieldErrors.role ? "is-invalid" : ""}`}
-                    value={formValues.role}
-                    onChange={(event) => {
-                      setFormValues({
-                        ...formValues,
-                        role: event.target.value,
-                      });
-                      setFieldErrors({ ...fieldErrors, role: "" });
-                    }}
-                  >
-                    <option value="">Select a role</option>
-                    {ROLE_OPTIONS.map((role) => (
-                      <option key={role} value={role}>
-                        {roleLabel(role)}
-                      </option>
-                    ))}
-                  </select>
-                  {fieldErrors.role && (
-                    <div className="invalid-feedback">{fieldErrors.role}</div>
-                  )}
-                </div>
-              </div>
+              {renderUserFormFields()}
               <div className="d-flex justify-content-end gap-2 mt-4">
                 <button
                   type="button"
@@ -808,10 +869,11 @@ function UserManagement() {
                 onChange={(event) => setRoleFilter(event.target.value)}
               >
                 <option value="all">All Role</option>
-                <option value="Super Admin">Super Admin</option>
-                <option value="HR Admin">HR Admin</option>
-                <option value="HR Manager">HOD</option>
-                <option value="Employee">Employee</option>
+                {ROLE_OPTIONS.map((role) => (
+                  <option key={role} value={role}>
+                    {role}
+                  </option>
+                ))}
               </select>
             </div>
             <div className="col-md-2 d-flex align-items-center">

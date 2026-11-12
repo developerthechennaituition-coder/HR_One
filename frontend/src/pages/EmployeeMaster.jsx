@@ -1,11 +1,10 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useEffect, useMemo, useState } from "react";
-import { roleLabel } from "../services/roleLabels";
+import { roleLabel, ROLE_OPTIONS } from "../services/roleLabels";
 import Pagination from "../components/Pagination";
 
 const API_URL = HRONE_API_BASE + "/api/users";
 
-const ROLE_OPTIONS = ["HR Admin", "HOD", "Employee"];
 
 function readStoredSession() {
   try {

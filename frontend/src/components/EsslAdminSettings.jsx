@@ -1,6 +1,6 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useState } from "react";
-import { roleLabel } from "../services/roleLabels";
+import { roleLabel, ROLE_OPTIONS } from "../services/roleLabels";
 import Pagination from "./Pagination";
 
 const API_BASE_URL =
@@ -79,6 +79,7 @@ function EsslAdminSettings({ session }) {
   const [importPreview, setImportPreview] = useState(null);
   const [mappingSearch, setMappingSearch] = useState("");
   const [mappingDepartment, setMappingDepartment] = useState("all");
+  const [mappingRole, setMappingRole] = useState("all");
   const [selectedEmployeeIds, setSelectedEmployeeIds] = useState(() => new Set());
   const [mappingPage, setMappingPage] = useState(1);
   const [savingMappingId, setSavingMappingId] = useState("");
@@ -93,6 +94,7 @@ function EsslAdminSettings({ session }) {
   )].sort((a, b) => a.localeCompare(b));
   const mappedEmployees = employees.filter((employee) => Boolean(String(employee.saved_essl_employee_id || "").trim()) && employee.is_active !== false && String(employee.essl_employee_id || "").trim() === String(employee.saved_essl_employee_id || "").trim());
   const mappingPageSize = 10;
+  useEffect(() => { setMappingPage(1); }, [mappingSearch, mappingDepartment, mappingRole]);
   const filteredEmployees = employees.filter((employee) => {
     const query = mappingSearch.trim().toLocaleLowerCase();
     const searchable = [
@@ -100,7 +102,8 @@ function EsslAdminSettings({ session }) {
       employee.department, employee.role,
     ].some((value) => String(value || "").toLocaleLowerCase().includes(query));
     return (!query || searchable) &&
-      (mappingDepartment === "all" || employee.department === mappingDepartment);
+      (mappingDepartment === "all" || employee.department === mappingDepartment) &&
+      (mappingRole === "all" || roleLabel(employee.role) === mappingRole);
   });
   const pageFilteredEmployees = filteredEmployees.slice((mappingPage - 1) * mappingPageSize, mappingPage * mappingPageSize);
   const selectedMappedCount = mappedEmployees.filter((employee) => selectedEmployeeIds.has(employee.user_id)).length;
@@ -537,13 +540,21 @@ function EsslAdminSettings({ session }) {
             <span className="badge text-bg-light border">{filteredEmployees.length} of {employees.length} employees</span>
           </div>
           <div className="row g-2 my-2">
-            <div className="col-md-8">
+            <div className="col-md-6">
               <label className="visually-hidden" htmlFor="essl-mapping-search">Search employee mappings</label>
               <input id="essl-mapping-search" type="search" className="form-control form-control-sm"
                 placeholder="Search Employee Name, Employee ID, ESSL Employee Code, Department or Role"
                 value={mappingSearch} onChange={(event) => setMappingSearch(event.target.value)} />
             </div>
-            <div className="col-md-4">
+            <div className="col-md-3">
+              <label className="visually-hidden" htmlFor="essl-mapping-role">Filter by role</label>
+              <select id="essl-mapping-role" className="form-select form-select-sm" value={mappingRole}
+                onChange={(event) => setMappingRole(event.target.value)}>
+                <option value="all">All Roles</option>
+                {ROLE_OPTIONS.map((role) => <option key={role} value={role}>{role}</option>)}
+              </select>
+            </div>
+            <div className="col-md-3">
               <label className="visually-hidden" htmlFor="essl-mapping-department">Filter by HRMS department</label>
               <select id="essl-mapping-department" className="form-select form-select-sm" value={mappingDepartment}
                 onChange={(event) => setMappingDepartment(event.target.value)}>

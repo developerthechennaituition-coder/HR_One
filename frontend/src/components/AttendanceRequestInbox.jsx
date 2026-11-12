@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   REQUEST_STATUS_BADGES,
   REQUEST_STATUS_LABELS,
@@ -7,6 +7,7 @@ import {
   formatAttendanceClock,
   formatTimeRange,
   getAttendanceRequest,
+  listAttendanceDepartments,
   listAttendanceRequests,
   respondToAttendanceRequest,
 } from "../services/attendanceRequestApi";
@@ -92,6 +93,25 @@ function AttendanceRequestInbox() {
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const sectionRef = useRef(null);
+  const [departmentOptions, setDepartmentOptions] = useState([]);
+
+  // Department dropdown options (same source as the Daily Attendance department filter).
+  useEffect(() => {
+    let cancelled = false;
+    listAttendanceDepartments()
+      .then((items) => { if (!cancelled) setDepartmentOptions(items); })
+      .catch(() => { if (!cancelled) setDepartmentOptions([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const departmentNames = useMemo(() => {
+    const names = new Map();
+    departmentOptions.forEach((item) => {
+      const name = String(item.department_name || item.name || "").trim();
+      if (name && !names.has(name.toLowerCase())) names.set(name.toLowerCase(), name);
+    });
+    return [...names.values()].sort((a, b) => a.localeCompare(b));
+  }, [departmentOptions]);
 
   const loadRequests = useCallback(async () => {
     setLoading(true);
@@ -257,7 +277,10 @@ function AttendanceRequestInbox() {
           </div>
           <div className="col-6 col-md-2">
             <label className="form-label small mb-1" htmlFor="ar-department">Department</label>
-            <input id="ar-department" className="form-control form-control-sm" value={filters.department} onChange={(e) => setFilters({ ...filters, department: e.target.value })} />
+            <select id="ar-department" className="form-select form-select-sm" value={filters.department} onChange={(e) => setFilters({ ...filters, department: e.target.value })}>
+              <option value="">All Departments</option>
+              {departmentNames.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
           </div>
           <div className="col-6 col-md-2">
             <label className="form-label small mb-1" htmlFor="ar-period">Payroll period</label>

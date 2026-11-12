@@ -666,6 +666,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                         <div className="small mb-2">Most common Not Marked weekdays: <strong>{weeklyOffPreview.suggested_weekdays.slice(0, 3).join(", ")}</strong>. Review the suggested dates or pick another Not Marked date.</div>
                       )}
                       {weeklyOffError && <div className="alert alert-danger py-2 small">{weeklyOffError}</div>}
+                      <div className="table-responsive">
                       <table className="table table-sm align-middle mb-2">
                         <thead className="table-light"><tr><th style={{ width: 36 }}>#</th><th>Weekly Off date</th><th>Day</th></tr></thead>
                         <tbody>
@@ -685,6 +686,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                           ))}
                         </tbody>
                       </table>
+                      </div>
                       <div className="small text-muted">
                         Existing Weekly Off: {weeklyOffPreview.existing_weekly_offs ?? 0} · Monthly limit: {weeklyOffPreview.monthly_limit ?? MAX_WEEKLY_OFFS}. Only Not Marked dates are listed; Present, Absent, Leave, Holiday and existing Weekly Off records are never changed. Nothing is saved until you press Submit.
                       </div>

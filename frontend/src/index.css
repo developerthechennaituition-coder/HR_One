@@ -339,3 +339,113 @@ body {
   .page-header, .attendance-page-header { gap: .75rem; align-items: flex-start; flex-wrap: wrap; }
   .page-header .btn, .attendance-page-header .btn { max-width: 100%; }
 }
+
+
+/* =========================================================
+   Responsive hardening layer (desktop / tablet / mobile)
+   Additive only: wraps rows, contains wide content and keeps popups
+   inside the viewport. No colours, fonts or layouts are redefined.
+   ========================================================= */
+
+/* Tablet and below: page / card header rows (title on the left, actions on the
+   right) wrap instead of squeezing or overflowing. */
+@media (max-width: 991.98px) {
+  .main-content .d-flex.justify-content-between {
+    flex-wrap: wrap;
+    row-gap: 0.5rem;
+  }
+
+  .top-header,
+  .header-title-group,
+  .header-right {
+    min-width: 0;
+  }
+
+  .top-header h5 {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Large popups never exceed the screen on tablets. */
+  .modal-dialog.modal-lg,
+  .modal-dialog.modal-xl {
+    max-width: min(900px, calc(100% - 1rem));
+  }
+
+  .modal-dialog-scrollable .modal-content {
+    max-height: calc(100dvh - 1rem);
+  }
+}
+
+/* Popups: keep header, body and footer usable on small screens. */
+.modal-body { overflow-wrap: break-word; }
+.modal-body table { max-width: 100%; }
+.payroll-review-breakdown { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.team-attendance-filters { flex-wrap: wrap; }
+.team-attendance-filters select { flex: 1 1 135px; min-width: 0; }
+
+@media (max-width: 575.98px) {
+  .modal-footer {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .modal-footer > .btn {
+    flex: 1 1 auto;
+    margin: 0;
+  }
+
+  .modal-header .modal-title {
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
+
+  .modal-dialog-scrollable .modal-body {
+    padding: 0.85rem;
+  }
+
+  /* Notification dropdown stays fully on screen under the header. */
+  .notification-panel {
+    position: fixed !important;
+    top: 64px !important;
+    left: 12px !important;
+    right: 12px !important;
+    width: auto !important;
+    max-width: none !important;
+  }
+
+  .profile-dropdown {
+    max-width: calc(100vw - 24px);
+  }
+}
+
+/* Attendance page: Reset button lines up with the filter controls (below the labels). */
+@media (min-width: 768px) {
+  .attendance-filter-reset { margin-top: 2rem; }
+}
+
+/* My Attendance calendar header: month/year controls use the full card width on phones. */
+@media (max-width: 575.98px) {
+  .attendance-calendar-controls {
+    width: 100%;
+    flex-wrap: nowrap !important;
+  }
+
+  .attendance-calendar-controls .form-select {
+    flex: 1 1 0;
+    width: auto !important;
+    min-width: 0;
+    font-size: 0.85rem;
+    padding-left: 0.5rem;
+    padding-right: 1.5rem;
+    background-position: right 0.4rem center;
+  }
+
+  .attendance-calendar-controls .btn {
+    flex: 0 0 auto;
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+  }
+}

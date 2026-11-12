@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { dateState, monthOptions, clampMonth, isMonthInRange, shiftMonth as shiftCalendarMonth, yearOptions } from "../services/attendanceCalendarRange";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
 import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
+import AttendanceStatusSummary from "./AttendanceStatusSummary";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -80,7 +81,7 @@ function UpcomingDayDetails({ day, onClose }) {
 }
 
 // `range` comes from buildCalendarRange(): joining date through today + 89 days.
-function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedDate, onSelectDate, onMonthChange }) {
+function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedDate, onSelectDate, onMonthChange, summaryCounts, summaryPercentages }) {
   const days = calendar?.days || [];
   // Upcoming holiday / leave / permission date opened for read-only details.
   const [previewDate, setPreviewDate] = useState(null);
@@ -105,7 +106,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
       <div className="card-body">
         <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
           <h4 className="mb-0">Monthly Attendance Calendar</h4>
-          <div className="d-flex flex-wrap align-items-center gap-2">
+          <div className="d-flex flex-wrap align-items-center gap-2 attendance-calendar-controls">
             <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => shiftMonth(-1)} disabled={loading || atEarliestMonth} aria-label="Previous month">
               <i className="bi bi-chevron-left" aria-hidden="true" />
             </button>
@@ -124,6 +125,11 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
             </button>
           </div>
         </div>
+
+
+       {summaryCounts && summaryPercentages && (
+          <AttendanceStatusSummary counts={summaryCounts} percentages={summaryPercentages} />
+        )} 
 
         <div className="d-flex flex-wrap gap-3 mb-3 small">
           {CALENDAR_LEGEND.map((item) => (
@@ -160,7 +166,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
           <div className="text-center py-4"><div className="spinner-border text-primary" role="status" /></div>
         ) : (
           <div style={{ overflowX: "auto" }}>
-            <div style={{ minWidth: 420 }}>
+            <div style={{ minWidth: 350 }}>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 6, marginBottom: 6 }}>
                 {WEEKDAYS.map((name) => <div key={name} className="text-center text-muted fw-semibold small">{name}</div>)}
               </div>

@@ -1416,10 +1416,6 @@ export default function EmployeeDetails({
       label: "HR Admin",
     },
     {
-      value: "Administrator",
-      label: "Administrator",
-    },
-    {
       value: "HR Manager",
       label: "HOD",
     },

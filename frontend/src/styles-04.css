@@ -58,7 +58,16 @@
   color: #6f42c1;
 }
 
+.team-attendance-summary-card.holiday {
+  background: #e6f5f8;
+  border-color: #cce4ea;
+  color: #0b3d4a;
+}
 
+.team-attendance-summary-card.holiday strong {
+  font-size: 38px;
+  line-height: 1.2;
+}
 /* ============================================================
    ATTENDANCE LEGEND
    ============================================================ */

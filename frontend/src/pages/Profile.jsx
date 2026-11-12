@@ -6,7 +6,7 @@ import MyHolidayCalendar from "../components/MyHolidayCalendar";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
 import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
-import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
+import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey, formatAttendanceCount, summarizeAttendancePortions } from "../services/attendanceCalendarStatus";
 import { roleLabel } from "../services/roleLabels";
 
 const API_URL = HRONE_API_BASE + "/api/auth/me";
@@ -1042,58 +1042,32 @@ function Profile({ onNavigate }) {
     calendarRange,
   ]);
 
-  const presentCount = monthDateKeys.reduce((total, dateString) => {
-    return total + attendanceCalendarPortions(getAttendanceForDate(dateString)).present;
-  }, 0);
-
-  const absentCount = monthDateKeys.reduce((total, dateString) => {
-    return total + attendanceCalendarPortions(getAttendanceForDate(dateString)).absent;
-  }, 0);
-
-  const leaveCount = monthDateKeys.reduce((total, dateString) => {
+  // Half-days are split into 0.5 portions per half; the same shared helper is
+  // used by Employee Attendance so both views always agree.
+  const {
+    counts: attendanceCounts,
+    percentages: attendancePercentages,
+  } = summarizeAttendancePortions(monthDateKeys, (dateString) => {
     const record = getAttendanceForDate(dateString);
-    const recordedLeave = attendanceCalendarPortions(record).leave;
-    if (recordedLeave) return total + recordedLeave;
-    return total + (getApprovedLeaveForDate(dateString) ? 1 : 0);
-  }, 0);
-
-  /*
-   * ============================================================
-   * ATTENDANCE PERCENTAGE
-   * ============================================================
-   */
-
-  const percentageTotal =
-    presentCount +
-    absentCount +
-    leaveCount;
-
-  const presentPercentage =
-    percentageTotal > 0
-      ? (
-          (presentCount /
-            percentageTotal) *
-          100
-        ).toFixed(1)
-      : "0.0";
-
-  const absentPercentage =
-    percentageTotal > 0
-      ? (
-          (absentCount /
-            percentageTotal) *
-          100
-        ).toFixed(1)
-      : "0.0";
-
-  const leavePercentage =
-    percentageTotal > 0
-      ? (
-          (leaveCount /
-            percentageTotal) *
-          100
-        ).toFixed(1)
-      : "0.0";
+    const recorded = attendanceCalendarPortions(record);
+    const hasRecordedPortion = Object.values(recorded).some(Boolean);
+    if (!hasRecordedPortion) {
+      if (getApprovedLeaveForDate(dateString)) {
+        return { status: "Leave", is_approved_leave: true };
+      }
+      if (!record && holidayByDate[dateString]) {
+        return { status: "Holiday" };
+      }
+    }
+    return record;
+  });
+  const presentCount = attendanceCounts.present;
+  const absentCount = attendanceCounts.absent;
+  const leaveCount = attendanceCounts.leave;
+  const holidayCount = attendanceCounts.holiday;
+  const presentPercentage = attendancePercentages.present;
+  const absentPercentage = attendancePercentages.absent;
+  const leavePercentage = attendancePercentages.leave;
 
   /*
    * ============================================================
@@ -1979,14 +1953,14 @@ function Profile({ onNavigate }) {
 
                   {/* PRESENT */}
 
-                  <div className="col-md-4">
+                  <div className="col-6 col-md-3">
                     <div className="border rounded p-3 h-100">
                       <small className="text-muted d-block mb-1">
                         Present
                       </small>
 
                       <div className="fw-semibold text-success">
-                        {presentCount}{" "}
+                        {formatAttendanceCount(presentCount)}{" "}
                         day
                         {presentCount ===
                         1
@@ -1999,14 +1973,14 @@ function Profile({ onNavigate }) {
 
                   {/* ABSENT */}
 
-                  <div className="col-md-4">
+                  <div className="col-6 col-md-3">
                     <div className="border rounded p-3 h-100">
                       <small className="text-muted d-block mb-1">
                         Absent
                       </small>
 
                       <div className="fw-semibold text-danger">
-                        {absentCount}{" "}
+                        {formatAttendanceCount(absentCount)}{" "}
                         day
                         {absentCount ===
                         1
@@ -2019,7 +1993,7 @@ function Profile({ onNavigate }) {
 
                   {/* LEAVE */}
 
-                  <div className="col-md-4">
+                  <div className="col-6 col-md-3">
                     <div className="border rounded p-3 h-100">
                       <small className="text-muted d-block mb-1">
                         Leave
@@ -2034,13 +2008,32 @@ function Profile({ onNavigate }) {
                               .background,
                         }}
                       >
-                        {leaveCount}{" "}
+                        {formatAttendanceCount(leaveCount)}{" "}
                         day
                         {leaveCount ===
                         1
                           ? ""
                           : "s"}{" "}
                         ({leavePercentage}%)
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* HOLIDAY */}
+
+                  <div className="col-6 col-md-3">
+                    <div className="border rounded p-3 h-100">
+                      <small className="text-muted d-block mb-1">
+                        Holiday
+                      </small>
+
+                      <div
+                        className="fw-semibold"
+                        style={{ color: "#432874" }}
+                      >
+                        {formatAttendanceCount(holidayCount)}{" "}
+                        day
+                        {holidayCount === 1 ? "" : "s"}
                       </div>
                     </div>
                   </div>

@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { roleLabel } from "../services/roleLabels";
 import {
   useEffect,
   useMemo,
@@ -10,7 +11,7 @@ import { getTeamMemberAttendanceCalendar } from "../services/attendanceRequestAp
 import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
 import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate } from "../services/attendanceCalendarRange";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
-import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey } from "../services/attendanceCalendarStatus";
+import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey, formatAttendanceCount, summarizeAttendancePortions } from "../services/attendanceCalendarStatus";
 
 const API_URL =
   HRONE_API_BASE + "/api/reporting-manager";
@@ -847,75 +848,25 @@ function TeamMemberDetails({
      MONTH COUNTS
   ========================================================== */
 
-  const getCountByStatus = (
-    targetStatus
-  ) => {
-    return monthDateKeys.filter(
-      (date) => {
-        const record =
-          getAttendanceForDate(
-            date
-          );
-
-        return (
-          normalizeStatus(
-            record?.status ||
-              record?.attendance_status
-          ) === targetStatus ||
-          (targetStatus === "leave" && record?.is_approved_leave)
-        );
-      }
-    ).length;
-  };
-
-  const presentCount = monthDateKeys.reduce((total, date) => (
-    total + attendanceCalendarPortions(getAttendanceForDate(date)).present
-  ), 0);
-
-  const absentCount = monthDateKeys.reduce((total, date) => (
-    total + attendanceCalendarPortions(getAttendanceForDate(date)).absent
-  ), 0);
-
-  const leaveCount = monthDateKeys.reduce((total, date) => {
+  // Same half-day-aware summary as My Attendance / Employee Attendance.
+  const {
+    counts: attendanceCounts,
+    percentages: attendancePercentages,
+  } = summarizeAttendancePortions(monthDateKeys, (date) => {
     const record = getAttendanceForDate(date);
-    const portions = attendanceCalendarPortions(record).leave;
-    return total + (portions || (approvedLeaveByDate[date] ? 1 : 0));
-  }, 0);
-
-  const holidayCount =
-    getCountByStatus("holiday");
-
-  const totalMarked =
-    presentCount +
-    absentCount +
-    leaveCount;
-
-  const presentPercentage =
-    totalMarked > 0
-      ? (
-          (presentCount /
-            totalMarked) *
-          100
-        ).toFixed(1)
-      : "0.0";
-
-  const absentPercentage =
-    totalMarked > 0
-      ? (
-          (absentCount /
-            totalMarked) *
-          100
-        ).toFixed(1)
-      : "0.0";
-
-  const leavePercentage =
-    totalMarked > 0
-      ? (
-          (leaveCount /
-            totalMarked) *
-          100
-        ).toFixed(1)
-      : "0.0";
+    const recorded = attendanceCalendarPortions(record);
+    if (!Object.values(recorded).some(Boolean) && approvedLeaveByDate[date]) {
+      return { status: "Leave", is_approved_leave: true };
+    }
+    return record;
+  });
+  const presentCount = attendanceCounts.present;
+  const absentCount = attendanceCounts.absent;
+  const leaveCount = attendanceCounts.leave;
+  const holidayCount = attendanceCounts.holiday;
+  const presentPercentage = attendancePercentages.present;
+  const absentPercentage = attendancePercentages.absent;
+  const leavePercentage = attendancePercentages.leave;
 
   /* ==========================================================
      SELECTED RECORD
@@ -1761,7 +1712,7 @@ function TeamMemberDetails({
 
               <strong>
                 {displayValue(
-                  member.role
+                  roleLabel(member.role)
                 )}
               </strong>
             </div>
@@ -1902,7 +1853,7 @@ function TeamMemberDetails({
 
         <div className="row g-3 mt-2 mb-4">
 
-          <div className="col-12 col-md-3">
+          <div className="col-6 col-md-3">
 
             <div className="team-attendance-summary-card present">
 
@@ -1911,7 +1862,7 @@ function TeamMemberDetails({
               </span>
 
               <strong>
-                {presentCount}
+                {formatAttendanceCount(presentCount)}
               </strong>
 
               <small>
@@ -1922,7 +1873,7 @@ function TeamMemberDetails({
 
           </div>
 
-          <div className="col-12 col-md-3">
+          <div className="col-6 col-md-3">
 
             <div className="team-attendance-summary-card absent">
 
@@ -1931,7 +1882,7 @@ function TeamMemberDetails({
               </span>
 
               <strong>
-                {absentCount}
+                {formatAttendanceCount(absentCount)}
               </strong>
 
               <small>
@@ -1942,7 +1893,7 @@ function TeamMemberDetails({
 
           </div>
 
-          <div className="col-12 col-md-3">
+          <div className="col-6 col-md-3">
 
             <div className="team-attendance-summary-card leave">
 
@@ -1951,7 +1902,7 @@ function TeamMemberDetails({
               </span>
 
               <strong>
-                {leaveCount}
+                {formatAttendanceCount(leaveCount)}
               </strong>
 
               <small>
@@ -1962,21 +1913,19 @@ function TeamMemberDetails({
 
           </div>
 
-          <div className="col-12 col-md-3">
+          <div className="col-6 col-md-3">
 
-            <div className="team-attendance-summary-card">
+            <div className="team-attendance-summary-card holiday">
 
               <span>
                 Holidays
               </span>
 
               <strong>
-                {holidayCount}
+                {formatAttendanceCount(holidayCount)}
               </strong>
 
-              <small>
-                Calendar
-              </small>
+               
 
             </div>
 

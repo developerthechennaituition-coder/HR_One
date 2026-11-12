@@ -388,6 +388,7 @@ class WfhSettingsPayload(BaseModel):
     wfh_permitted_to: str | None = None
     wfh_permitted_start_time: str | None = None
     wfh_permitted_end_time: str | None = None
+    wfh_permitted_weekdays: list[str] = Field(default_factory=lambda: list(WEEKDAY_NAMES))
 
     @field_validator(
         "home_latitude",
@@ -1984,6 +1985,115 @@ def end_wfh_break(
     return {"attendance": _to_response(updated, user), "wfh_breaks": updated.get("wfh_breaks", [])}
 
 
+def generate_due_wfh_absences(now: datetime | None = None) -> dict[str, int]:
+    """Create missing WFH Absent records once each permitted day's end time has passed.
+
+    Existing attendance (including holidays, weekly offs, leave and manual entries)
+    is authoritative. Finalized payroll periods are never changed.
+    """
+    now_local = (now or company_now()).astimezone(COMPANY_TZ)
+    today = now_local.date()
+    created = skipped = 0
+    employees = users_collection.find({
+        "is_active": True,
+        "is_wfh_enabled": True,
+        "wfh_permitted_from": {"$ne": None},
+        "wfh_permitted_to": {"$ne": None},
+        "wfh_permitted_end_time": {"$ne": None},
+    })
+    for employee in employees:
+        user_id = str(employee.get("_id"))
+        employee_id = str(employee.get("employee_id") or "")
+        try:
+            permitted_from = date.fromisoformat(str(employee.get("wfh_permitted_from"))[:10])
+            permitted_to = date.fromisoformat(str(employee.get("wfh_permitted_to"))[:10])
+            end_clock = time.fromisoformat(str(employee.get("wfh_permitted_end_time")))
+        except (TypeError, ValueError):
+            logger.warning("Skipping WFH auto-absence for employee %s: invalid schedule", user_id)
+            continue
+        weekdays = employee.get("wfh_permitted_weekdays") or list(WEEKDAY_NAMES)
+        valid_weekdays = {WEEKDAY_NAMES.index(day) for day in weekdays if day in WEEKDAY_NAMES}
+        if not valid_weekdays:
+            continue
+        # Catch up dates missed while the backend was offline, but never write future dates.
+        cursor = max(permitted_from, employee_joining_date(employee) or permitted_from)
+        last = min(permitted_to, today)
+        while cursor <= last:
+            if cursor.weekday() not in valid_weekdays:
+                cursor += timedelta(days=1)
+                continue
+            date_iso = cursor.isoformat()
+            # A manager-approved late check-in permission is date-specific and
+            # its approved end_time is the real deadline for automatic Absent.
+            # Without an approved extension, retain the employee's configured
+            # WFH end time as the fallback deadline.
+            late_permission = _wfh_late_check_in_request(user_id, date_iso)
+            absence_end_clock = end_clock
+            if late_permission and str(late_permission.get("status") or "").lower() == "approved":
+                approved_end = late_permission.get("end_time")
+                if not approved_end:
+                    logger.warning(
+                        "Skipping WFH auto-absence for employee %s on %s: approved permission has no end time",
+                        user_id, date_iso,
+                    )
+                    cursor += timedelta(days=1)
+                    continue
+                try:
+                    absence_end_clock = time.fromisoformat(str(approved_end))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Skipping WFH auto-absence for employee %s on %s: invalid approved permission end time",
+                        user_id, date_iso,
+                    )
+                    cursor += timedelta(days=1)
+                    continue
+            deadline = datetime.combine(cursor, absence_end_clock, tzinfo=COMPANY_TZ)
+            if now_local < deadline:
+                cursor += timedelta(days=1)
+                continue
+            period = cursor.strftime("%Y-%m")
+            payroll = db["monthly_payroll_records"].find_one(
+                {"employee_id": employee_id, "period": period}, {"status": 1}
+            ) if employee_id else None
+            if str((payroll or {}).get("status") or "").strip().lower() in {"approved", "processed", "paid"}:
+                skipped += 1
+                cursor += timedelta(days=1)
+                continue
+            # Scheduled WFH days do not supersede company weekly-offs or approved leave.
+            if cursor.weekday() in company_weekly_off_weekdays() or _approved_leaves_for_date(date_iso, user_id):
+                skipped += 1
+                cursor += timedelta(days=1)
+                continue
+            key = {"user_id": user_id, "attendance_date": date_iso}
+            # Do not replace an existing Present/Leave/Holiday/Weekly Off/manual decision.
+            try:
+                result = attendance_collection.update_one(
+                    key,
+                    {"$setOnInsert": {
+                        "user_id": user_id,
+                        "employee_id": employee_id,
+                        "attendance_date": date_iso,
+                        "status": "Absent",
+                        "check_in_time": None,
+                        "check_out_time": None,
+                        "attendance_type": "WFH",
+                        "attendance_source": "WFH_AUTO_ABSENT",
+                        "wfh_auto_absent": True,
+                        "wfh_scheduled_end_time": absence_end_clock.strftime("%H:%M"),
+                        "marked_by": "system",
+                        "created_at": now_local.astimezone(timezone.utc),
+                        "updated_at": now_local.astimezone(timezone.utc),
+                    }},
+                    upsert=True,
+                )
+                if result.upserted_id:
+                    created += 1
+            except DuplicateKeyError:
+                skipped += 1
+            cursor += timedelta(days=1)
+    return {"created": created, "skipped": skipped}
+
+
 @router.get("/wfh/admin/employees")
 def list_wfh_employee_settings(
     authorization: str | None = Header(default=None),
@@ -2004,6 +2114,7 @@ def list_wfh_employee_settings(
             "wfh_permitted_to": employee.get("wfh_permitted_to"),
             "wfh_permitted_start_time": employee.get("wfh_permitted_start_time"),
             "wfh_permitted_end_time": employee.get("wfh_permitted_end_time"),
+            "wfh_permitted_weekdays": employee.get("wfh_permitted_weekdays") or list(WEEKDAY_NAMES),
             "home_latitude": employee.get("home_latitude"),
             "home_longitude": employee.get("home_longitude"),
             "allowed_radius": employee.get("allowed_radius", 100),
@@ -2149,6 +2260,11 @@ def update_wfh_employee_settings(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "WFH end date must be on or after the start date.")
     if payload.wfh_permitted_start_time and payload.wfh_permitted_end_time and payload.wfh_permitted_end_time <= payload.wfh_permitted_start_time:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "WFH end time must be later than start time.")
+    selected_weekdays = [str(day).strip().lower() for day in payload.wfh_permitted_weekdays]
+    if payload.is_wfh_enabled and not selected_weekdays:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Select at least one permitted WFH weekday.")
+    if len(set(selected_weekdays)) != len(selected_weekdays) or any(day not in WEEKDAY_NAMES for day in selected_weekdays):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Select valid WFH weekdays.")
     if os.getenv("HRMS_ENV", "development").lower() == "development":
         logger.info("WFH admin settings updated for employee %s", user_id)
     now = datetime.now(timezone.utc)
@@ -2161,6 +2277,7 @@ def update_wfh_employee_settings(
                 "wfh_permitted_to": payload.wfh_permitted_to,
                 "wfh_permitted_start_time": payload.wfh_permitted_start_time,
                 "wfh_permitted_end_time": payload.wfh_permitted_end_time,
+                "wfh_permitted_weekdays": selected_weekdays,
                 "allowed_radius": payload.allowed_radius,
                 "updated_at": now,
             }
@@ -2194,6 +2311,7 @@ def update_wfh_employee_settings(
         "wfh_permitted_to": payload.wfh_permitted_to,
         "wfh_permitted_start_time": payload.wfh_permitted_start_time,
         "wfh_permitted_end_time": payload.wfh_permitted_end_time,
+        "wfh_permitted_weekdays": selected_weekdays,
         "home_latitude": employee.get("home_latitude"),
         "home_longitude": employee.get("home_longitude"),
         "allowed_radius": payload.allowed_radius,
@@ -6438,7 +6556,7 @@ def export_user_monthly_attendance(
         permission_duration_text = "\n".join(entry["duration_text"] for entry in permission_items) or "—"
         if permission_items:
             permission_duration_text += f"\nPermission Count: {len(permission_items)}"
-        working_interval_text = "\\n".join(
+        working_interval_text = "\n".join(
             f"WI{interval_index}: {local_clock(item.get('from_time'))} - {local_clock(item.get('to_time'))} "
             f"({item.get('duration') or _format_duration(item.get('duration_minutes') or 0)})"
             for interval_index, item in enumerate((row.get("working_intervals") or []), 1)

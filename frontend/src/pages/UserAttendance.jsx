@@ -8,6 +8,7 @@ import {
   MONTH_NAMES, buildCalendarRange, clampMonth, companyToday, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions,
 } from "../services/attendanceCalendarRange";
 import { roleLabel } from "../services/roleLabels";
+import { summarizeCalendarDays } from "../services/attendanceCalendarStatus";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
@@ -260,17 +261,8 @@ function UserAttendance({ session }) {
     setMonthlyDetails(null); setMonthlyDetailsError(""); setMonthlyDetailsLoading(false);
   }, [selectedUserId, year, month]);
 
-  // Recorded attendance only (as before); upcoming holidays/leave are not counted.
-  const counts = useMemo(() => {
-    const result = { present: 0, absent: 0, leave: 0, holiday: 0 };
-    (calendar?.days || []).forEach((day) => {
-      const key = String(day.status || "").toLowerCase();
-      if (day.has_record && key in result) result[key] += 1;
-    });
-    return result;
-  }, [calendar]);
-  const marked = counts.present + counts.absent + counts.leave;
-  const percent = (value) => (marked ? ((value / marked) * 100).toFixed(1) : "0.0");
+  // Half-days are split into 0.5 portions per half (shared with My Attendance).
+  const { counts, percentages } = useMemo(() => summarizeCalendarDays(calendar), [calendar]);
 
   const selectedCalendarDay = calendar?.days?.find((day) => day.attendance_date === selectedDate) || null;
 
@@ -402,23 +394,6 @@ function UserAttendance({ session }) {
               </div>
             </div>
 
-            <div className="row g-3 mb-3">
-              {[
-                ["present", counts.present, percent(counts.present)],
-                ["absent", counts.absent, percent(counts.absent)],
-                ["leave", counts.leave, percent(counts.leave)],
-                ["holiday", counts.holiday, null],
-              ].map(([key, value, pct]) => (
-                <div className="col-6 col-lg-3" key={key}>
-                  <div className="border rounded p-3 h-100" style={{ borderLeft: `5px solid ${STATUS_COLORS[key].background}` }}>
-                    <div className="text-muted small">{STATUS_COLORS[key].label}</div>
-                    <div className="fs-4 fw-semibold">{value}</div>
-                    {pct !== null && <div className="text-muted small">{pct}% of marked days</div>}
-                  </div>
-                </div>
-              ))}
-            </div>
-
             <MyAttendanceCalendar
               year={year}
               month={month}
@@ -428,6 +403,8 @@ function UserAttendance({ session }) {
               selectedDate={selectedDate}
               onSelectDate={selectDate}
               onMonthChange={changeMonth}
+              summaryCounts={counts}
+              summaryPercentages={percentages}
             />
             {monthlyDetailsError && <div className="alert alert-danger mt-3 mb-0" role="alert">{monthlyDetailsError}</div>}
 

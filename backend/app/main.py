@@ -26,7 +26,7 @@ from app.session import active_sessions
 from app.core_routes import router as core_router, _organization_user
 
 #Attendance
-from app.attendance import router as attendance_router, ensure_attendance_indexes
+from app.attendance import router as attendance_router, ensure_attendance_indexes, generate_due_wfh_absences
 from app.essl import router as essl_attendance_router, ensure_essl_indexes
 from app.attendance_requests import router as attendance_requests_router
 
@@ -60,6 +60,47 @@ from app.db.mongodb import (
 app = FastAPI(title="HRMS Backend", description="Backend API for HRMS application", version="1.0.0")
 logger = logging.getLogger(__name__)
 ORGANIZATION_TIMEZONE = ZoneInfo(os.getenv("ORG_TIMEZONE", "Asia/Kolkata"))
+
+
+_wfh_absence_scheduler_stop = threading.Event()
+_wfh_absence_scheduler_thread: threading.Thread | None = None
+
+
+def _run_wfh_absence_scheduler() -> None:
+    """Run the WFH end-of-day absence sweep in the backend process."""
+    while not _wfh_absence_scheduler_stop.is_set():
+        try:
+            summary = generate_due_wfh_absences()
+            if summary.get("created"):
+                logger.info("WFH automatic absence generation: %s", summary)
+        except Exception:
+            logger.exception("WFH automatic absence generation failed.")
+        _wfh_absence_scheduler_stop.wait(60)
+
+
+@app.on_event("startup")
+def start_wfh_absence_scheduler() -> None:
+    global _wfh_absence_scheduler_thread
+    if _wfh_absence_scheduler_thread and _wfh_absence_scheduler_thread.is_alive():
+        return
+    # The sweep uses an atomic upsert protected by the unique
+    # (user_id, attendance_date) index. Ensure it exists before the first
+    # scheduler pass, including when this app starts with multiple workers.
+    ensure_attendance_indexes()
+    _wfh_absence_scheduler_stop.clear()
+    _wfh_absence_scheduler_thread = threading.Thread(
+        target=_run_wfh_absence_scheduler,
+        name="wfh-automatic-absence",
+        daemon=True,
+    )
+    _wfh_absence_scheduler_thread.start()
+
+
+@app.on_event("shutdown")
+def stop_wfh_absence_scheduler() -> None:
+    _wfh_absence_scheduler_stop.set()
+    if _wfh_absence_scheduler_thread and _wfh_absence_scheduler_thread.is_alive():
+        _wfh_absence_scheduler_thread.join(timeout=5)
 
 
 @app.middleware("http")

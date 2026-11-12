@@ -2,6 +2,7 @@ import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import MyAttendanceCalendar from "../components/MyAttendanceCalendar";
+import { summarizeCalendarDays } from "../services/attendanceCalendarStatus";
 import MyAttendanceRequests from "../components/MyAttendanceRequests";
 import { getAttendanceCalendar } from "../services/attendanceRequestApi";
 import { buildCalendarRange, clampMonth, isMonthInRange, isSelectableDate, minSelectableDate } from "../services/attendanceCalendarRange";
@@ -162,6 +163,7 @@ function EmployeeAttendance({ session, onNavigate }) {
     await Promise.all([loadAttendance(), loadCalendar()]);
   };
 
+  const monthSummary = useMemo(() => summarizeCalendarDays(calendar), [calendar]);
   const selectedCalendarDay = calendar?.days?.find((day) => day.attendance_date === selectedDate) || null;
 
   useEffect(() => {
@@ -311,7 +313,7 @@ function EmployeeAttendance({ session, onNavigate }) {
         </div>
       </div>
 
-      <div className="card border-0 shadow-sm">
+      <div className="card border-0 shadow-sm mb-4">
         <div className="card-body">
           <h4 className="mb-3">Attendance History</h4>
           <div className="table-responsive">
@@ -353,6 +355,7 @@ function EmployeeAttendance({ session, onNavigate }) {
       </div>
 
       {calendarError && <div className="alert alert-danger" role="alert">{calendarError}</div>}
+
       <MyAttendanceCalendar
         year={calendarYear}
         month={calendarMonth}
@@ -362,6 +365,8 @@ function EmployeeAttendance({ session, onNavigate }) {
         selectedDate={selectedDate}
         onSelectDate={selectDate}
         onMonthChange={changeCalendarMonth}
+        summaryCounts={monthSummary.counts}
+        summaryPercentages={monthSummary.percentages}
       />
 
       <AttendanceDayBreakdown

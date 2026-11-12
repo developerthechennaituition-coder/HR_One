@@ -78,23 +78,30 @@ export const attendanceCalendarHalfSymbol = (day) => {
   return "◒";
 };
 
+// Splits one calendar day into Present / Absent / Leave / Holiday portions.
+// A full day contributes 1 to one bucket; a half-day contributes 0.5 per half
+// according to that half's own status (e.g. Present + Absent => 0.5 + 0.5).
 export const attendanceCalendarPortions = (day) => {
-  const portions = { present: 0, absent: 0, leave: 0 };
+  const portions = { present: 0, absent: 0, leave: 0, holiday: 0 };
   const classify = (value) => {
     const status = normalize(value);
     if (status === "present") return "present";
     if (status === "absent") return "absent";
     if (status.includes("leave")) return "leave";
+    if (status === "holiday") return "holiday";
+    if (status === "weekly off" || status === "weeklyoff") return "ignore";
     return null;
   };
+  const add = (key, value) => { if (key && key !== "ignore") portions[key] += value; };
   const first = classify(day?.first_half_status);
   const second = classify(day?.second_half_status);
   const isHalfDay = attendanceCalendarStatusKey(day) === "halfday";
 
-  if (first || second || isHalfDay) {
-    if (first) portions[first] += 0.5;
-    if (second) portions[second] += 0.5;
+  if (isHalfDay || (first && second && first !== second)) {
+    add(first, 0.5);
+    add(second, 0.5);
     if (isHalfDay && (!first || !second)) {
+      // The unrecorded half of a Half-Day Present is counted as Absent.
       const side = String(day?.half_day_present_side || "");
       const flaggedPresentSide = side === "first" || side === "second"
         ? side
@@ -102,17 +109,15 @@ export const attendanceCalendarPortions = (day) => {
           ? "first"
           : String(day?.half_day_present || "").endsWith("Second Half")
             ? "second"
-            : !first && !second
+            : first === "present"
               ? "first"
-              : first === "present"
-                ? "first"
-                : second === "present"
+              : second === "present"
+                ? "second"
+                : first === "absent"
                   ? "second"
-                  : first === "absent"
-                    ? "second"
-                    : second === "absent"
-                      ? "first"
-                      : "";
+                  : second === "absent"
+                    ? "first"
+                    : "first";
       if (!first) portions[flaggedPresentSide === "first" ? "present" : "absent"] += 0.5;
       if (!second) portions[flaggedPresentSide === "second" ? "present" : "absent"] += 0.5;
     }
@@ -123,5 +128,40 @@ export const attendanceCalendarPortions = (day) => {
   if (status === "present") portions.present = 1;
   else if (status === "absent") portions.absent = 1;
   else if (status.includes("leave") || day?.is_approved_leave) portions.leave = 1;
+  else if (status === "holiday") portions.holiday = 1;
   return portions;
 };
+
+// One shared monthly summary for every attendance calendar page, so the counts
+// and percentages always agree. Present / Absent / Leave carry a percentage
+// (out of Present + Absent + Leave); Holiday is a count only.
+// `days` are calendar day objects; `resolve` may return an adjusted day
+// (e.g. approved leave or a published holiday for a date with no record).
+export const summarizeAttendancePortions = (days, resolve = (day) => day) => {
+  const totals = { present: 0, absent: 0, leave: 0, holiday: 0 };
+  days.forEach((day) => {
+    const portions = attendanceCalendarPortions(resolve(day));
+    Object.keys(totals).forEach((key) => { totals[key] += portions[key]; });
+  });
+  const counted = totals.present + totals.absent + totals.leave;
+  const percentages = {};
+  ["present", "absent", "leave"].forEach((key) => {
+    percentages[key] = counted > 0 ? ((totals[key] / counted) * 100).toFixed(1) : "0.0";
+  });
+  return { counts: totals, counted, percentages };
+};
+
+// Summary for backend calendar payloads (`calendar.days`): recorded days plus
+// published holidays and approved leave inside the visible window.
+export const summarizeCalendarDays = (calendar) => summarizeAttendancePortions(
+  (calendar?.days || []).filter((day) => {
+    if (day?.is_before_joining || day?.is_after_window) return false;
+    const status = normalize(day?.status);
+    return Boolean(day?.has_record) || status === "holiday" || status === "leave";
+  }),
+);
+
+// 2 -> "2", 2.5 -> "2.5"
+export const formatAttendanceCount = (value) => (
+  Number.isInteger(value) ? String(value) : value.toFixed(1)
+);

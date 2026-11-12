@@ -66,6 +66,18 @@ export const listAttendanceRequests = (filters = {}) => {
   return request(query ? `?${query}` : "", {}, "Unable to load attendance requests.");
 };
 
+// HR Admin: department master + departments carried on employee records, for the inbox filter.
+export const listAttendanceDepartments = async () => {
+  const token = getToken();
+  if (!token) throw new Error("Your session has expired. Please login again.");
+  const response = await fetch(`${HRONE_API_BASE}/api/attendance/departments`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await response.json().catch(() => []);
+  if (!response.ok) throw new Error(errorMessage(data?.detail, "Unable to load departments."));
+  return Array.isArray(data) ? data : [];
+};
+
 export const getAttendanceRequest = (requestId) =>
   request(`/${encodeURIComponent(requestId)}`, {}, "Unable to load the attendance request.");
 
