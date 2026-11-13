@@ -26,7 +26,7 @@ from app.session import active_sessions
 from app.core_routes import router as core_router, _organization_user
 
 #Attendance
-from app.attendance import router as attendance_router, ensure_attendance_indexes, generate_due_wfh_absences
+from app.attendance import router as attendance_router, ensure_attendance_indexes, generate_due_wfh_absences, mark_attendance_issues
 from app.essl import router as essl_attendance_router, ensure_essl_indexes
 from app.attendance_requests import router as attendance_requests_router
 
@@ -75,6 +75,12 @@ def _run_wfh_absence_scheduler() -> None:
                 logger.info("WFH automatic absence generation: %s", summary)
         except Exception:
             logger.exception("WFH automatic absence generation failed.")
+        try:
+            issues = mark_attendance_issues()
+            if issues.get("marked"):
+                logger.info("Attendance Issue marking: %s", issues)
+        except Exception:
+            logger.exception("Attendance Issue marking failed.")
         _wfh_absence_scheduler_stop.wait(60)
 
 

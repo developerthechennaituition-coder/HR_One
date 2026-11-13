@@ -660,9 +660,14 @@ def _save_daily_attendance(
         "user_id": str(user["_id"]),
         "attendance_date": attendance_date,
     }
+    # A finished day with a Check-In but no Check-Out is an Attendance Issue,
+    # never Present. It reverts to Present as soon as a Check-Out punch arrives.
+    day_is_over = attendance_date < datetime.now(COMPANY_TZ).date().isoformat()
+    missing_checkout = last is None and day_is_over
     values = {
         "employee_id": user.get("employee_id", ""),
-        "status": "Present",
+        "status": "Attendance Issue" if missing_checkout else "Present",
+        "attendance_issue": missing_checkout,
         "attendance_type": "OFFICE",
         "attendance_source": "ESSL",
         "check_in_time": first.strftime("%H:%M"),

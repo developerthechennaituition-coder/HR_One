@@ -1,0 +1,26 @@
+/* Attendance Issue (check-in without check-out) — shared across attendance views */
+.team-attendance-summary-card.issue {
+  background: #fff8e1;
+  border-color: #ffe08a;
+  color: #8a5a00;
+}
+.team-selected-status.issue {
+  background: #fff8e1;
+  color: #8a5a00;
+}
+.attendance-issue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #ffe69c;
+  color: #664d03;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.attendance-issue-symbol {
+  color: #f59f00;
+  font-weight: 700;
+}

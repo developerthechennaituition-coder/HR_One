@@ -21,7 +21,10 @@ class WfhAutomaticAbsentTests(unittest.TestCase):
             "wfh_permitted_weekdays": ["tuesday"],
         }
         self.attendance = MagicMock()
-        self.attendance.update_one.return_value = SimpleNamespace(upserted_id="new-record")
+        self.attendance.update_one.side_effect = [
+            SimpleNamespace(modified_count=0, upserted_id=None),
+            SimpleNamespace(upserted_id="new-record"),
+        ]
         self.db = MagicMock()
         self.db.__getitem__.return_value.find_one.return_value = None
         self.patches = [
@@ -89,12 +92,27 @@ class WfhAutomaticAbsentTests(unittest.TestCase):
         self.assertEqual(self.inserted_record()["wfh_scheduled_end_time"], "18:00")
 
     def test_existing_attendance_is_never_overwritten(self):
-        self.attendance.update_one.return_value = SimpleNamespace(upserted_id=None)
+        self.attendance.update_one.side_effect = [
+            SimpleNamespace(modified_count=0, upserted_id=None),
+            SimpleNamespace(upserted_id=None),
+        ]
         result = self.run_at(18, 0)
         self.assertEqual(result["created"], 0)
         self.assertEqual(result["skipped"], 0)
-        self.attendance.update_one.assert_called_once()
+        self.assertEqual(self.attendance.update_one.call_count, 2)
         self.assertIn("$setOnInsert", self.attendance.update_one.call_args.args[1])
+
+    def test_existing_not_marked_placeholder_is_promoted_to_absent(self):
+        self.attendance.update_one.side_effect = [
+            SimpleNamespace(modified_count=1, upserted_id=None),
+        ]
+        result = self.run_at(18, 0)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(self.attendance.update_one.call_count, 1)
+        query, update = self.attendance.update_one.call_args.args[:2]
+        self.assertEqual(query["status"]["$in"], ["Not Marked", "not marked", "not_marked"])
+        self.assertEqual(update["$set"]["status"], "Absent")
+        self.assertEqual(update["$set"]["attendance_source"], "WFH_AUTO_ABSENT")
 
     def test_approved_payroll_period_is_not_modified(self):
         self.db.__getitem__.return_value.find_one.return_value = {"status": "aPpRoVeD"}

@@ -43,9 +43,12 @@ from app.attendance import (
     _format_duration,
     _attendance_clock_hhmm,
     _is_automatic_attendance_record,
+    is_wfh_auto_absent,
+    record_effective_status,
 )
 from app.db.mongodb import db
 from app.attendance_calculations import (
+    ATTENDANCE_ISSUE_STATUS,
     calculate_half_day_portions,
     classify_half_day,
     combine_half_day_statuses,
@@ -73,6 +76,12 @@ RequestStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Wee
 FinalStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission", "Not Applicable"]
 NOT_APPLICABLE = "Not Applicable"
 BEFORE_JOINING = "Before Joining"
+ATTENDANCE_ISSUE = ATTENDANCE_ISSUE_STATUS
+# Stored markers removed when an approved correction cancels an Attendance Issue.
+ISSUE_FIELDS = (
+    "attendance_issue", "attendance_issue_original_status",
+    "attendance_issue_reason", "attendance_issue_marked_at",
+)
 # Permitted corrections by the date's current attendance status. Leave dates
 # are owned by the Leave module and future/pre-joining dates are not eligible.
 STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
@@ -83,6 +92,8 @@ STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "Present": ("Present", "Half-Day Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
     "Half-Day Present": ("Present", "Half-Day Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
     "Holiday": ("Present",),
+    # Check-in without check-out. HR enters the missing Check-Out when approving Present.
+    ATTENDANCE_ISSUE: ("Present", "Half-Day Present", "Absent"),
 }
 MEDICAL_LEAVE_MONTHLY_LIMIT = leave.MEDICAL_LEAVE_DAYS_PER_MONTH
 MEDICAL_LEAVE_CODE = leave.MEDICAL_LEAVE_CODE
@@ -258,6 +269,14 @@ def _attendance_category(record: dict[str, Any] | None) -> str | None:
         return "Work From Home"
     if record.get("attendance_type") == "OFFICE" or record.get("attendance_source") in {"ESSL", "MANUAL"}:
         return "Office"
+    if record.get("attendance_source") == "ATTENDANCE_REQUEST":
+        # Records approved before the category was preserved: use the source
+        # of the punch record the approved request replaced.
+        previous = record.get("correction_previous") or {}
+        if previous.get("attendance_source") == "WFH_FACE_GPS":
+            return "Work From Home"
+        if previous.get("attendance_source") in {"ESSL", "MANUAL"}:
+            return "Office"
     return None
 
 
@@ -352,7 +371,8 @@ def _month_context(user: dict[str, Any], year: int, month: int) -> dict[str, Any
 
 def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any]) -> str:
     if record:
-        return str(record.get("status") or "Not Marked")
+        # Present with a Check-In but no Check-Out (day over) is an Attendance Issue.
+        return str(record_effective_status(record) or "Not Marked")
     if current > ctx["today"]:
         # Future dates show known holidays, approved leave and weekly offs.
         if ctx["joining"] and current < ctx["joining"]:
@@ -589,13 +609,21 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             half_day["half_day_eligibility"] = record.get("half_day_eligibility")
             half_day["actual_working_minutes"] = record.get("actual_working_minutes", effective_minutes)
         issue = attendance_issue(day_check_in, day_check_out, daily_metrics.get("working_intervals") or [])
+        is_issue_date = day_status == ATTENDANCE_ISSUE
+        if is_issue_date:
+            # An Attendance Issue is neither Present nor Absent in any half-day count.
+            half_day.update(
+                first_half_status=ATTENDANCE_ISSUE, second_half_status=ATTENDANCE_ISSUE,
+                half_day_present="No", half_day_present_side=None,
+            )
         early_minutes, late_minutes = _going_by_minutes(day_check_out, schedule.get("scheduled_work_end_time"))
         resolved_day_status = day_status
-        if not day_check_in and not day_check_out and day_status == "Absent":
+        auto_absent = is_wfh_auto_absent(record)
+        if not day_check_in and not day_check_out and day_status == "Absent" and not auto_absent:
             resolved_day_status = "Not Marked"
             half_day["first_half_status"] = "Not Marked"
             half_day["second_half_status"] = "Not Marked"
-        if day_status not in {"Holiday", "Weekly Off", "Leave", "Medical Leave", BEFORE_JOINING} and not (not day_check_in and not day_check_out and day_status == "Absent"):
+        if day_status not in {"Holiday", "Weekly Off", "Leave", "Medical Leave", BEFORE_JOINING} and not (not day_check_in and not day_check_out and day_status == "Absent" and not auto_absent):
             # Missing both punches is Not Marked. Do not infer Absent solely
             # because a scheduled date has passed without an attendance record.
             if not issue["has_attendance_issue"] and day_completed:
@@ -668,6 +696,9 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             "late_going_by": _format_duration(late_minutes) if late_minutes is not None else "—",
             **issue,
             **half_day,
+            "is_attendance_issue": is_issue_date,
+            "attendance_issue_details": ["Missing check-out time"] if is_issue_date else issue.get("attendance_issue_details", []),
+            "is_wfh_auto_absent": auto_absent,
             "leave_type_code": record.get("leave_type_code") if record else (upcoming_leave or {}).get("leave_type_code"),
             "upcoming_leave": upcoming_leave if day_status == "Leave" else None,
             "permissions": permissions,
@@ -883,11 +914,18 @@ def _time_problem(
     if check_in and check_out and check_out <= check_in:
         return "Check-out time must be later than check-in time."
     # A correction may change recorded times but never erase them.
-    if original and original.get("status") == "Present":
+    if original and original.get("status") in {"Present", ATTENDANCE_ISSUE}:
         if original.get("check_in_time") and not check_in:
             return "Enter a check-in time; an existing check-in cannot be removed."
         if original.get("check_out_time") and not check_out:
             return "Enter a check-out time; an existing check-out cannot be removed."
+    return None
+
+
+def _issue_checkout_problem(original_status: str | None, final_status: str | None, check_out: str | None) -> str | None:
+    """An Attendance Issue is cancelled only once HR enters the missing Check-Out."""
+    if original_status == ATTENDANCE_ISSUE and final_status == "Present" and not check_out:
+        return "Enter the missing check-out time to resolve this Attendance Issue."
     return None
 
 
@@ -1274,7 +1312,7 @@ def get_attendance_request(request_id: str, authorization: str | None = Header(d
         record = attendance_collection.find_one({"user_id": request["user_id"], "attendance_date": item["attendance_date"]})
         payroll_status = _payroll_status(request.get("employee_id", ""), item["attendance_date"][:7], payroll_cache)
         lock_reason = _payroll_lock_reason(item["attendance_date"][:7], payroll_status)
-        item["current_status"] = str(record.get("status")) if record else None
+        item["current_status"] = str(record_effective_status(record)) if record else None
         item["current_check_in_time"] = _attendance_clock_hhmm(record.get("check_in_time")) if record else None
         item["current_check_out_time"] = _attendance_clock_hhmm(record.get("check_out_time")) if record else None
         for field in (
@@ -1325,6 +1363,34 @@ def get_attendance_request(request_id: str, authorization: str | None = Header(d
 
 ESSL_FIELDS = ("first_punch", "last_punch", "last_essl_sync_at", "last_essl_sync_id")
 LEAVE_FIELDS = ("leave_request_id", "leave_day_part", "leave_type_code", "medical_leave")
+
+
+def _approved_attendance_type(existing: dict[str, Any] | None, item: dict[str, Any], user_id: str, attendance_date: str) -> str | None:
+    """Keep the Office / WFH category when a request approves attendance for a date.
+
+    An issue-date request replaces a WFH or ESSL record (or an ESSL punch with no
+    record yet); the corrected date must stay in the same category.
+    """
+    existing = existing or {}
+    if existing.get("attendance_type"):
+        return existing["attendance_type"]
+    if existing.get("attendance_source") == "WFH_FACE_GPS":
+        return "WFH"
+    if existing.get("attendance_source") in {"ESSL", "MANUAL"}:
+        return "OFFICE"
+    category = str(item.get("original_attendance_category") or "").strip().casefold()
+    if category == "work from home":
+        return "WFH"
+    if category == "office":
+        return "OFFICE"
+    try:
+        day = date.fromisoformat(attendance_date)
+        start = datetime.combine(day, datetime.min.time(), tzinfo=COMPANY_TZ).astimezone(timezone.utc)
+        if db["essl_raw_punches"].find_one({"user_id": user_id, "punch_at": {"$gte": start, "$lt": start + timedelta(days=1)}}, {"_id": 1}):
+            return "OFFICE"
+    except Exception:
+        logger.exception("Unable to infer attendance type for %s on %s", user_id, attendance_date)
+    return None
 
 
 def _apply_date_decision(
@@ -1432,13 +1498,25 @@ def _apply_date_decision(
         "check_out_time": check_out,
         "punch_details_missing": final_status == "Present" and not check_in,
         "attendance_source": "ATTENDANCE_REQUEST",
-        "attendance_type": (existing or {}).get("attendance_type") if final_status in {"Present", "Half-Day Present"} else None,
+        "attendance_type": _approved_attendance_type(existing, item, user_id, attendance_date) if final_status in {"Present", "Half-Day Present"} else None,
         "attendance_request_id": request_id,
         "attendance_request_number": request.get("request_number"),
         "marked_by": str(admin["_id"]),
         "updated_at": now,
     }
     unset = {field: "" for field in ESSL_FIELDS}
+    # Approval cancels any stored Attendance Issue; the date now carries the
+    # approved status and Check-Out time.
+    unset.update({field: "" for field in ISSUE_FIELDS})
+    if item.get("original_status") == ATTENDANCE_ISSUE:
+        values["attendance_issue_resolution"] = {
+            "request_id": request_id,
+            "request_number": request.get("request_number"),
+            "resolved_by": str(admin["_id"]),
+            "resolved_at": now,
+            "original_check_in_time": item.get("original_check_in_time"),
+            "added_check_out_time": check_out,
+        }
     if half_day_fields:
         values.update(half_day_fields)
         if half_day_fields.get("leave_request_id"):
@@ -1619,7 +1697,7 @@ def _validate_decisions(request: dict[str, Any], payload: AttendanceRequestRespo
         time_problem = _time_problem(
             decision.final_status, decision.final_check_in_time, decision.final_check_out_time,
             {"status": original, "check_in_time": item.get("original_check_in_time"), "check_out_time": item.get("original_check_out_time")},
-        )
+        ) or _issue_checkout_problem(original, decision.final_status, decision.final_check_out_time)
         if time_problem:
             problems.append(f"{iso}: {time_problem}")
             continue

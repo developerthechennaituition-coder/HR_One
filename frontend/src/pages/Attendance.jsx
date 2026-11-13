@@ -928,9 +928,9 @@ function Attendance({ session }) {
                 disabled
               />
 
-              <small className="text-muted">
+             {/*  <small className="text-muted">
 Daily Attendance manages today's records. Historical Attendance Modification supports previous dates in the current month and previous three completed months, subject to payroll locks.
-              </small>
+              </small> */}
             </div>
 
               <div className="col-6 col-md-4 col-xl-2">

@@ -417,6 +417,7 @@ function UserAttendance({ session }) {
                 if (key === "half-day present") return "text-bg-info";
                 if (key === "present") return "text-bg-success";
                 if (key === "absent") return "text-bg-danger";
+                if (key === "attendance issue") return "text-bg-warning";
                 if (["leave", "medical leave"].includes(key)) return "text-bg-primary";
                 if (["holiday", "permission"].includes(key)) return "text-bg-warning";
                 if (key === "not marked") return "text-bg-light border";
@@ -444,6 +445,7 @@ function UserAttendance({ session }) {
                     ["Half-Day Present", summary.half_day_present_days ?? 0],
                     ["Present Days", summary.present_days ?? 0],
                     ["Absent Days", summary.absent_days ?? 0],
+                    ["Issue Count", summary.attendance_issue_days ?? 0],
                     ["Leave Days", summary.leave_days ?? 0],
                     ["Weekly Off Days", summary.weekly_off_days ?? 0],
                     ["Holiday Days", summary.holiday_days ?? 0],

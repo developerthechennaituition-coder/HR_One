@@ -578,6 +578,11 @@ function Profile({ onNavigate }) {
       text: "#ffffff",
     },
 
+    issue: {
+      background: "#ffc107",
+      text: "#3b2f00",
+    },
+
     leave: {
       background: "#6f42c1",
       text: "#ffffff",
@@ -1065,6 +1070,7 @@ function Profile({ onNavigate }) {
   const absentCount = attendanceCounts.absent;
   const leaveCount = attendanceCounts.leave;
   const holidayCount = attendanceCounts.holiday;
+  const issueCount = attendanceCounts.issue;
   const presentPercentage = attendancePercentages.present;
   const absentPercentage = attendancePercentages.absent;
   const leavePercentage = attendancePercentages.leave;
@@ -1764,6 +1770,10 @@ function Profile({ onNavigate }) {
                       label: "Absent",
                     },
                     {
+                      key: "issue",
+                      label: "Attendance Issue",
+                    },
+                    {
                       key: "medicalleave",
                       label: "Medical Leave (ML)",
                     },
@@ -2038,6 +2048,25 @@ function Profile({ onNavigate }) {
                     </div>
                   </div>
 
+                  {/* ATTENDANCE ISSUE */}
+
+                  <div className="col-6 col-md-3">
+                    <div className="border rounded p-3 h-100">
+                      <small className="text-muted d-block mb-1">
+                        Attendance Issue
+                      </small>
+
+                      <div
+                        className="fw-semibold"
+                        style={{ color: "#8a5a00" }}
+                      >
+                        {formatAttendanceCount(issueCount)}{" "}
+                        day
+                        {issueCount === 1 ? "" : "s"}
+                      </div>
+                    </div>
+                  </div>
+
                 </div>
 
                 {/* ==================================================
@@ -2291,10 +2320,51 @@ function Profile({ onNavigate }) {
                               </strong>
                             </p>
 
-                            <p className="text-danger mt-2 mb-0">
-                              You are absent on this date.
+                            <p className="mb-0">
+                              Status: <strong>Absent</strong>
+                              {selectedRecord?.attendance_source && (
+                                <>
+                                  {" · "}Source:{" "}
+                                  <strong>{selectedRecord.attendance_source}</strong>
+                                </>
+                              )}
                             </p>
 
+                            <p className="text-danger mt-2 mb-0">
+                              {selectedRecord?.attendance_source === "WFH_AUTO_ABSENT"
+                                ? "You did not check in within the permitted WFH time, so this date was marked Absent automatically."
+                                : "You are absent on this date."}
+                            </p>
+
+                          </div>
+                        </div>
+                      )}
+
+                    {/* ==================================================
+                        ATTENDANCE ISSUE (check-in without check-out)
+                    ================================================== */}
+
+                    {!selectedRecord?.is_approved_leave &&
+                      getStatusKey(selectedRecord) === "issue" && (
+                        <div className="card" style={{ borderColor: statusColors.issue.background }}>
+                          <div className="card-body">
+                            <h6 className="mb-2" style={{ color: "#8a5a00" }}>
+                              Attendance Issue
+                            </h6>
+                            <p className="mb-1">
+                              Date:{" "}
+                              <strong>{formatDateForDisplay(selectedAttendanceDate)}</strong>
+                            </p>
+                            <p className="mb-1">
+                              Check In:{" "}
+                              <strong>{formatAttendanceClock(selectedRecord.check_in_time) || "—"}</strong>
+                              {" · "}Check Out:{" "}
+                              <strong>Missing</strong>
+                            </p>
+                            <p className="mt-2 mb-0" style={{ color: "#8a5a00" }}>
+                              You checked in but did not check out, so this date is not counted as Present.
+                              Submit an Attendance Request (Attendance Issue) to have HR add the missing check-out time.
+                            </p>
                           </div>
                         </div>
                       )}

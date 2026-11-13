@@ -35,6 +35,9 @@ const getAttendanceType = (record) => {
   if (record?.attendance_type === "WFH" || record?.attendance_source === "WFH_FACE_GPS") {
     return "Work From Home";
   }
+  if (record?.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(record?.attendance_source)) {
+    return "Work From Office";
+  }
   if (record?.attendance_source === "ATTENDANCE_REQUEST") return "Not Recorded";
   if (record?.attendance_type === "OFFICE" || record?.attendance_source) {
     return "Work From Office";

@@ -425,7 +425,8 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
         "attendance_date": {"$gte": start, "$lte": end},
     }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1, "medical_leave": 1,
         "first_half_status": 1, "second_half_status": 1, "check_in_time": 1, "check_out_time": 1,
-        "attendance_source": 1, "hr_admin_modified": 1, "approved_permission": 1}))
+        "attendance_source": 1, "hr_admin_modified": 1, "approved_permission": 1,
+        "scheduled_work_start_time": 1, "scheduled_work_end_time": 1}))
 
     leave_codes = {
         str(row.get("leave_type_code") or "").upper()
@@ -451,12 +452,17 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     # portions so a Present + Absent/Leave day is never counted as a full Present.
     day_status: dict[str, tuple[str, bool, float]] = {}
     half_day_parts_by_date: dict[str, list[tuple[str, bool, float]]] = {}
-    half_status_values = {"present", "absent", "leave", "medical leave", "holiday", "weekly off", "not applicable", "not marked"}
+    half_status_values = {"present", "absent", "leave", "medical leave", "holiday", "weekly off", "not applicable", "not marked", "attendance issue"}
+    from app.attendance import record_effective_status
     for row in records:
         day = str(row.get("attendance_date") or "")
         if not day:
             continue
-        status_value = str(row.get("status") or "").strip().casefold()
+        # Present with a Check-In but no Check-Out is an Attendance Issue; it is
+        # never counted as Present or paid until HR resolves it.
+        status_value = str(record_effective_status(row) or "").strip().casefold()
+        if status_value == "attendance issue":
+            row = {**row, "status": "Attendance Issue", "first_half_status": "Attendance Issue", "second_half_status": "Attendance Issue"}
         first_half = str(row.get("first_half_status") or "").strip().casefold()
         second_half = str(row.get("second_half_status") or "").strip().casefold()
         if employee_user and (not (first_half in half_status_values and second_half in half_status_values) or (str(row.get("attendance_source") or "").upper() in {"ESSL", "WFH_FACE_GPS"} and not row.get("hr_admin_modified"))):
@@ -514,6 +520,8 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
                     parts.append(("present", True, 0.5))
                 elif half_status == "absent":
                     parts.append(("absent", False, 0.5))
+                elif half_status == "attendance issue":
+                    parts.append(("attendance_issue", False, 0.5))
                 elif half_status == "holiday":
                     parts.append(("holiday", True, 0.5))
                 elif half_status == "weekly off":
@@ -536,6 +544,8 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
             day_status[day] = ("present", True, 1.0)
         elif status_value == "holiday":
             day_status[day] = ("holiday", True, 1.0)
+        elif status_value == "attendance issue":
+            day_status[day] = ("attendance_issue", False, 1.0)
         elif status_value == "absent":
             day_status.setdefault(day, ("absent", False, 1.0))
         elif status_value == "not applicable":
@@ -667,11 +677,13 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     medical_leave = _portion_total("medical_leave")
     payable_days = min(float(days_in_month), present + paid_leave + holiday + weekly_off + medical_leave)
     not_applicable = _portion_total("not_applicable")
-    lop = absent + unpaid_leave + not_applicable
+    attendance_issue_days = _portion_total("attendance_issue")
+    lop = absent + unpaid_leave + not_applicable + attendance_issue_days
 
     return {
         "employee_id": employee_id, "month": month, "year": year, "calendar_days": days_in_month,
         "present_days": round(present, 2), "absent_days": round(absent, 2),
+        "attendance_issue_days": round(attendance_issue_days, 2),
         "paid_leave_days": round(paid_leave, 2), "unpaid_leave_days": round(unpaid_leave, 2),
         "holiday_days": round(holiday, 2),
         "weekly_off_days": round(weekly_off, 2), "medical_leave_days": round(medical_leave, 2),
@@ -679,7 +691,7 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
         "working_days": round(present + absent + paid_leave + unpaid_leave + medical_leave, 2),
         "lop_days": round(lop, 2), "paid_days": round(payable_days, 2),
         "recorded_attendance_days": len(day_status),
-        "review": "Payable days are present days + approved paid leave + eligible holidays + weekly offs + medical leave. Unpaid leave, absences and Not Applicable days are Loss of Pay.",
+        "review": "Payable days are present days + approved paid leave + eligible holidays + weekly offs + medical leave. Unpaid leave, absences, Attendance Issue dates (until HR resolves them) and Not Applicable days are Loss of Pay.",
     }
 
 

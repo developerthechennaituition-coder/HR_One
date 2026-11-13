@@ -53,6 +53,15 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
   const [paymentRef, setPaymentRef] = useState({});
   const [search, setSearch] = useState("");
   const [departmentFilter, setDepartmentFilter] = useState("");
+  // Paid-day Review is the source of truth for Monthly Payroll Records filters.
+  const [reviewSearch, setReviewSearch] = useState("");
+  const [reviewDepartment, setReviewDepartment] = useState("");
+  const [reviewEmployeeFilter, setReviewEmployeeFilter] = useState("");
+  const [recordSearch, setRecordSearch] = useState("");
+  const [recordDepartment, setRecordDepartment] = useState("");
+  const [recordEmployeeFilter, setRecordEmployeeFilter] = useState("");
+  const [payslipEmployeeFilter, setPayslipEmployeeFilter] = useState("");
+  const [detailsEmployeeId, setDetailsEmployeeId] = useState("");
   const [reviewStatusFilter, setReviewStatusFilter] = useState("");
   const [recordStatusFilter, setRecordStatusFilter] = useState("");
   const [employeePage, setEmployeePage] = useState(1);
@@ -100,6 +109,18 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
     ...records.map((row) => row.department),
     ...slips.map((row) => row.department),
   ].map((value) => String(value || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const reviewEmployeeOptions = useMemo(() => activeEmployees
+    .filter((employee) => !reviewDepartment || String(employee.department || "").trim() === reviewDepartment)
+    .sort((a, b) => String(a.name || a.employee_id).localeCompare(String(b.name || b.employee_id))),
+  [activeEmployees, reviewDepartment]);
+  const recordEmployeeOptions = useMemo(() => employees
+    .filter((employee) => !recordDepartment || String(employee.department || "").trim() === recordDepartment)
+    .sort((a, b) => String(a.name || a.employee_id).localeCompare(String(b.name || b.employee_id))),
+  [employees, recordDepartment]);
+  const payslipEmployeeOptions = useMemo(() => employees
+    .filter((employee) => !departmentFilter || String(employee.department || "").trim() === departmentFilter)
+    .sort((a, b) => String(a.name || a.employee_id).localeCompare(String(b.name || b.employee_id))),
+  [employees, departmentFilter]);
   // Status shown in the Paid-Day Review "Review & Calculate" column (same values as the cell badge).
   const reviewStatusOf = useCallback((employeeId) => {
     const record = records.find((row) => row.employee_id === employeeId);
@@ -117,28 +138,58 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
     return [...base, ...new Set(extra)];
   }, [records]);
   const visibleEmployees = useMemo(() => {
-    const query = search.trim().toLowerCase();
+    const query = reviewSearch.trim().toLowerCase();
     return activeEmployees.filter((employee) =>
       (!query || [employee.employee_id, employee.name]
         .some((value) => String(value || "").toLowerCase().includes(query))) &&
-      (!departmentFilter || String(employee.department || "").trim() === departmentFilter) &&
+      (!reviewDepartment || String(employee.department || "").trim() === reviewDepartment) &&
+      (!reviewEmployeeFilter || employee.employee_id === reviewEmployeeFilter) &&
       (!reviewStatusFilter || reviewStatusOf(employee.employee_id) === reviewStatusFilter),
     );
-  }, [activeEmployees, search, departmentFilter, reviewStatusFilter, reviewStatusOf]);
+  }, [activeEmployees, reviewSearch, reviewDepartment, reviewEmployeeFilter, reviewStatusFilter, reviewStatusOf]);
   const visibleRows = useMemo(() => {
     const rows = mode === "payslips" ? slips : records;
-    const query = search.trim().toLowerCase();
+    const query = (mode === "monthly" ? recordSearch : search).trim().toLowerCase();
+    const department = mode === "monthly" ? recordDepartment : departmentFilter;
+    const employeeFilter = mode === "monthly" ? recordEmployeeFilter : payslipEmployeeFilter;
     return rows.filter((row) =>
       (!query || [row.employee_id, row.employee_name]
         .some((value) => String(value || "").toLowerCase().includes(query))) &&
-      (!departmentFilter || String(row.department || "").trim() === departmentFilter) &&
+      (!department || String(row.department || "").trim() === department) &&
+      (!employeeFilter || row.employee_id === employeeFilter) &&
       (mode !== "monthly" || !recordStatusFilter || String(row.status || "") === recordStatusFilter),
     );
-  }, [mode, records, slips, search, departmentFilter, recordStatusFilter]);
+  }, [mode, records, slips, search, departmentFilter, recordSearch, recordDepartment, recordStatusFilter, recordEmployeeFilter, payslipEmployeeFilter]);
   const pageSize = 10;
   const pageEmployees = visibleEmployees.slice((employeePage - 1) * pageSize, employeePage * pageSize);
   const pageRows = visibleRows.slice((recordPage - 1) * pageSize, recordPage * pageSize);
-  useEffect(() => { setEmployeePage(1); setRecordPage(1); }, [search, departmentFilter, reviewStatusFilter, recordStatusFilter, mode]);
+  useEffect(() => { setEmployeePage(1); }, [reviewSearch, reviewDepartment, reviewEmployeeFilter, reviewStatusFilter, mode]);
+  useEffect(() => { setRecordPage(1); }, [search, departmentFilter, recordSearch, recordDepartment, recordStatusFilter, recordEmployeeFilter, payslipEmployeeFilter, mode]);
+  const reviewFiltersActive = Boolean(reviewSearch || reviewDepartment || reviewEmployeeFilter || reviewStatusFilter);
+  const recordFiltersActive = Boolean(recordSearch || recordDepartment || recordEmployeeFilter || recordStatusFilter);
+  const resetReviewFilters = () => { setReviewSearch(""); setReviewDepartment(""); setReviewEmployeeFilter(""); setReviewStatusFilter(""); setEmployeePage(1); };
+  const resetRecordFilters = () => {
+    setReviewSearch(""); setReviewDepartment(""); setReviewEmployeeFilter(""); setReviewStatusFilter("");
+    setRecordSearch(""); setRecordDepartment(""); setRecordEmployeeFilter(""); setRecordStatusFilter("");
+    setRecordPage(1);
+  };
+  // Keep Monthly Payroll Records aligned with the filters selected in Paid-day Review.
+  // This also keeps employee selection dependent on the selected department.
+  useEffect(() => {
+    setRecordSearch(reviewSearch);
+    setRecordDepartment(reviewDepartment);
+    setRecordEmployeeFilter(reviewEmployeeFilter);
+    setRecordStatusFilter(reviewStatusFilter);
+    setRecordPage(1);
+  }, [reviewSearch, reviewDepartment, reviewEmployeeFilter, reviewStatusFilter]);
+
+  const resetPayslipFilters = () => {
+    setSearch("");
+    setDepartmentFilter("");
+    setPayslipEmployeeFilter("");
+    setRecordPage(1);
+  };
+  const detailsEmployee = detailsEmployeeId ? employees.find((row) => row.employee_id === detailsEmployeeId) : null;
   const paidCount = records.filter((row) => row.status === "Paid").length;
   const calculatedCount = records.filter((row) => row.status === "Calculated").length;
   const profileCount = salaryProfiles.filter((profile) => profile.employee_id).length;
@@ -259,29 +310,38 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
         <section className="payroll-panel payroll-review-panel">
           <div className="payroll-section-heading"><div><h2><Icon name="calendar2-check" /> Paid-day review</h2><p>Confirm attendance values before calculating salaries.</p></div><span className="payroll-info-chip"><Icon name="info-circle" /> Company attendance rules must be verified</span></div>
           <div className="payroll-alert payroll-alert-warning"><Icon name="info-circle" /><span>Payable days = Present + Approved Paid Leave + Eligible Holidays + Weekly Offs + Medical Leave. Not Applicable days set by HR Admin are added to Loss of Pay. Salary is prorated in the backend as Monthly Salary ÷ Calendar Days in the selected month × Payable Days. Unpaid leave and absences are not payable; avoid counting the same date twice.</span></div>
-          <div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Search payroll data" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search employee ID, name" /></label><select className="form-select" aria-label="Filter by department" value={departmentFilter} onChange={(event) => setDepartmentFilter(event.target.value)} style={{ maxWidth: 240 }}>
+          <div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Filter paid-day review by employee" value={reviewSearch} onChange={(event) => setReviewSearch(event.target.value)} placeholder="Search employee ID, name" /></label><select className="form-select" aria-label="Filter paid-day review by department" value={reviewDepartment} onChange={(event) => { setReviewDepartment(event.target.value); setReviewEmployeeFilter(""); }} style={{ maxWidth: 240 }}>
             <option value="">All Departments</option>
             {departmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
-          </select><span className="payroll-result-count">{visibleEmployees.length} employees · {attendanceSummary.length} salary profiles with effective dates</span></div>
-          <div className="payroll-table-wrap"><table className="payroll-table"><thead><tr><th><input type="checkbox" aria-label="Select all eligible employees" checked={visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).length > 0 && visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).every((employee) => selectedEmployeeIds.includes(employee.employee_id))} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th>{["Employee ID", "Employee Name", "Department", "Present", "Paid Leave", "Unpaid Leave", "Holidays", "Weekly Off", "Medical Leave", "Absent", "Working Days", "Payable Days (review)", "LOP Days (review)", "OT Amount (₹)", "Estimated Salary"].map((label) => <th key={label}>{label}</th>)}<th className="payroll-th-filter"><span>Review &amp; Calculate</span><select className="payroll-column-filter" aria-label="Filter by Review & Calculate status" value={reviewStatusFilter} onChange={(event) => setReviewStatusFilter(event.target.value)}><option value="">All statuses</option>{reviewStatusOptions.map((status) => <option key={status} value={status}>{status}</option>)}</select></th></tr></thead><tbody>
-            {pageEmployees.map((employee) => { const attendance = attendanceSummary.find((row) => row.employee_id === employee.employee_id); const profile = salaryProfiles.find((row) => row.employee_id === employee.employee_id); const payrollRecord = records.find((row) => row.employee_id === employee.employee_id); const isCalculated = Boolean(payrollRecord); const canCalculate = Boolean(profile) && String(profile.effective_from || "").slice(0, 7) <= periodKey && !isCalculated; const daysInMonth = new Date(Number(year), Number(month), 0).getDate(); const payableDays = Number(paidDays[employee.employee_id] ?? attendance?.paid_days ?? 0); const estimatedSalary = Number(profile?.monthly_salary || 0) * (profile?.attendance_deduction_enabled === false ? 1 : Math.max(0, Math.min(daysInMonth, payableDays)) / daysInMonth) + Number(overtimeAmounts[employee.employee_id] || 0); return <tr key={employee.employee_id}><td>{isCalculated ? <Icon name="check-circle-fill" className="payroll-calculated-check" /> : canCalculate ? <input type="checkbox" aria-label={`Select ${employee.employee_id} for payroll calculation`} checked={selectedEmployeeIds.includes(employee.employee_id)} onChange={(event) => toggleEmployeeSelection(employee.employee_id, event.target.checked)} /> : <span title="Configure an effective salary profile first">—</span>}</td><td className="payroll-id">{employee.employee_id}</td><td>{employee.name || "—"}</td><td>{employee.department || "—"}</td><td>{attendance?.present_days ?? "—"}</td><td>{attendance?.paid_leave_days ?? "—"}</td><td>{attendance?.unpaid_leave_days ?? "—"}</td><td>{attendance?.holiday_days ?? "—"}</td><td>{attendance?.weekly_off_days ?? "—"}</td><td>{attendance?.medical_leave_days ?? "—"}</td><td>{attendance?.absent_days ?? "—"}</td><td>{attendance?.working_days ?? "—"}</td><td><input aria-label={`Payable days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="No profile" value={paidDays[employee.employee_id] ?? ""} onChange={(event) => setPaidDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`LOP days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="0" value={lopDays[employee.employee_id] ?? ""} onChange={(event) => setLopDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`Overtime amount for ${employee.employee_id}`} className="payroll-number-input payroll-overtime-input" type="number" min="0" max="999999999.99" step="0.01" placeholder="0.00" value={overtimeAmounts[employee.employee_id] ?? "0"} onChange={(event) => setOvertimeAmounts((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td className="payroll-net">{profile ? money(estimatedSalary, profile.currency || "INR") : "—"}</td><td>{isCalculated ? <span className="payroll-status payroll-status-calculated">{payrollRecord.status}</span> : <span className="payroll-status payroll-status-pending">{profile ? "Pending" : "Salary setup required"}</span>}</td></tr>; })}
-            {!visibleEmployees.length && <tr><td colSpan="17" className="payroll-empty"><Icon name="people" /><strong>No employees found</strong><span>Try a different search or add employees in Employee Master.</span></td></tr>}
+          </select><select className="form-select" aria-label="Filter paid-day review by employee" value={reviewEmployeeFilter} onChange={(event) => setReviewEmployeeFilter(event.target.value)} style={{ maxWidth: 260 }}>
+            <option value="">All Employees</option>
+            {reviewEmployeeOptions.map((employee) => <option key={employee.employee_id} value={employee.employee_id}>{employee.name || employee.employee_id} ({employee.employee_id})</option>)}
+          </select><button type="button" className="payroll-button payroll-button-outline" onClick={resetReviewFilters} disabled={!reviewFiltersActive} title="Clear the employee, department and status filters"><Icon name="arrow-counterclockwise" /> Reset</button><span className="payroll-result-count">{visibleEmployees.length} employees · {attendanceSummary.length} salary profiles with effective dates</span></div>
+          <div className="payroll-table-wrap"><table className="payroll-table"><thead><tr><th><input type="checkbox" aria-label="Select all eligible employees" checked={visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).length > 0 && visibleEmployees.filter((employee) => salaryProfiles.some((profile) => profile.employee_id === employee.employee_id && String(profile.effective_from || "").slice(0, 7) <= periodKey) && !records.some((row) => row.employee_id === employee.employee_id)).every((employee) => selectedEmployeeIds.includes(employee.employee_id))} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th>{["Employee ID", "Employee Name", "Department", "View Details", "Payable Days (review)", "LOP Days (review)", "OT Amount (₹)", "Estimated Salary"].map((label) => <th key={label}>{label}</th>)}<th className="payroll-th-filter"><span>Review &amp; Calculate</span><select className="payroll-column-filter" aria-label="Filter by Review & Calculate status" value={reviewStatusFilter} onChange={(event) => setReviewStatusFilter(event.target.value)}><option value="">All statuses</option>{reviewStatusOptions.map((status) => <option key={status} value={status}>{status}</option>)}</select></th></tr></thead><tbody>
+            {pageEmployees.map((employee) => { const attendance = attendanceSummary.find((row) => row.employee_id === employee.employee_id); const profile = salaryProfiles.find((row) => row.employee_id === employee.employee_id); const payrollRecord = records.find((row) => row.employee_id === employee.employee_id); const isCalculated = Boolean(payrollRecord); const canCalculate = Boolean(profile) && String(profile.effective_from || "").slice(0, 7) <= periodKey && !isCalculated; const daysInMonth = new Date(Number(year), Number(month), 0).getDate(); const payableDays = Number(paidDays[employee.employee_id] ?? attendance?.paid_days ?? 0); const estimatedSalary = Number(profile?.monthly_salary || 0) * (profile?.attendance_deduction_enabled === false ? 1 : Math.max(0, Math.min(daysInMonth, payableDays)) / daysInMonth) + Number(overtimeAmounts[employee.employee_id] || 0); return <tr key={employee.employee_id}><td>{isCalculated ? <Icon name="check-circle-fill" className="payroll-calculated-check" /> : canCalculate ? <input type="checkbox" aria-label={`Select ${employee.employee_id} for payroll calculation`} checked={selectedEmployeeIds.includes(employee.employee_id)} onChange={(event) => toggleEmployeeSelection(employee.employee_id, event.target.checked)} /> : <span title="Configure an effective salary profile first">—</span>}</td><td className="payroll-id">{employee.employee_id}</td><td>{employee.name || "—"}</td><td>{employee.department || "—"}</td><td><button type="button" className="payroll-button payroll-button-outline" disabled={!profile} title={profile ? "View attendance details" : "Salary setup required"} aria-label={`View attendance details for ${employee.employee_id}`} onClick={() => setDetailsEmployeeId(employee.employee_id)}><Icon name="eye" /> View Details</button></td><td><input aria-label={`Payable days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="No profile" value={paidDays[employee.employee_id] ?? ""} onChange={(event) => setPaidDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`LOP days for ${employee.employee_id}`} className="payroll-number-input" type="number" min="0" max={daysInMonth} step="0.5" placeholder="0" value={lopDays[employee.employee_id] ?? ""} onChange={(event) => setLopDays((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td><input aria-label={`Overtime amount for ${employee.employee_id}`} className="payroll-number-input payroll-overtime-input" type="number" min="0" max="999999999.99" step="0.01" placeholder="0.00" value={overtimeAmounts[employee.employee_id] ?? "0"} onChange={(event) => setOvertimeAmounts((state) => ({ ...state, [employee.employee_id]: event.target.value }))} /></td><td className="payroll-net">{profile ? money(estimatedSalary, profile.currency || "INR") : "—"}</td><td>{isCalculated ? <span className="payroll-status payroll-status-calculated">{payrollRecord.status}</span> : <span className="payroll-status payroll-status-pending">{profile ? "Pending" : "Salary setup required"}</span>}</td></tr>; })}
+            {!visibleEmployees.length && <tr><td colSpan="10" className="payroll-empty"><Icon name="people" /><strong>No employees found</strong><span>Try a different search or add employees in Employee Master.</span></td></tr>}
           </tbody></table></div>
           <Pagination page={employeePage} totalItems={visibleEmployees.length} pageSize={pageSize} onPageChange={setEmployeePage} />
           <div className="payroll-panel-footer"><span>Estimated salary uses the calendar-day proration rule; final amount is calculated and validated by the backend.</span><button disabled={busy || !selectedEmployeeIds.length} type="button" className="payroll-button payroll-button-primary" onClick={runCalculation}><Icon name={busy ? "arrow-repeat" : "calculator"} /> {busy ? "Calculating…" : `Review & Calculate Payroll (${selectedEmployeeIds.length})`}</button></div>
         </section>
-        <section className="payroll-panel"><div className="payroll-section-heading"><div><h2>Monthly Payroll Records</h2><p>Approve, process and confirm payment for calculated records.</p></div></div><div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Search payroll data" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search employee ID, name" /></label><select className="form-select" aria-label="Filter by department" value={departmentFilter} onChange={(event) => setDepartmentFilter(event.target.value)} style={{ maxWidth: 240 }}>
+        <section className="payroll-panel"><div className="payroll-section-heading"><div><h2>Monthly Payroll Records</h2><p>Approve, process and confirm payment for calculated records.</p></div></div><div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Filter payroll records by employee" value={recordSearch} onChange={(event) => { setRecordSearch(event.target.value); setReviewSearch(event.target.value); }} placeholder="Search employee ID, name" /></label><select className="form-select" aria-label="Filter payroll records by department" value={recordDepartment} onChange={(event) => { setRecordDepartment(event.target.value); setReviewDepartment(event.target.value); setRecordEmployeeFilter(""); setReviewEmployeeFilter(""); }} style={{ maxWidth: 240 }}>
             <option value="">All Departments</option>
             {departmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
-          </select></div><PayrollTable statusFilter={recordStatusFilter} onStatusFilter={setRecordStatusFilter} statusOptions={recordStatusOptions} rows={pageRows} mode="monthly" money={money} onAction={handleStatusAction} onReview={setReviewRow} paymentRef={paymentRef} setPaymentRef={setPaymentRef} />
+          </select><select className="form-select" aria-label="Filter payroll records by employee" value={recordEmployeeFilter} onChange={(event) => { setRecordEmployeeFilter(event.target.value); setReviewEmployeeFilter(event.target.value); }} style={{ maxWidth: 260 }}>
+            <option value="">All Employees</option>
+            {recordEmployeeOptions.map((employee) => <option key={employee.employee_id} value={employee.employee_id}>{employee.name || employee.employee_id} ({employee.employee_id})</option>)}
+          </select><button type="button" className="payroll-button payroll-button-outline" onClick={resetRecordFilters} disabled={!recordFiltersActive} title="Clear the employee, department and status filters"><Icon name="arrow-counterclockwise" /> Reset</button><span className="payroll-result-count">{visibleRows.length} records</span></div><PayrollTable statusFilter={recordStatusFilter} onStatusFilter={(value) => { setRecordStatusFilter(value); setReviewStatusFilter(value); }} statusOptions={recordStatusOptions} rows={pageRows} mode="monthly" money={money} onAction={handleStatusAction} onReview={setReviewRow} paymentRef={paymentRef} setPaymentRef={setPaymentRef} />
         <Pagination page={recordPage} totalItems={visibleRows.length} pageSize={pageSize} onPageChange={setRecordPage} /></section>
       </>}
       {mode === "payslips" && <section className="payroll-panel">
         <div className="payroll-section-heading"><div><h2><Icon name="file-earmark-pdf" /> Generated Payslips</h2><p>Only available payslips for the selected payroll period are shown.</p></div></div>
-        <div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Search payroll data" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search employee ID, name" /></label><select className="form-select" aria-label="Filter by department" value={departmentFilter} onChange={(event) => setDepartmentFilter(event.target.value)} style={{ maxWidth: 240 }}>
+        <div className="payroll-toolbar"><label className="payroll-search"><Icon name="search" /><input type="search" aria-label="Search payroll data" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search employee ID, name" /></label><select className="form-select" aria-label="Filter by department" value={departmentFilter} onChange={(event) => { setDepartmentFilter(event.target.value); setPayslipEmployeeFilter(""); }} style={{ maxWidth: 240 }}>
             <option value="">All Departments</option>
             {departmentOptions.map((department) => <option key={department} value={department}>{department}</option>)}
-          </select><span className="payroll-result-count">{visibleRows.length} payslips</span></div>
+          </select><select className="form-select" aria-label="Filter payslips by employee" value={payslipEmployeeFilter} onChange={(event) => setPayslipEmployeeFilter(event.target.value)} style={{ maxWidth: 260 }}>
+            <option value="">All Employees</option>
+            {payslipEmployeeOptions.map((employee) => <option key={employee.employee_id} value={employee.employee_id}>{employee.name || employee.employee_id} ({employee.employee_id})</option>)}
+          </select><button type="button" className="payroll-button payroll-button-outline" onClick={resetPayslipFilters} disabled={!search && !departmentFilter && !payslipEmployeeFilter} title="Clear the search, department and employee filters"><Icon name="arrow-counterclockwise" /> Reset</button><span className="payroll-result-count">{visibleRows.length} payslips</span></div>
         <div className="payroll-table-wrap"><table className="payroll-table"><thead><tr>{["Employee ID", "Employee Name", "Department", "Gross Earnings", "Deductions", "Net Salary", "Status", "Action"].map((label) => <th key={label}>{label}</th>)}</tr></thead><tbody>
           {pageRows.map((row) => <tr key={row.id || row.payroll_record_id}><td className="payroll-id">{row.employee_id}</td><td>{row.employee_name || "—"}</td><td>{row.department || "—"}</td><td>{money(row.gross_earnings, row.currency)}</td><td>{money(row.total_deductions, row.currency)}</td><td className="payroll-net">{money(row.net_salary, row.currency)}</td><td><StatusBadge status={row.status} /></td><td><div className="payroll-row-actions"><button type="button" className="payroll-button payroll-button-outline" disabled={!(["Paid", "Available"].includes(String(row.status || "").trim())) || busy} title="View payslip PDF" onClick={() => handlePreviewPayslip(row)}><Icon name="eye" /> View</button><button type="button" className="payroll-button payroll-button-primary" disabled={!(["Paid", "Available"].includes(String(row.status || "").trim()))} title={!(["Paid", "Available"].includes(String(row.status || "").trim())) ? "Payslip download is available after payment is confirmed" : "Download payslip PDF"} onClick={() => downloadPayslip(row.payroll_record_id || row.id, row.employee_name, row.employee_id, row.period).catch((requestError) => setError(requestError.message || "Unable to download payslip."))}><Icon name="download" /> Download PDF</button></div></td></tr>)}
           {!visibleRows.length && <tr><td colSpan="8" className="payroll-empty"><Icon name="file-earmark-x" /><strong>No payslips found</strong><span>Choose another month or confirm payroll has been marked as paid.</span></td></tr>}
@@ -298,6 +358,32 @@ export default function PayrollWorkspace({ mode = "monthly", onNavigate }) {
           onClose={closePreview}
         />
       )}
+      {detailsEmployee && (() => {
+        const attendance = attendanceSummary.find((row) => row.employee_id === detailsEmployee.employee_id);
+        const value = (field) => attendance?.[field] ?? "—";
+        return <div className="payroll-modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setDetailsEmployeeId(""); }}>
+          <section className="payroll-review-modal" role="dialog" aria-modal="true" aria-label={`Attendance details for ${detailsEmployee.name || detailsEmployee.employee_id}`}>
+            <header className="payroll-review-modal-header">
+              <div><h2><Icon name="calendar2-check" /> Attendance Details</h2><p>{detailsEmployee.name || detailsEmployee.employee_id} · {detailsEmployee.employee_id} · {MONTHS.find((item) => item.value === month)?.label} {year}</p></div>
+              <button type="button" className="payroll-button payroll-button-outline" onClick={() => setDetailsEmployeeId("")}><Icon name="x-lg" /> Close</button>
+            </header>
+            <div className="payroll-review-detail-grid">
+              <div><span>Department</span><strong>{detailsEmployee.department || "—"}</strong></div>
+              <div><span>Present</span><strong>{value("present_days")}</strong></div>
+              <div><span>Paid Leave</span><strong>{value("paid_leave_days")}</strong></div>
+              <div><span>Unpaid Leave</span><strong>{value("unpaid_leave_days")}</strong></div>
+              <div><span>Holidays</span><strong>{value("holiday_days")}</strong></div>
+              <div><span>Weekly Off</span><strong>{value("weekly_off_days")}</strong></div>
+              <div><span>Medical Leave</span><strong>{value("medical_leave_days")}</strong></div>
+              <div><span>Absent</span><strong>{value("absent_days")}</strong></div>
+              <div><span>Working Days</span><strong>{value("working_days")}</strong></div>
+              <div><span>Payable Days (Review)</span><strong>{paidDays[detailsEmployee.employee_id] || value("paid_days")}</strong></div>
+              <div><span>LOP Days (Review)</span><strong>{lopDays[detailsEmployee.employee_id] || value("lop_days")}</strong></div>
+            </div>
+            {!attendance && <div className="payroll-alert payroll-alert-warning"><Icon name="info-circle" /><span>No attendance summary is available for this employee in the selected month.</span></div>}
+          </section>
+        </div>;
+      })()}
       {reviewRow && <div className="payroll-modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setReviewRow(null); }}>
         <section className="payroll-review-modal" role="dialog" aria-modal="true" aria-label={`Review payroll for ${reviewRow.employee_name || reviewRow.employee_id}`}>
           <header className="payroll-review-modal-header">

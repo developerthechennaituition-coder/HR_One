@@ -73,6 +73,10 @@ from app.weekly_off_planner import (
     validate_weekly_off_selection,
 )
 from app.attendance_calculations import (
+    ATTENDANCE_ISSUE_STATUS,
+    effective_attendance_status,
+    is_attendance_issue_status,
+    missing_checkout_issue,
     calculate_half_day_portions,
     classify_half_day,
     combine_half_day_statuses,
@@ -181,6 +185,40 @@ def company_today() -> date:
     Current company-local date.
     """
     return company_now().date()
+
+
+def record_effective_status(record: dict[str, Any] | None, now: datetime | None = None) -> str:
+    """Status of a stored attendance record as every view and count must show it.
+
+    A Present record that has a Check-In but no Check-Out once the day is over is an
+    Attendance Issue (never Present). Everything else is returned unchanged.
+    """
+    record = record or {}
+    stored = str(record.get("status") or "")
+    # Confirmed WFH automatic absence: a legacy row whose top-level status still says
+    # Not Marked is Absent. Display/count only; stored (e.g. payroll-locked) rows are not rewritten.
+    if (
+        is_wfh_auto_absent(record)
+        and stored.strip().casefold() in {"", "not marked", "not_marked"}
+        and not (record.get("check_in_time") or record.get("check_out_time"))
+    ):
+        return "Absent"
+    return effective_attendance_status(
+        stored,
+        check_in=record.get("check_in_time") or record.get("check_in_at"),
+        check_out=record.get("check_out_time") or record.get("check_out_at"),
+        attendance_date=record.get("attendance_date") or "",
+        now=(now or company_now()),
+        scheduled_start=record.get("scheduled_work_start_time"),
+        scheduled_end=record.get("scheduled_work_end_time"),
+    ) or stored
+
+
+def is_wfh_auto_absent(record: dict[str, Any] | None) -> bool:
+    """Absent created by the WFH missed-check-in sweep (a real Absent, never 'Not Marked')."""
+    return bool(record) and (
+        record.get("attendance_source") == "WFH_AUTO_ABSENT" or bool(record.get("wfh_auto_absent"))
+    )
 
 
 def employee_joining_date(user: dict[str, Any]) -> date | None:
@@ -533,7 +571,7 @@ def _is_automatic_attendance_record(record: dict[str, Any] | None) -> bool:
     if not record:
         return True
     source = str(record.get("attendance_source") or "").upper()
-    return source in {"ESSL", "WFH_FACE_GPS"} and not record.get("hr_admin_modified")
+    return source in {"ESSL", "WFH_FACE_GPS", "WFH_AUTO_ABSENT"} and not record.get("hr_admin_modified")
 
 
 def _preserve_saved_half_day_status(record: dict[str, Any] | None) -> bool:
@@ -541,7 +579,7 @@ def _preserve_saved_half_day_status(record: dict[str, Any] | None) -> bool:
     if not record:
         return False
     source = str(record.get("attendance_source") or "").upper()
-    return bool(record.get("hr_admin_modified") or source in {"MANUAL", "ADMIN", "ATTENDANCE_REQUEST"})
+    return bool(record.get("hr_admin_modified") or source in {"MANUAL", "ADMIN", "ATTENDANCE_REQUEST", "WFH_AUTO_ABSENT"})
 
 
 
@@ -1060,9 +1098,13 @@ def _to_response(
             "attendance_date",
             "",
         ),
-        "status": record.get(
+        "status": record_effective_status(record) or record.get(
             "status",
             "Absent",
+        ),
+        "has_attendance_issue": is_attendance_issue_status(record_effective_status(record)),
+        "attendance_issue_details": (
+            ["Missing check-out time"] if is_attendance_issue_status(record_effective_status(record)) else []
         ),
         "check_in_time": _attendance_clock_hhmm(record.get("check_in_time")),
         "check_out_time": _attendance_clock_hhmm(record.get("check_out_time")),
@@ -1991,7 +2033,14 @@ def generate_due_wfh_absences(now: datetime | None = None) -> dict[str, int]:
     Existing attendance (including holidays, weekly offs, leave and manual entries)
     is authoritative. Finalized payroll periods are never changed.
     """
-    now_local = (now or company_now()).astimezone(COMPANY_TZ)
+    now_value = now or company_now()
+    # Treat naive test/maintenance timestamps as organization-local rather than
+    # letting the host server timezone silently shift the WFH deadline.
+    now_local = (
+        now_value.replace(tzinfo=COMPANY_TZ)
+        if now_value.tzinfo is None
+        else now_value.astimezone(COMPANY_TZ)
+    )
     today = now_local.date()
     created = skipped = 0
     employees = users_collection.find({
@@ -2065,33 +2114,106 @@ def generate_due_wfh_absences(now: datetime | None = None) -> dict[str, int]:
                 cursor += timedelta(days=1)
                 continue
             key = {"user_id": user_id, "attendance_date": date_iso}
-            # Do not replace an existing Present/Leave/Holiday/Weekly Off/manual decision.
+            # A date may already have a placeholder attendance row (Not Marked).
+            # Promote only that placeholder to WFH_AUTO_ABSENT; never overwrite a
+            # real Present/Leave/Holiday/Weekly Off/manual attendance decision.
+            absent_fields = {
+                "status": "Absent",
+                "attendance_type": "WFH",
+                "attendance_source": "WFH_AUTO_ABSENT",
+                "wfh_auto_absent": True,
+                "wfh_scheduled_end_time": absence_end_clock.strftime("%H:%M"),
+                "marked_by": "system",
+                "updated_at": now_local.astimezone(timezone.utc),
+            }
             try:
-                result = attendance_collection.update_one(
-                    key,
-                    {"$setOnInsert": {
-                        "user_id": user_id,
-                        "employee_id": employee_id,
-                        "attendance_date": date_iso,
-                        "status": "Absent",
-                        "check_in_time": None,
-                        "check_out_time": None,
-                        "attendance_type": "WFH",
-                        "attendance_source": "WFH_AUTO_ABSENT",
-                        "wfh_auto_absent": True,
-                        "wfh_scheduled_end_time": absence_end_clock.strftime("%H:%M"),
-                        "marked_by": "system",
-                        "created_at": now_local.astimezone(timezone.utc),
-                        "updated_at": now_local.astimezone(timezone.utc),
-                    }},
-                    upsert=True,
+                promoted = attendance_collection.update_one(
+                    {**key, "status": {"$in": ["Not Marked", "not marked", "not_marked"]}},
+                    {"$set": absent_fields},
+                    upsert=False,
                 )
-                if result.upserted_id:
+                if promoted.modified_count:
                     created += 1
+                else:
+                    result = attendance_collection.update_one(
+                        key,
+                        {"$setOnInsert": {
+                            "user_id": user_id,
+                            "employee_id": employee_id,
+                            "attendance_date": date_iso,
+                            **absent_fields,
+                            "check_in_time": None,
+                            "check_out_time": None,
+                            "created_at": now_local.astimezone(timezone.utc),
+                        }},
+                        upsert=True,
+                    )
+                    if result.upserted_id:
+                        created += 1
             except DuplicateKeyError:
                 skipped += 1
             cursor += timedelta(days=1)
     return {"created": created, "skipped": skipped}
+
+
+def mark_attendance_issues(now: datetime | None = None) -> dict[str, int]:
+    """Persist 'Attendance Issue' for finished days with a Check-In but no Check-Out.
+
+    Only Present records are converted. Leave/holiday/weekly-off/half-day/manual
+    Absent records and finalized payroll months are never changed. The original
+    status is kept so the issue can be cleared again.
+    """
+    now_local = (now or company_now()).astimezone(COMPANY_TZ)
+    today_iso = now_local.date().isoformat()
+    marked = skipped = 0
+    candidates = attendance_collection.find({
+        "status": "Present",
+        "attendance_date": {"$lt": today_iso},
+        "check_in_time": {"$nin": [None, ""]},
+        "$or": [{"check_out_time": None}, {"check_out_time": ""}],
+    })
+    payroll_cache: dict[tuple[str, str], bool] = {}
+    for record in candidates:
+        if not missing_checkout_issue(
+            status=record.get("status"),
+            check_in=record.get("check_in_time"),
+            check_out=record.get("check_out_time"),
+            attendance_date=record.get("attendance_date"),
+            now=now_local,
+            scheduled_start=record.get("scheduled_work_start_time"),
+            scheduled_end=record.get("scheduled_work_end_time"),
+        ):
+            continue
+        # ESSL days may have a later raw punch that the daily row has not absorbed yet.
+        if record.get("attendance_source") == "ESSL" and record.get("last_punch"):
+            continue
+        employee_id = str(record.get("employee_id") or "")
+        period = str(record.get("attendance_date"))[:7]
+        locked = payroll_cache.get((employee_id, period))
+        if locked is None:
+            payroll = db["monthly_payroll_records"].find_one(
+                {"employee_id": employee_id, "period": period}, {"status": 1}
+            ) if employee_id else None
+            locked = str((payroll or {}).get("status") or "").strip().lower() in {
+                "approved", "finalized", "finalised", "processed", "paid", "complete", "completed",
+            }
+            payroll_cache[(employee_id, period)] = locked
+        if locked:
+            skipped += 1
+            continue
+        result = attendance_collection.update_one(
+            {"_id": record["_id"], "status": "Present", "check_out_time": record.get("check_out_time")},
+            {"$set": {
+                "status": ATTENDANCE_ISSUE_STATUS,
+                "attendance_issue": True,
+                "attendance_issue_original_status": "Present",
+                "attendance_issue_reason": "Missing check-out time",
+                "attendance_issue_marked_at": now_local.astimezone(timezone.utc),
+                "updated_at": now_local.astimezone(timezone.utc),
+            }},
+        )
+        marked += int(result.modified_count)
+    return {"marked": marked, "skipped": skipped}
 
 
 @router.get("/wfh/admin/employees")
@@ -2107,6 +2229,7 @@ def list_wfh_employee_settings(
             "user_id": str(employee["_id"]),
             "employee_id": employee.get("employee_id", ""),
             "name": employee.get("name", ""),
+            "work_email": employee.get("work_email", ""),
             "is_active": bool(employee.get("is_active", False)),
             "role": employee.get("role", "Employee"),
             "is_wfh_enabled": employee.get("is_wfh_enabled") is True,
@@ -2977,6 +3100,9 @@ def list_attendance(
             users[record_user_id],
         )
         row.update(daily)
+        # The daily calculation echoes the stored status; keep the effective one
+        # (Present without a Check-Out is an Attendance Issue).
+        row["status"] = record_effective_status(record) or row.get("status")
         permission_map = _collect_permissions(record_user_id, selected.isoformat(), (selected + timedelta(days=1)).isoformat(), {selected.isoformat(): record})
         permission_entries = permission_map.get(selected.isoformat(), [])
         permission_minutes = _union_minutes([entry["_interval"] for entry in permission_entries])
@@ -3818,7 +3944,7 @@ def get_historical_attendance_month(
         if (
             not payroll_locked
             and record
-            and record.get("attendance_source") in {"ESSL", "WFH_FACE_GPS"}
+            and record.get("attendance_source") in {"ESSL", "WFH_FACE_GPS", "WFH_AUTO_ABSENT"}
             and not record.get("hr_admin_modified")
             and status_value not in {"Leave", "Medical Leave", "Holiday", "Weekly Off", "Permission", "Not Applicable"}
         ):
@@ -4281,6 +4407,21 @@ def modify_historical_attendance(
     payroll_status = (payroll or {}).get("status")
     if payroll_status in {"Approved", "Processed", "Paid"}:
         raise HTTPException(status.HTTP_409_CONFLICT, f"Attendance is locked because payroll is {payroll_status}.")
+    # A missing Check-Out is corrected only through an Attendance Request that HR Admin
+    # approves with the Check-Out time, never by marking the issue date Present directly.
+    existing_for_issue = attendance_collection.find_one(
+        {"user_id": payload.user_id, "attendance_date": selected.isoformat()}
+    )
+    if (
+        existing_for_issue
+        and is_attendance_issue_status(record_effective_status(existing_for_issue))
+        and status_value in {"Present", "Half-Day Present"}
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This date is an Attendance Issue (check-in without check-out). The employee must submit an "
+            "Attendance Request and HR Admin must approve it with the missing check-out time.",
+        )
     if payload.permission_start_time or payload.permission_end_time:
         if not payload.permission_start_time or not payload.permission_end_time:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Both permission start and end times are required.")
@@ -4599,7 +4740,11 @@ def get_my_attendance(
         # Empty punch pairs are Not Marked in the employee-facing attendance view.
         # This also normalizes legacy auto-generated Absent rows without altering
         # explicit attendance records in the database.
-        if not row.get("check_in_time") and not row.get("check_out_time") and str(row.get("status") or "").casefold() == "absent":
+        if (
+            not row.get("check_in_time") and not row.get("check_out_time")
+            and str(row.get("status") or "").casefold() == "absent"
+            and not is_wfh_auto_absent(record)
+        ):
             row["status"] = "Not Marked"
         response_rows.append(row)
     return response_rows
@@ -5071,13 +5216,17 @@ def _calculate_daily_attendance(
                     continue
         check_in = record.get("check_in_time")
         check_out = record.get("check_out_time")
-        if not punch_times and isinstance(check_in, str) and check_in:
+        # Half-day records already contributed their present-half punches above;
+        # otherwise use the record's own Check-In and Check-Out (approved
+        # attendance-request / manual corrections store exactly these two times).
+        _record_punches_only = not punch_times
+        if _record_punches_only and isinstance(check_in, str) and check_in:
             try:
                 h, m = map(int, check_in.split(":")[:2])
                 punch_times.append(datetime.combine(selected_date, time(h, m), tzinfo=COMPANY_TZ))
             except (ValueError, TypeError):
                 pass
-        if not punch_times and isinstance(check_out, str) and check_out:
+        if _record_punches_only and isinstance(check_out, str) and check_out:
             try:
                 h, m = map(int, check_out.split(":")[:2])
                 out_time = datetime.combine(selected_date, time(h, m), tzinfo=COMPANY_TZ)
@@ -5344,7 +5493,7 @@ def refresh_automatic_attendance_calculation(user_id: str, selected_date: date) 
     finalized payroll months are intentionally immutable here.
     """
     record = attendance_collection.find_one({"user_id": user_id, "attendance_date": selected_date.isoformat()})
-    if not record or record.get("attendance_source") not in {"ESSL", "WFH_FACE_GPS"} or record.get("hr_admin_modified"):
+    if not record or record.get("attendance_source") not in {"ESSL", "WFH_FACE_GPS", "WFH_AUTO_ABSENT"} or record.get("hr_admin_modified"):
         return False
     employee_id = str(record.get("employee_id") or "")
     if not employee_id:
@@ -5510,6 +5659,51 @@ def get_daily_attendance_breakdown(
     )
     if _status_override:
         _resolved_day_status = _status_override
+
+    # WFH automatic-absence records can already carry both half-day statuses as
+    # Absent while their legacy top-level status remains Not Marked. Treat that
+    # persisted, completed, punch-free WFH day as a full-day Absent consistently.
+    # Manual edits and payroll-locked months are not recalculated by this path.
+    payroll_record = db["monthly_payroll_records"].find_one(
+        {"employee_id": str(target.get("employee_id") or record.get("employee_id") or ""),
+         "period": selected.strftime("%Y-%m")},
+        {"status": 1},
+    )
+    payroll_locked = str((payroll_record or {}).get("status") or "").strip().casefold() in {
+        "approved", "processed", "paid",
+    }
+    saved_wfh_absent = (
+        not payroll_locked
+        and record.get("attendance_source") == "WFH_AUTO_ABSENT"
+        and not check_in and not check_out
+        and str(record.get("first_half_status") or "").strip().casefold() == "absent"
+        and str(record.get("second_half_status") or "").strip().casefold() == "absent"
+        and not record.get("hr_admin_modified")
+    )
+    if saved_wfh_absent:
+        _resolved_day_status = "Absent"
+        half_day.update(combine_half_day_statuses("Absent", "Absent"))
+        # Reconcile the stale top-level status once so every other consumer
+        # (calendar, attendance lists, summaries and payroll) reads the same
+        # persisted result. This update is gated above by the payroll lock.
+        if str(record.get("status") or "").strip().casefold() != "absent":
+            reconciled_at = datetime.now(timezone.utc)
+            attendance_collection.update_one(
+                {
+                    "_id": record["_id"],
+                    "attendance_source": "WFH_AUTO_ABSENT",
+                    "hr_admin_modified": {"$ne": True},
+                },
+                {"$set": {
+                    "status": "Absent",
+                    "first_half_status": "Absent",
+                    "second_half_status": "Absent",
+                    "half_day_present": "No",
+                    "half_day_present_side": None,
+                    "attendance_calculation_updated_at": reconciled_at,
+                    "updated_at": reconciled_at,
+                }},
+            )
     return {
         **daily,
         **half_day,
@@ -5620,8 +5814,8 @@ def _monthly_report_rows(user_id: str, employee: dict[str, Any], year: int, mont
             continue
         record = record_by_date.get(date_iso, {})
         details = _calculate_daily_attendance(user_id, selected_date, employee) if record else {}
-        calculated_status = record.get("status") or details.get("status") or "Not Marked"
-        if record and not payroll_locked and record.get("attendance_source") in {"ESSL", "WFH_FACE_GPS"} and not record.get("hr_admin_modified"):
+        calculated_status = (record_effective_status(record) if record else "") or record.get("status") or details.get("status") or "Not Marked"
+        if record and not payroll_locked and record.get("attendance_source") in {"ESSL", "WFH_FACE_GPS", "WFH_AUTO_ABSENT"} and not record.get("hr_admin_modified"):
             day_check_in = details.get("first_check_in") or record.get("check_in_time")
             day_check_out = details.get("last_check_out") or record.get("check_out_time")
             permission_map = _collect_permissions(
@@ -5656,6 +5850,17 @@ def _monthly_report_rows(user_id: str, employee: dict[str, Any], year: int, mont
             )
             if _status_override:
                 calculated_status = _status_override
+
+            saved_wfh_absent = (
+                record.get("attendance_source") == "WFH_AUTO_ABSENT"
+                and not day_check_in and not day_check_out
+                and str(record.get("first_half_status") or "").strip().casefold() == "absent"
+                and str(record.get("second_half_status") or "").strip().casefold() == "absent"
+                and not record.get("hr_admin_modified")
+            )
+            if saved_wfh_absent:
+                calculated_status = "Absent"
+                half.update(combine_half_day_statuses("Absent", "Absent"))
             recalc_values = {
                 "status": calculated_status,
                 "half_day_present": half.get("half_day_present"),
@@ -6183,6 +6388,10 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
             half_day.update(combine_half_day_statuses(record["first_half_status"], record["second_half_status"]))
             half_day["half_day_eligibility"] = record.get("half_day_eligibility")
             half_day["actual_working_minutes"] = record.get("actual_working_minutes", effective_minutes)
+        if is_attendance_issue_status(status_text):
+            # Attendance Issue days are neither Present nor Absent in any count.
+            half_day.update(first_half_status=ATTENDANCE_ISSUE_STATUS, second_half_status=ATTENDANCE_ISSUE_STATUS,
+                            half_day_present="No", half_day_present_side=None)
         effective_break_intervals = base.get("break_intervals") if legacy is not None else (day_metrics.get("break_intervals") or [])
         effective_break_minutes = int(base.get("break_minutes") or 0) if legacy is not None else int(day_metrics.get("break_minutes", day_metrics.get("visible_break_minutes", 0)) or 0)
         if legacy is not None:
@@ -6196,11 +6405,12 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
             effective_break_details = "\n".join(break_lines) if break_lines else "No break intervals recorded"
         resolved_status = status_text
         protected_statuses = {"holiday", "weekly off", "leave", "medical leave", "not applicable", "before joining"}
-        if not check_in and not check_out and status_text.casefold() == "absent":
+        auto_absent = is_wfh_auto_absent(record)
+        if not check_in and not check_out and status_text.casefold() == "absent" and not auto_absent:
             resolved_status = "Not Marked"
             half_day["first_half_status"] = "Not Marked"
             half_day["second_half_status"] = "Not Marked"
-        if status_text.casefold() not in protected_statuses and not (not check_in and not check_out and status_text.casefold() == "absent"):
+        if status_text.casefold() not in protected_statuses and not (not check_in and not check_out and status_text.casefold() == "absent" and not auto_absent):
             _status_override = half_day_status_override(
                 half_day,
                 total_duration_minutes=total_duration_minutes,
@@ -6261,6 +6471,7 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
     half_status_counts = {
         "Present": 0.0, "Absent": 0.0, "Leave": 0.0,
         "Medical Leave": 0.0, "Holiday": 0.0, "Weekly Off": 0.0,
+        ATTENDANCE_ISSUE_STATUS: 0.0,
     }
     for item in rows:
         for key in ("first_half_status", "second_half_status"):
@@ -6278,6 +6489,7 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
             "total_days": len(rows),
             "present_days": half_status_counts["Present"],
             "absent_days": half_status_counts["Absent"],
+            "attendance_issue_days": half_status_counts[ATTENDANCE_ISSUE_STATUS],
             "leave_days": half_status_counts["Leave"],
             "medical_leave_days": half_status_counts["Medical Leave"],
             "holiday_days": half_status_counts["Holiday"],
@@ -6422,6 +6634,7 @@ def export_user_monthly_attendance(
         ("Recorded Attendance Days", len(rows)),
         ("Present", sum(v for k, v in counts.items() if k.casefold() == "present")),
         ("Absent", sum(v for k, v in counts.items() if k.casefold() == "absent")),
+        ("Attendance Issue", sum(v for k, v in counts.items() if k.casefold() == "attendance issue")),
         ("Leave", sum(v for k, v in counts.items() if k.casefold() == "leave")),
         ("Medical Leave", sum(v for k, v in counts.items() if k.casefold() == "medical leave")),
         ("Holiday", sum(v for k, v in counts.items() if k.casefold() == "holiday")),
@@ -6461,7 +6674,8 @@ def export_user_monthly_attendance(
          ("Permission Duration", report_summary["permission_total_text"])],
         [("Half-Day Present", report_summary["half_day_present_days"]),
          ("First Half Present", report_summary["first_half_present_days"]),
-         ("Second Half Present", report_summary["second_half_present_days"])],
+         ("Second Half Present", report_summary["second_half_present_days"]),
+         ("Attendance Issue", report_summary["attendance_issue_days"])],
     ]
     for group_index, group in enumerate(summary_groups):
         group_col = 4 + group_index * 2
@@ -6614,6 +6828,8 @@ def export_user_monthly_attendance(
                     cell.fill = PatternFill("solid", fgColor=green)
                 elif normalized == "absent":
                     cell.fill = PatternFill("solid", fgColor="F4CCCC")
+                elif normalized == "attendance issue":
+                    cell.fill = PatternFill("solid", fgColor="FFE699")
                 elif normalized in {"leave", "medical leave"}:
                     cell.fill = PatternFill("solid", fgColor=orange)
                 elif normalized == "holiday":

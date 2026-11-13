@@ -504,6 +504,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                 <select className="form-select" value={attendanceFilter} onChange={(e) => setAttendanceFilter(e.target.value)}>
                   <option value="all">All statuses</option>
                   {STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}
+                  <option value="Attendance Issue">Attendance Issue</option>
                 </select>
               </div>
               <div className="col-12 col-md-3">
@@ -536,7 +537,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                           <tr>
                             <td className="text-nowrap">{row.attendance_date}</td>
                             <td>{new Date(`${row.attendance_date}T00:00:00`).toLocaleDateString("en-IN", { weekday: "short" })}</td>
-                            <td><span className="badge text-bg-light border">{row.status}</span></td>
+                            <td>{row.status === "Attendance Issue" ? <span className="attendance-issue-badge" title="Check-in without check-out">⚠ Attendance Issue</span> : <span className="badge text-bg-light border">{row.status}</span>}</td>
                             <td>{display(timeValue(row.check_in_time))}</td>
                             <td>{display(timeValue(row.check_out_time))}</td>
                             <td>{row.permission_start_time && row.permission_end_time ? `${row.permission_start_time}–${row.permission_end_time}` : "—"}</td>
@@ -544,7 +545,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                             <td>{row.payroll_status || "—"}</td>
                             <td className="text-end text-nowrap">
                               <button type="button" className="btn btn-sm btn-outline-secondary me-1" onClick={() => setExpandedDate(expandedDate === row.attendance_date ? "" : row.attendance_date)}><i className="bi bi-eye me-1" />View</button>
-                              <button type="button" className="btn btn-sm btn-outline-primary me-1" disabled={!rowCanEdit} title={!rowCanEdit ? (row.is_before_joining ? "Before employee joining date" : payrollLocked || row.payroll_locked ? "Payroll is approved/processed/paid; view only." : "Current date and eligible previous dates in the current month and previous three completed months can be modified.") : "Modify attendance"} onClick={() => beginEdit(row)}><i className="bi bi-pencil-square me-1" />Edit</button>
+                              <button type="button" className="btn btn-sm btn-outline-primary me-1" disabled={!rowCanEdit || row.status === "Attendance Issue"} title={row.status === "Attendance Issue" ? "Attendance Issue: the employee must submit an Attendance Request and HR Admin approves it with the missing check-out time." : !rowCanEdit ? (row.is_before_joining ? "Before employee joining date" : payrollLocked || row.payroll_locked ? "Payroll is approved/processed/paid; view only." : "Current date and eligible previous dates in the current month and previous three completed months can be modified.") : "Modify attendance"} onClick={() => beginEdit(row)}><i className="bi bi-pencil-square me-1" />Edit</button>
                               <button type="button" className="btn btn-sm btn-outline-dark" onClick={() => loadHistory(row.attendance_date)} title="View modification history"><i className="bi bi-clock-history me-1" />History</button>
                             </td>
                           </tr>

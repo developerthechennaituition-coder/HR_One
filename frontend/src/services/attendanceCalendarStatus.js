@@ -12,6 +12,8 @@ export const attendanceCalendarStatusKey = (day) => {
   const first = normalize(day?.first_half_status);
   const second = normalize(day?.second_half_status);
 
+  // Check-in without check-out: never Present, never Absent.
+  if (status === "attendance issue" || day?.is_attendance_issue) return "issue";
   if (
     String(day?.half_day_present || "No").startsWith("Yes") ||
     status === "half day present" ||
@@ -56,12 +58,14 @@ export const attendanceCalendarLabel = (day) => {
     if (side.endsWith("Second Half") || isPresentHalf(second)) return "Second Half Present";
     return "Half-Day Present";
   }
+  if (key === "issue") return "Attendance Issue";
   if (key === "leave") return day?.leave_type_code || "Leave";
   if (key === "holiday") return day?.holiday_name || "Holiday";
   return {
     wfh: "Work From Home",
     present: "Present",
     absent: "Absent",
+    issue: "Attendance Issue",
     weeklyoff: "Weekly Off",
     notapplicable: "Not Applicable",
     notmarked: "",
@@ -82,9 +86,10 @@ export const attendanceCalendarHalfSymbol = (day) => {
 // A full day contributes 1 to one bucket; a half-day contributes 0.5 per half
 // according to that half's own status (e.g. Present + Absent => 0.5 + 0.5).
 export const attendanceCalendarPortions = (day) => {
-  const portions = { present: 0, absent: 0, leave: 0, holiday: 0 };
+  const portions = { present: 0, absent: 0, leave: 0, holiday: 0, issue: 0 };
   const classify = (value) => {
     const status = normalize(value);
+    if (status === "attendance issue") return "issue";
     if (status === "present") return "present";
     if (status === "absent") return "absent";
     if (status.includes("leave")) return "leave";
@@ -125,7 +130,8 @@ export const attendanceCalendarPortions = (day) => {
   }
 
   const status = normalize(day?.status || day?.attendance_status);
-  if (status === "present") portions.present = 1;
+  if (status === "attendance issue" || day?.is_attendance_issue) portions.issue = 1;
+  else if (status === "present") portions.present = 1;
   else if (status === "absent") portions.absent = 1;
   else if (status.includes("leave") || day?.is_approved_leave) portions.leave = 1;
   else if (status === "holiday") portions.holiday = 1;
@@ -134,11 +140,12 @@ export const attendanceCalendarPortions = (day) => {
 
 // One shared monthly summary for every attendance calendar page, so the counts
 // and percentages always agree. Present / Absent / Leave carry a percentage
-// (out of Present + Absent + Leave); Holiday is a count only.
+// (out of Present + Absent + Leave); Holiday and Attendance Issue are counts only.
+// Attendance Issue dates are never part of Present or Absent.
 // `days` are calendar day objects; `resolve` may return an adjusted day
 // (e.g. approved leave or a published holiday for a date with no record).
 export const summarizeAttendancePortions = (days, resolve = (day) => day) => {
-  const totals = { present: 0, absent: 0, leave: 0, holiday: 0 };
+  const totals = { present: 0, absent: 0, leave: 0, holiday: 0, issue: 0 };
   days.forEach((day) => {
     const portions = attendanceCalendarPortions(resolve(day));
     Object.keys(totals).forEach((key) => { totals[key] += portions[key]; });
@@ -157,9 +164,19 @@ export const summarizeCalendarDays = (calendar) => summarizeAttendancePortions(
   (calendar?.days || []).filter((day) => {
     if (day?.is_before_joining || day?.is_after_window) return false;
     const status = normalize(day?.status);
-    return Boolean(day?.has_record) || status === "holiday" || status === "leave";
+    return Boolean(day?.has_record) || status === "holiday" || status === "leave" || status === "attendance issue";
   }),
 );
+
+// Friendly Source text shared by the attendance detail panels.
+const SOURCE_LABELS = {
+  ESSL: "ESSL",
+  MANUAL: "Manual",
+  ATTENDANCE_REQUEST: "Attendance Request (approved by HR Admin)",
+  WFH_FACE_GPS: "WFH (Face + GPS)",
+  WFH_AUTO_ABSENT: "WFH Auto Absent",
+};
+export const attendanceSourceLabel = (source) => SOURCE_LABELS[source] || source || "—";
 
 // 2 -> "2", 2.5 -> "2.5"
 export const formatAttendanceCount = (value) => (

@@ -6,7 +6,7 @@ import FastAPI or MongoDB so the business rules can be reused and unit-tested.
 from __future__ import annotations
 
 import re
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 
@@ -207,6 +207,75 @@ def attendance_issue(check_in: Any, check_out: Any, working_intervals: list[dict
     return {"has_attendance_issue": bool(issues), "attendance_issue_details": issues}
 
 
+ATTENDANCE_ISSUE_STATUS = "Attendance Issue"
+# Statuses that may turn into an Attendance Issue when the day ended without a
+# Check-Out. Leave, holiday, weekly off, half-day and manual Absent are never touched.
+_ISSUE_ELIGIBLE_STATUSES = frozenset({"present", "attendance issue"})
+
+
+def is_attendance_issue_status(status: Any) -> bool:
+    return str(status or "").strip().casefold() == "attendance issue"
+
+
+def missing_checkout_issue(
+    *,
+    status: Any,
+    check_in: Any,
+    check_out: Any,
+    attendance_date: Any,
+    now: datetime,
+    scheduled_start: Any = None,
+    scheduled_end: Any = None,
+) -> bool:
+    """True when the employee checked in, never checked out and the day is over.
+
+    The current day is never an issue while it is still open. For an overnight
+    schedule (end <= start) the day stays open until four hours after the
+    scheduled end on the following morning, matching the punch grouping used by
+    the daily calculation.
+    """
+    if str(status or "").strip().casefold() not in _ISSUE_ELIGIBLE_STATUSES:
+        return False
+    if not check_in or check_out:
+        return False
+    try:
+        day = attendance_date if isinstance(attendance_date, date) and not isinstance(attendance_date, datetime) \
+            else date.fromisoformat(str(attendance_date)[:10])
+    except (TypeError, ValueError):
+        return False
+    cutoff = datetime.combine(day + timedelta(days=1), time.min, tzinfo=now.tzinfo)
+    start_min = _clock_minutes(scheduled_start)
+    end_min = _clock_minutes(scheduled_end)
+    if start_min is not None and end_min is not None and end_min <= start_min:
+        cutoff += timedelta(minutes=end_min, hours=4)
+    return now >= cutoff
+
+
+def effective_attendance_status(
+    status: Any,
+    *,
+    check_in: Any,
+    check_out: Any,
+    attendance_date: Any,
+    now: datetime,
+    scheduled_start: Any = None,
+    scheduled_end: Any = None,
+) -> str:
+    """Status used by every view/count: Present without a Check-Out is an Attendance Issue.
+
+    A stored Attendance Issue whose Check-Out now exists reverts to Present.
+    """
+    text = str(status or "").strip()
+    if missing_checkout_issue(
+        status=text, check_in=check_in, check_out=check_out, attendance_date=attendance_date,
+        now=now, scheduled_start=scheduled_start, scheduled_end=scheduled_end,
+    ):
+        return ATTENDANCE_ISSUE_STATUS
+    if is_attendance_issue_status(text) and check_in and check_out:
+        return "Present"
+    return text
+
+
 # Half-day thresholds, as percentages of the employee's configured Half Day Time.
 # They are applied to Total Duration (Check-Out minus Check-In, breaks included).
 HALF_DAY_ABSENT_BELOW_PERCENT = 50
@@ -217,7 +286,7 @@ PROTECTED_DAY_STATUSES = frozenset({
     "before joining", "leave", "medical leave", "permission",
 })
 _RECALCULABLE_STATUSES = frozenset({
-    "", "present", "absent", "half-day present", "half day present", "not marked",
+    "", "present", "absent", "half-day present", "half day present", "not marked", "attendance issue",
 })
 
 

@@ -74,6 +74,8 @@ def _sheet_title(name: str, used: set[str]) -> str:
 
 def _status_fill(status: Any) -> str | None:
     text = str(status or "").casefold()
+    if "attendance issue" in text:
+        return "FFE699"
     if "half-day present" in text:
         return "DDEBF7"
     if "present" in text:
@@ -164,7 +166,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> list[list[tuple[str, Any]]]:
     permission = sum(int(r.get("permission_total_minutes") or 0) for r in rows)
     permission_count = sum(len(r.get("permissions") or []) for r in rows)
     counts = {"Present Days": 0.0, "Absent Days": 0.0, "Leave Days": 0.0,
-              "Medical Leave": 0.0, "Holidays": 0.0, "Weekly Off": 0.0}
+              "Medical Leave": 0.0, "Holidays": 0.0, "Weekly Off": 0.0, "Attendance Issue": 0.0}
     for row in rows:
         first = str(row.get("first_half_status") or "").casefold()
         second = str(row.get("second_half_status") or "").casefold()
@@ -174,6 +176,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> list[list[tuple[str, Any]]]:
             for half in (first, second):
                 if half == "present": counts["Present Days"] += .5
                 elif half == "absent": counts["Absent Days"] += .5
+                elif half == "attendance issue": counts["Attendance Issue"] += .5
                 elif half == "leave": counts["Leave Days"] += .5
                 elif half == "medical leave": counts["Medical Leave"] += .5
                 elif half == "holiday": counts["Holidays"] += .5
@@ -184,6 +187,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> list[list[tuple[str, Any]]]:
             elif status == "present": counts["Present Days"] += 1
             if "1/2 absent" in status or "half absent" in status: counts["Absent Days"] += .5
             elif status == "absent": counts["Absent Days"] += 1
+            if status == "attendance issue": counts["Attendance Issue"] += 1
             if "1/2 medical leave" in status or "half medical leave" in status: counts["Medical Leave"] += .5
             elif "medical leave" in status: counts["Medical Leave"] += 1
             if ("1/2 leave" in status or "half leave" in status) and "medical leave" not in status: counts["Leave Days"] += .5
@@ -197,7 +201,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> list[list[tuple[str, Any]]]:
         [("Net Working Time", _duration_text(working)), ("Break Time", _duration_text(breaks)), ("Total Duration", _duration_text(elapsed))],
         [("Present Days", counts["Present Days"]), ("Absent Days", counts["Absent Days"]), ("Leave Days", counts["Leave Days"]), ("Holidays", counts["Holidays"])],
         [("Weekly Off", counts["Weekly Off"]), ("Medical Leave", counts["Medical Leave"]), ("Permission Count", permission_count), ("Permission Duration", _duration_text(permission))],
-        [("Half-Day Present", half_count), ("First Half Present", first_count), ("Second Half Present", second_count)],
+        [("Half-Day Present", half_count), ("First Half Present", first_count), ("Second Half Present", second_count), ("Issue Count", counts["Attendance Issue"])],
     ]
 
 def build_multi_employee_attendance_workbook(
@@ -425,6 +429,63 @@ def build_multi_employee_attendance_workbook(
             current_row += 1
 
         last_data_row = current_row - 1
+
+        # Unresolved Attendance Issue dates (check-in without check-out) for this employee.
+        issue_rows = [
+            item for item in rows
+            if str(item.get("status") or "").strip().casefold() == "attendance issue"
+        ]
+        current_row += 1
+        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=last_col)
+        issue_title = ws.cell(
+            current_row, 1,
+            f"ATTENDANCE ISSUE DETAILS - {name}  (Unresolved issue dates: {len(issue_rows)})",
+        )
+        issue_title.font = Font(bold=True, color="664D03", size=10)
+        issue_title.fill = PatternFill("solid", fgColor="FFE699")
+        issue_title.alignment = Alignment(vertical="center")
+        ws.row_dimensions[current_row].height = 24
+        current_row += 1
+        if not issue_rows:
+            ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=last_col)
+            ws.cell(current_row, 1, "No unresolved attendance issues for this month.").font = Font(italic=True, size=9)
+            current_row += 1
+        else:
+            issue_headers = [(1, 1, "S.No."), (2, 2, "Date"), (3, 3, "Day"), (4, 4, "In Time"),
+                             (5, 5, "Out Time"), (6, 9, "Issue"), (10, 13, "Attendance Request / Resolution")]
+            for start_col, end_col, header in issue_headers:
+                if end_col > start_col:
+                    ws.merge_cells(start_row=current_row, start_column=start_col, end_row=current_row, end_column=end_col)
+                head = ws.cell(current_row, start_col, header)
+                head.font = Font(bold=True, color="664D03", size=9)
+                head.fill = PatternFill("solid", fgColor="FFF2CC")
+                head.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            current_row += 1
+            for issue_number, item in enumerate(issue_rows, 1):
+                in_time = item.get("check_in_text") or item.get("first_check_in") or item.get("check_in_time") or ""
+                request_status = item.get("request_status")
+                resolution = (
+                    f"Attendance Request {request_status} - awaiting HR Admin approval with the missing check-out time"
+                    if request_status in {"Pending", "Under Review"}
+                    else "No attendance request submitted - HR Admin must add the check-out through an approved Attendance Request"
+                )
+                cells = [
+                    (1, 1, issue_number), (2, 2, str(item.get("attendance_date"))[:10]), (3, 3, item.get("day") or ""),
+                    (4, 4, _time_text(in_time) if in_time else "—"), (5, 5, "Missing"),
+                    (6, 9, "Check-in recorded but no check-out; not counted as Present"),
+                    (10, 13, resolution),
+                ]
+                for start_col, end_col, value in cells:
+                    if end_col > start_col:
+                        ws.merge_cells(start_row=current_row, start_column=start_col, end_row=current_row, end_column=end_col)
+                    cell = ws.cell(current_row, start_col, value)
+                    cell.font = Font(size=9)
+                    cell.alignment = Alignment(vertical="center", horizontal="left" if end_col > start_col else "center", wrap_text=True)
+                    for col in range(start_col, end_col + 1):
+                        ws.cell(current_row, col).border = Border(bottom=thin)
+                ws.row_dimensions[current_row].height = 30
+                current_row += 1
+
         # Keep the existing monthly summary for each employee, in the same sheet.
         current_row += 1
         summary_start = current_row

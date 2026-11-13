@@ -729,15 +729,15 @@ function UserManagement() {
       {/* Purpose: Edit User popup, styled like the View User popup above. */}
       {isFormOpen && editingId && (
         <div
-          className="modal d-block"
+          className="modal d-block edit-user-modal"
           tabIndex="-1"
           role="dialog"
           aria-modal="true"
           aria-labelledby="edit-user-title"
           style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
         >
-          <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
-            <div className="modal-content">
+          <div className="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable edit-user-modal-dialog">
+            <div className="modal-content edit-user-modal-content">
               <div className="modal-header">
                 <h5 className="modal-title" id="edit-user-title">Edit User</h5>
                 <button
@@ -750,7 +750,7 @@ function UserManagement() {
               </div>
 
               <form id="edit-user-form" onSubmit={handleSubmit}>
-                <div className="modal-body">
+                <div className="modal-body edit-user-modal-body">
                   {feedback.type === "danger" && feedback.message && (
                     <div className="alert alert-danger py-2" role="alert" aria-live="polite">
                       {feedback.message}
@@ -759,7 +759,7 @@ function UserManagement() {
                   {renderUserFormFields()}
                 </div>
 
-                <div className="modal-footer">
+                <div className="modal-footer edit-user-modal-footer">
                   <button
                     type="button"
                     className="btn btn-secondary"

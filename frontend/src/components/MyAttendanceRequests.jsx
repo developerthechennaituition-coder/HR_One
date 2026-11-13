@@ -12,8 +12,20 @@ import {
 } from "../services/attendanceRequestApi";
 
 const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const STATUS_FILTERS = ["Not Marked", "Absent", "Half-Day Present", "Present", "Weekly Off", "Holiday", "Not Applicable", "all"];
+const STATUS_FILTERS = ["Not Marked", "Absent", "Attendance Issue", "Half-Day Present", "Present", "Weekly Off", "Holiday", "Not Applicable", "all"];
 const ACTIVE_STATUSES = new Set(["pending", "processing"]);
+
+const requestDateKey = (value) => {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value).slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(parsed);
+};
 
 const timeSuffix = (checkIn, checkOut) => {
   const text = formatTimeRange(checkIn, checkOut);
@@ -130,6 +142,9 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
   const [submitting, setSubmitting] = useState(false);
   const [statusFilter, setStatusFilter] = useState("Not Marked");
   const [dateFilter, setDateFilter] = useState("");
+  const [requestListStatusFilter, setRequestListStatusFilter] = useState("all");
+  const [submittedDateFilter, setSubmittedDateFilter] = useState("");
+  const [responseDateFilter, setResponseDateFilter] = useState("");
   const [cancellingId, setCancellingId] = useState("");
   const [confirmCancelId, setConfirmCancelId] = useState("");
   const activeIdsRef = useRef(null);
@@ -154,6 +169,17 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
   useEffect(() => { loadRequests(); }, [loadRequests, refreshKey]);
 
   const hasActive = requests.some((item) => ACTIVE_STATUSES.has(item.status));
+  const filteredRequests = useMemo(() => requests.filter((request) =>
+    (requestListStatusFilter === "all" || request.status === requestListStatusFilter) &&
+    (!submittedDateFilter || requestDateKey(request.submitted_at) === submittedDateFilter) &&
+    (!responseDateFilter || requestDateKey(request.reviewed_at) === responseDateFilter)
+  ), [requests, requestListStatusFilter, submittedDateFilter, responseDateFilter]);
+
+  const resetRequestListFilters = () => {
+    setRequestListStatusFilter("all");
+    setSubmittedDateFilter("");
+    setResponseDateFilter("");
+  };
   useEffect(() => {
     if (!hasActive) return undefined;
     const timer = window.setInterval(loadRequests, 30000);
@@ -317,7 +343,31 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
           </div>
           {error && <div className="alert alert-danger py-2" role="alert">{error}</div>}
           {success && <div className="alert alert-success py-2" role="status">{success}</div>}
-          <div className="table-responsive">
+          <div className="row g-2 align-items-end mb-3" aria-label="Filter attendance requests">
+            <div className="col-12 col-sm-6 col-lg-3">
+              <label className="form-label small mb-1" htmlFor="my-ar-status-filter">Status</label>
+              <select id="my-ar-status-filter" className="form-select form-select-sm" value={requestListStatusFilter} onChange={(event) => setRequestListStatusFilter(event.target.value)}>
+                <option value="all">All Statuses</option>
+                {Object.entries(REQUEST_STATUS_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </div>
+            <div className="col-12 col-sm-6 col-lg-3">
+              <label className="form-label small mb-1" htmlFor="my-ar-submitted-date">Submitted Date</label>
+              <input id="my-ar-submitted-date" type="date" className="form-control form-control-sm" value={submittedDateFilter} onChange={(event) => setSubmittedDateFilter(event.target.value)} />
+            </div>
+            <div className="col-12 col-sm-6 col-lg-3">
+              <label className="form-label small mb-1" htmlFor="my-ar-response-date">Response Date</label>
+              <input id="my-ar-response-date" type="date" className="form-control form-control-sm" value={responseDateFilter} onChange={(event) => setResponseDateFilter(event.target.value)} />
+            </div>
+            <div className="col-12 col-sm-6 col-lg-3 d-flex align-items-end">
+              <button type="button" className="btn btn-outline-secondary btn-sm w-100" onClick={resetRequestListFilters} disabled={requestListStatusFilter === "all" && !submittedDateFilter && !responseDateFilter}>
+                <i className="bi bi-arrow-counterclockwise me-1" aria-hidden="true" />Reset
+              </button>
+            </div>
+          </div>
+          <div className="small text-muted mb-2">{filteredRequests.length} of {requests.length} request(s)</div>
+          <div className="my-attendance-requests-scroll">
+            <div className="table-responsive">
             <table className="table table-hover align-middle mb-0">
               <thead className="table-light">
                 <tr><th>Request</th><th>Submitted</th><th>Dates and decisions</th><th>Status</th><th>Response</th><th /></tr>
@@ -327,7 +377,9 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                   <tr><td colSpan="6" className="text-center text-muted py-4">Loading requests...</td></tr>
                 ) : requests.length === 0 ? (
                   <tr><td colSpan="6" className="text-center text-muted py-4">You have not submitted any attendance requests.</td></tr>
-                ) : requests.map((request) => (
+                ) : filteredRequests.length === 0 ? (
+                  <tr><td colSpan="6" className="text-center text-muted py-4">No attendance requests match the selected filters.</td></tr>
+                ) : filteredRequests.map((request) => (
                   <tr key={request.id}>
                     <td className="fw-semibold">{request.request_number}</td>
                     <td className="small">{formatRequestDateTime(request.submitted_at)}</td>
@@ -353,6 +405,7 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
         </div>
       </section>
@@ -378,7 +431,7 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                   <div className="col-6 col-md-3">
                     <label className="form-label small mb-1" htmlFor="ar-status-filter">Attendance status</label>
                     <select id="ar-status-filter" className="form-select form-select-sm" value={statusFilter} disabled={Boolean(dateFilter)} onChange={(e) => setStatusFilter(e.target.value)}>
-                      {STATUS_FILTERS.map((value) => <option key={value} value={value}>{value === "all" ? "All eligible dates" : value}</option>)}
+                      {STATUS_FILTERS.map((value) => <option key={value} value={value}>{value === "all" ? "All eligible dates" : value === "Attendance Issue" ? "⚠ Issue Date (Attendance Issue)" : value}</option>)}
                     </select>
                   </div>
                   <div className="col-6 col-md-4">
@@ -393,6 +446,13 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                 {limits && (
                   <div className="small text-muted mb-2">
                     This month: Weekly Off {limits.weekly_off_used} of {limits.weekly_off_limit} used · Medical Leave {limits.medical_leave_used} of {limits.medical_leave_limit} used
+                  </div>
+                )}
+
+                {Object.values(selected).some((entry) => entry.day.status === "Attendance Issue") && (
+                  <div className="alert alert-warning py-2 small mb-2" role="note">
+                    <span className="attendance-issue-symbol me-1" aria-hidden="true">⚠</span>
+                    Attendance Issue dates have a check-in but no check-out. Request <strong>Present</strong> (you may suggest your check-out time); HR Admin must approve the request by entering the missing check-out time. Until then the date is not counted as Present.
                   </div>
                 )}
 
@@ -414,14 +474,18 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                           const entry = selected[iso];
                           const problem = entry ? rowProblem(entry) : "";
                           return (
-                            <tr key={iso} className={day.eligible_for_request ? "" : "text-muted"}>
+                            <tr key={iso} className={day.eligible_for_request ? (day.status === "Attendance Issue" ? "table-warning" : "") : "text-muted"}>
                               <td>
                                 <input type="checkbox" className="form-check-input" id={`request-${iso}`} checked={Boolean(entry)}
                                   disabled={!day.eligible_for_request || submitting} onChange={(e) => toggleDate(day, e.target.checked)} />
                               </td>
                               <td className="text-nowrap"><label htmlFor={`request-${iso}`} className="mb-0">{formatRequestDate(iso)}</label></td>
                               <td>
-                                <div>{day.status_label || day.status}</div>
+                                <div>
+                                  {day.status === "Attendance Issue" && <span className="attendance-issue-symbol me-1" aria-hidden="true" title="Attendance Issue: check-in without check-out">⚠</span>}
+                                  {day.status_label || day.status}
+                                </div>
+                                {day.status === "Attendance Issue" && <div className="small text-muted">Check-out missing</div>}
                                 {(day.check_in_time || day.check_out_time) && <div className="small text-muted">{formatTimeRange(day.check_in_time, day.check_out_time)}</div>}
                                 {!day.eligible_for_request && <div className="small">{day.ineligible_reason}</div>}
                               </td>

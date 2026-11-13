@@ -71,6 +71,10 @@ function decisionProblem(item, decision) {
   }
   if (decision.final_status !== "Present") return "";
   if (decision.check_in && decision.check_out && decision.check_out <= decision.check_in) return "Check-out must be later than check-in.";
+  if (item.original_status === "Attendance Issue") {
+    if (item.original_check_in_time && !decision.check_in) return "An existing check-in cannot be removed.";
+    if (!decision.check_out) return "Enter the missing check-out time to resolve this Attendance Issue.";
+  }
   if (item.original_status === "Present") {
     if (item.original_check_in_time && !decision.check_in) return "An existing check-in cannot be removed.";
     if (item.original_check_out_time && !decision.check_out) return "An existing check-out cannot be removed.";
@@ -361,8 +365,12 @@ function AttendanceRequestInbox() {
                             <tr key={iso} className={decision.action ? "" : "table-warning"}>
                               <td className="fw-semibold text-nowrap">{formatRequestDate(iso)}</td>
                               <td>
-                                <div>{item.original_status}</div>
+                                <div>
+                                  {item.original_status === "Attendance Issue" && <span className="attendance-issue-symbol me-1" aria-hidden="true" title="Attendance Issue: check-in without check-out">⚠</span>}
+                                  {item.original_status}
+                                </div>
                                 <div className="small text-muted">{timesOrDash(item.original_check_in_time, item.original_check_out_time)}</div>
+                                {item.original_status === "Attendance Issue" && <div className="small text-warning-emphasis">Check-out missing — enter it to approve</div>}
                                 {(item.original_first_half_status || item.original_second_half_status) && (
                                   <div className="small">First: {item.original_first_half_status || "—"} · Second: {item.original_second_half_status || "—"}</div>
                                 )}
@@ -460,8 +468,8 @@ function AttendanceRequestInbox() {
                                           <input type="time" className="form-control form-control-sm" value={decision.check_in} disabled={submitting}
                                             onChange={(e) => updateDecision(iso, { check_in: e.target.value })} />
                                         </label>
-                                        <label className="small mb-0">Final check-out
-                                          <input type="time" className="form-control form-control-sm" value={decision.check_out} disabled={submitting}
+                                        <label className="small mb-0">Final check-out{item.original_status === "Attendance Issue" ? " *" : ""}
+                                          <input type="time" className={`form-control form-control-sm ${item.original_status === "Attendance Issue" && !decision.check_out ? "border-warning" : ""}`} required={item.original_status === "Attendance Issue"} value={decision.check_out} disabled={submitting}
                                             onChange={(e) => updateDecision(iso, { check_out: e.target.value })} />
                                         </label>
                                       </div>

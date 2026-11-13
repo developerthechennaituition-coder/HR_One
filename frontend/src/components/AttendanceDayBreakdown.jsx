@@ -1,6 +1,7 @@
 import { HRONE_API_BASE } from "../config/api.js";
 import { useCallback, useEffect, useState } from "react";
 import { formatAttendanceClock as formatClock } from "../services/attendanceHistoryFormat.js";
+import { attendanceSourceLabel } from "../services/attendanceCalendarStatus.js";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE;
 
@@ -95,8 +96,8 @@ function AttendanceDayBreakdown({ userId = "me", title = "Daily attendance", dat
               <div className="d-flex flex-wrap gap-4 mb-3 small">
                 <div><span className="text-muted">Status</span><div className="fw-semibold fs-6">{(calendarDay?.attendance_date === selectedDate && (calendarDay.status_label || calendarDay.status)) || data.status || "Not Marked"}{calendarDay?.attendance_date === selectedDate && calendarDay.holiday_name ? ` · ${calendarDay.holiday_name}` : ""}</div></div>
                 <div><span className="text-muted">Check-in / Check-out</span><div className="fw-semibold fs-6">{calendarDay?.attendance_date === selectedDate && calendarDay.has_record ? `${formatClock(data.first_check_in || data.check_in_time || calendarDay.check_in_time) === "—" ? "Not recorded" : formatClock(data.first_check_in || data.check_in_time || calendarDay.check_in_time)} / ${formatClock(data.last_check_out || data.check_out_time || calendarDay.check_out_time) === "—" ? "Not recorded" : formatClock(data.last_check_out || data.check_out_time || calendarDay.check_out_time)}` : "—"}</div></div>
-                <div><span className="text-muted">Attendance category</span><div className="fw-semibold fs-6">{data.attendance_type === "WFH" || data.attendance_source === "WFH_FACE_GPS" ? "Work From Home" : data.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(data.attendance_source) ? "Office" : "—"}</div></div>
-                <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" ? "Attendance request (no punch recorded)" : data.attendance_source || "—"}</div></div>
+                <div><span className="text-muted">Attendance category</span><div className="fw-semibold fs-6">{data.attendance_type === "WFH" || data.attendance_source === "WFH_FACE_GPS" ? "Work From Home" : data.attendance_type === "OFFICE" || ["ESSL", "MANUAL"].includes(data.attendance_source) ? "Office" : (calendarDay?.attendance_date === selectedDate && calendarDay.attendance_category) || "—"}</div></div>
+                <div><span className="text-muted">Source</span><div className="fw-semibold fs-6">{data.attendance_source === "ATTENDANCE_REQUEST" && !(data.first_check_in || data.check_in_time || data.last_check_out || data.check_out_time) ? "Attendance Request (no punch recorded)" : attendanceSourceLabel(data.attendance_source)}</div></div>
                 <div><span className="text-muted">Scheduled time</span><div className="fw-semibold fs-6">{data.scheduled_work_start_time || "—"} – {data.scheduled_work_end_time || "—"}</div></div>
                 <div><span className="text-muted">Working type</span><div className="fw-semibold fs-6">{data.working_type || "—"}</div></div>
                 <div><span className="text-muted">Early Going By</span><div className="fw-semibold fs-6">{data.early_going_by || "—"}</div></div>

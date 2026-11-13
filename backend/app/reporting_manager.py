@@ -993,11 +993,12 @@ def get_team_member_attendance(
     attendance_rows = []
     if records:
         from datetime import date as _date
-        from app.attendance import _calculate_daily_attendance
+        from app.attendance import _calculate_daily_attendance, record_effective_status
         from app.attendance_calculations import attendance_issue
 
         for attendance_record in records:
             row = _serialize_attendance(attendance_record)
+            row["status"] = record_effective_status(attendance_record) or row.get("status")
             date_value = str(attendance_record.get("attendance_date") or "")[:10]
             try:
                 selected_day = _date.fromisoformat(date_value)

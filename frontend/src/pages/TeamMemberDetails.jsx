@@ -11,7 +11,7 @@ import { getTeamMemberAttendanceCalendar } from "../services/attendanceRequestAp
 import { isWeeklyOff, useCompanyWeeklyOffs } from "../services/weeklyOff";
 import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate } from "../services/attendanceCalendarRange";
 import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
-import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey, formatAttendanceCount, summarizeAttendancePortions } from "../services/attendanceCalendarStatus";
+import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey, attendanceSourceLabel, formatAttendanceCount, summarizeAttendancePortions } from "../services/attendanceCalendarStatus";
 
 const API_URL =
   HRONE_API_BASE + "/api/reporting-manager";
@@ -334,6 +334,11 @@ function TeamMemberDetails({
     absent: {
       background: "#dc3545",
       text: "#ffffff",
+    },
+
+    issue: {
+      background: "#ffc107",
+      text: "#3b2f00",
     },
 
     leave: {
@@ -862,6 +867,7 @@ function TeamMemberDetails({
   });
   const presentCount = attendanceCounts.present;
   const absentCount = attendanceCounts.absent;
+  const issueCount = attendanceCounts.issue;
   const leaveCount = attendanceCounts.leave;
   const holidayCount = attendanceCounts.holiday;
   const presentPercentage = attendancePercentages.present;
@@ -1931,6 +1937,22 @@ function TeamMemberDetails({
 
           </div>
 
+          <div className="col-6 col-md-3">
+
+            <div className="team-attendance-summary-card issue">
+
+              <span>
+                Attendance Issue
+              </span>
+
+              <strong>
+                {formatAttendanceCount(issueCount)}
+              </strong>
+
+            </div>
+
+          </div>
+
         </div>
 
         {/* ====================================================
@@ -2065,6 +2087,22 @@ function TeamMemberDetails({
                   <div className="team-selected-info">
 
                     <span>
+                      Source
+                    </span>
+
+                    <strong>
+                      {displayValue(attendanceSourceLabel(selectedRecord.attendance_source))}
+                    </strong>
+
+                  </div>
+
+                </div>
+
+                <div className="col-12 col-md-4">
+
+                  <div className="team-selected-info">
+
+                    <span>
                      Attendance Type
                     </span>
 
@@ -2072,7 +2110,7 @@ function TeamMemberDetails({
                       {displayValue(
                         selectedRecord.attendance_category ||
                           selectedRecord.attendance_type ||
-                          selectedRecord.attendance_source
+                          (selectedRecord.attendance_source === "ATTENDANCE_REQUEST" ? "" : selectedRecord.attendance_source)
                       )}
                     </strong>
 

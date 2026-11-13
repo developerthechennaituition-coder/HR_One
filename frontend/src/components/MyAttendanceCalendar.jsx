@@ -11,6 +11,7 @@ const CALENDAR_LEGEND = [
   { key: "halfday", label: "Half-Day Present", background: "#dbeafe", text: "#1e40af" },
   { key: "wfh", label: "Work From Home", background: "#cff4fc", text: "#055160" },
   { key: "absent", label: "Absent", background: "#f8d7da", text: "#842029" },
+  { key: "issue", label: "Attendance Issue", background: "#ffe69c", text: "#664d03" },
   { key: "holiday", label: "Holiday", background: "#e2d9f3", text: "#432874" },
   { key: "medicalleave", label: "Medical Leave (ML)", background: "#f3e8ff", text: "#6b21a8" },
   { key: "leave", label: "Leave", background: "#ffe5d0", text: "#984c0c" },
@@ -219,7 +220,7 @@ function MyAttendanceCalendar({ year, month, range, calendar, loading, selectedD
                         <span className="fw-semibold">{Number(day.attendance_date.slice(8, 10))}</span>
                         <span className="d-flex gap-1">
                           {isHalfDayPresent && <span className="fw-bold" aria-label={day.half_day_present} title={day.half_day_present} style={{ fontSize: 16, lineHeight: 1 }}>{halfSymbol}</span>}
-                          {day.has_attendance_issue && <span className="fw-bold text-warning" aria-label="Attendance issue" title={(day.attendance_issue_details || []).join(", ")}>⚠</span>}
+                          {(statusKey === "issue" || day.has_attendance_issue) && <span className="fw-bold text-warning" aria-label="Attendance issue" title={(day.attendance_issue_details || []).join(", ")}>⚠</span>}
                           {day.permissions?.length > 0 && <span className="badge text-bg-info" style={{ fontSize: 9 }}>P</span>}
                           {day.request && <span className="badge text-bg-warning" style={{ fontSize: 9 }}>Req</span>}
                         </span>
