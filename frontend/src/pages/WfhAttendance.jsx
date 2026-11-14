@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { HRONE_API_BASE } from "../config/api.js";
+import { formatIST } from "../services/attendanceHistoryFormat";
 
 // Use the shared API base (same source as notifications, attendance, leave and
 // payroll). The page previously derived its own base from the browser's
@@ -21,6 +22,9 @@ const PUBLIC_FRONTEND_URL = (
 ).replace(/\/+$/, "");
 const LOCATION_TIMEOUT_MS = 30000;
 const LOCATION_REFINEMENT_MS = 2500;
+// Re-read GPS before the final submit if the earlier reading is older than this
+// (the server accepts readings up to 120 s old by default).
+const LOCATION_REUSE_LIMIT_MS = 45000;
 const DEFAULT_MAX_WFH_LOCATION_ACCURACY_METERS = 100;
 
 const formatTime = (time) => {
@@ -30,6 +34,16 @@ const formatTime = (time) => {
   return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 };
 
+const WFH_FIELD_LABELS = {
+  latitude: "Latitude",
+  longitude: "Longitude",
+  accuracy_m: "GPS accuracy",
+  location_timestamp: "Location time",
+  purpose: "Action",
+  challenge_id: "Face verification session",
+  frames: "Face capture",
+};
+
 const formatApiError = (detail) => {
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail)) {
@@ -37,9 +51,10 @@ const formatApiError = (detail) => {
       .map((item) => {
         if (typeof item === "string") return item;
         if (!item || typeof item !== "object") return "";
-        const location = Array.isArray(item.loc)
+        const field = Array.isArray(item.loc)
           ? item.loc.filter((part) => part !== "body").join(".")
           : "";
+        const location = WFH_FIELD_LABELS[field] || field;
         const message = typeof item.msg === "string" ? item.msg : "";
         return [location, message].filter(Boolean).join(": ");
       })
@@ -74,6 +89,8 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const workingRef = useRef(false);
+  // server clock minus device clock (ms); aligns location timestamps with the server.
+  const serverClockOffsetRef = useRef(0);
   const locationCancelRef = useRef(null);
   const mountedRef = useRef(true);
   const loadInFlightRef = useRef(null);
@@ -91,8 +108,10 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
   const apiRequest = useCallback(
     async (path, options = {}) => {
       let response;
+      const requestStartedAt = Date.now();
       try {
         response = await fetch(`${API_BASE_URL}/api/attendance${path}`, {
+          cache: "no-store",
           ...options,
           headers: { ...headers(), ...options.headers },
         });
@@ -104,11 +123,19 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
         throw connectionError;
       }
       const data = await response.json().catch(() => ({}));
+      if (response.ok && Number.isFinite(data?.server_time_ms)) {
+        // Assume the server stamped the response mid-flight.
+        const deviceMidpoint = (requestStartedAt + Date.now()) / 2;
+        serverClockOffsetRef.current = data.server_time_ms - deviceMidpoint;
+      }
       if (!response.ok) {
         const requestError = new Error(
           response.status === 401
             ? "Your session has expired. Please login again."
-            : formatApiError(data?.detail) || "Unable to complete WFH attendance.",
+            : formatApiError(data?.detail) ||
+              (response.status === 422
+                ? "The location details could not be validated. Allow location access, wait for a fresh GPS reading and try again."
+                : "Unable to complete WFH attendance."),
         );
         requestError.status = response.status;
         throw requestError;
@@ -177,6 +204,36 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
     };
   }, []);
 
+  // Location fields for the API. location_age_ms is measured with the device's
+  // monotonic timer at the moment of sending, so it is independent of the
+  // device and server clocks (which can differ by minutes).
+  const locationFields = (location) => ({
+    latitude: location.latitude,
+    longitude: location.longitude,
+    accuracy_m: location.accuracy,
+    location_timestamp: location.timestamp,
+    ...(Number.isFinite(location.receivedPerf)
+      ? { location_age_ms: Math.max(0, Math.round(performance.now() - location.receivedPerf)) }
+      : {}),
+  });
+
+  // A reading can legitimately go stale (slow network, phone woke from sleep).
+  // When the server reports that, take one new live reading and resend; the
+  // server still applies every freshness, accuracy and radius check.
+  const isOutdatedLocationError = (error) =>
+    error?.status === 422 && /outdated/i.test(error?.message || "");
+
+  const sendWithFreshLocation = async (send, location, maxAccuracy) => {
+    try {
+      return { result: await send(location), location };
+    } catch (error) {
+      if (!isOutdatedLocationError(error)) throw error;
+      setWorkingMessage("Taking a fresh location reading...");
+      const refreshed = await detectLocation(setWorkingMessage, maxAccuracy);
+      return { result: await send(refreshed), location: refreshed };
+    }
+  };
+
   const detectLocation = (onAccuracyUpdate, maxAccuracy) =>
     new Promise((resolve, reject) => {
       if (!window.isSecureContext) {
@@ -196,6 +253,12 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
       let refinementId;
       let bestPosition = null;
       let bestAccuracy = Number.POSITIVE_INFINITY;
+      // Time (on the server's clock) at which the best reading was received.
+      // The position's own timestamp can be minutes old on desktop location
+      // providers, and device clocks can be wrong; both made fresh readings
+      // look "outdated". maximumAge: 0 guarantees the reading itself is fresh.
+      let bestReceivedAt = Date.now() + serverClockOffsetRef.current;
+      let bestReceivedPerf = performance.now();
       const accuracyLimit =
         Number.isFinite(maxAccuracy) && maxAccuracy > 0
           ? maxAccuracy
@@ -238,7 +301,7 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
           finish(
             reject,
             new Error(
-              `Your device reported location accuracy of ±${Math.round(bestAccuracy)} m, which is not precise enough for the 100 m WFH geofence. Ethernet does not provide physical coordinates by itself. Enable Windows Location Services and browser location access, retry, or use an approved GPS-capable mobile device. Manual home coordinates cannot replace your live attendance location.`,
+              `Your device reported location accuracy of ±${Math.round(bestAccuracy)} m, which is not precise enough (maximum allowed ±${Math.round(accuracyLimit)} m). Ethernet does not provide physical coordinates by itself. Enable Windows Location Services and browser location access, retry, or use an approved GPS-capable mobile device. Manual home coordinates cannot replace your live attendance location.`,
             ),
           );
           return;
@@ -248,7 +311,8 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
           latitude: bestPosition.coords.latitude,
           longitude: bestPosition.coords.longitude,
           accuracy: bestPosition.coords.accuracy,
-          timestamp: bestPosition.timestamp,
+          timestamp: bestReceivedAt,
+          receivedPerf: bestReceivedPerf,
         });
       }, LOCATION_TIMEOUT_MS);
 
@@ -273,6 +337,8 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
             if (coords.accuracy < bestAccuracy) {
               bestPosition = position;
               bestAccuracy = coords.accuracy;
+              bestReceivedAt = Date.now() + serverClockOffsetRef.current;
+              bestReceivedPerf = performance.now();
             }
             onAccuracyUpdate?.(
               "Location reading received. Waiting briefly for a more accurate fresh reading...",
@@ -288,7 +354,8 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
                   latitude: bestPosition.coords.latitude,
                   longitude: bestPosition.coords.longitude,
                   accuracy: bestPosition.coords.accuracy,
-                  timestamp: bestPosition.timestamp,
+                  timestamp: bestReceivedAt,
+                  receivedPerf: bestReceivedPerf,
                 });
               }, LOCATION_REFINEMENT_MS);
             }
@@ -340,22 +407,23 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
     setWorking(true); setError(""); setNotice("");
     try {
       setWorkingMessage("Getting a fresh GPS location for registration...");
-      const location = await detectLocation((message) => setWorkingMessage(message), settings?.max_location_accuracy_meters || DEFAULT_MAX_WFH_LOCATION_ACCURACY_METERS);
+      const registerAccuracyLimit = settings?.max_location_accuracy_meters || DEFAULT_MAX_WFH_LOCATION_ACCURACY_METERS;
+      const location = await detectLocation((message) => setWorkingMessage(message), registerAccuracyLimit);
       setWorkingMessage("Saving your registered WFH location...");
-      const result = await apiRequest("/wfh/location/register", {
-        method: "POST",
-        body: JSON.stringify({
-          latitude: location.latitude,
-          longitude: location.longitude,
-          accuracy_m: location.accuracy,
-          location_timestamp: location.timestamp,
+      const { result } = await sendWithFreshLocation(
+        (reading) => apiRequest("/wfh/location/register", {
+          method: "POST",
+          body: JSON.stringify(locationFields(reading)),
         }),
-      });
+        location,
+        registerAccuracyLimit,
+      );
       setSettings((current) => current ? {
         ...current,
         home_location_configured: true,
         location_registration_required: false,
         home_location_accuracy_meters: result.accuracy_meters,
+        home_location_updated_at: result.registered_at,
       } : current);
       setNotice(`Your WFH location is registered successfully (GPS accuracy ±${Math.round(result.accuracy_meters)} m). HR Admin can now view the registration status.`);
     } catch (e) {
@@ -444,12 +512,7 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
       body: JSON.stringify({
         purpose,
         ...(location
-          ? {
-              latitude: location.latitude,
-              longitude: location.longitude,
-              accuracy_m: location.accuracy,
-              location_timestamp: location.timestamp,
-            }
+          ? locationFields(location)
           : {}),
       }),
     });
@@ -509,21 +572,24 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
       setSettings(currentSettings);
 
       setWorkingMessage("Checking your location...");
-      const location = await detectLocation(
+      const initialLocation = await detectLocation(
         setWorkingMessage,
         currentSettings.max_location_accuracy_meters,
       );
       setWorkingMessage("Verifying your location against approved WFH places...");
-      const locationVerification = await apiRequest("/wfh/location/verify", {
-        method: "POST",
-        body: JSON.stringify({
-          latitude: location.latitude,
-          longitude: location.longitude,
-          accuracy_m: location.accuracy,
-          location_timestamp: location.timestamp,
-          purpose: action,
+      const verified = await sendWithFreshLocation(
+        (reading) => apiRequest("/wfh/location/verify", {
+          method: "POST",
+          body: JSON.stringify({
+            ...locationFields(reading),
+            purpose: action,
+          }),
         }),
-      });
+        initialLocation,
+        currentSettings.max_location_accuracy_meters,
+      );
+      const locationVerification = verified.result;
+      const location = verified.location;
       if (!mountedRef.current) return;
       setLocationResult({
         distance_meters: locationVerification.distance_meters,
@@ -534,17 +600,30 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
       setWorkingMessage("Starting face verification...");
       const capture = await getLiveFrames(action, location);
       if (!mountedRef.current) return;
+      // Camera verification can take a while. The server only accepts a recent
+      // location reading, so take a new live reading (still fully verified
+      // server-side) when the earlier one is getting old.
+      let finalLocation = location;
+      if (performance.now() - location.receivedPerf > LOCATION_REUSE_LIMIT_MS) {
+        setWorkingMessage("Refreshing your location for final verification...");
+        finalLocation = await detectLocation(
+          setWorkingMessage,
+          currentSettings.max_location_accuracy_meters,
+        );
+        if (!mountedRef.current) return;
+      }
       setWorkingMessage("Verifying your face...");
-      const record = await apiRequest(`/wfh/${action.replace("_", "-")}`, {
-        method: "POST",
-        body: JSON.stringify({
-          latitude: location.latitude,
-          longitude: location.longitude,
-          accuracy_m: location.accuracy,
-          location_timestamp: location.timestamp,
-          ...capture,
+      const { result: record } = await sendWithFreshLocation(
+        (reading) => apiRequest(`/wfh/${action.replace("_", "-")}`, {
+          method: "POST",
+          body: JSON.stringify({
+            ...locationFields(reading),
+            ...capture,
+          }),
         }),
-      });
+        finalLocation,
+        currentSettings.max_location_accuracy_meters,
+      );
       if (!mountedRef.current) return;
       const distance =
         action === "check_in"
@@ -850,7 +929,7 @@ function WfhAttendance({ session, fallbackPurpose = null }) {
       ) : (
         <>
           {settings?.location_registration_required && <div className="alert alert-warning" role="alert">HR Admin has reset your location. Register your current location again before WFH attendance.</div>}
-          {settings?.home_location_configured && <div className="alert alert-success py-2" role="status">WFH location registered{settings.home_location_accuracy_meters != null ? ` · GPS accuracy ±${Math.round(settings.home_location_accuracy_meters)} m` : ""}. Contact HR Admin if you need to register a different location.</div>}
+          {settings?.home_location_configured && <div className="alert alert-success py-2" role="status">WFH location registered{settings.home_location_accuracy_meters != null ? ` · GPS accuracy ±${Math.round(settings.home_location_accuracy_meters)} m` : ""}{settings.home_location_updated_at ? ` · Registered ${formatIST(settings.home_location_updated_at)}` : ""}. Contact HR Admin if you need to register a different location.</div>}
           <div className="card border-0 shadow-sm mb-4">
             <div className="card-body">
               <h3 className="h5 mb-3">Today&apos;s Status</h3>

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { parseInstant } from "../services/attendanceHistoryFormat.js";
 
 import {
   getNotifications,
@@ -33,13 +34,13 @@ function NotificationPanel({
       return "-";
     }
 
-    const date = new Date(value);
+    const date = parseInstant(value);
 
-    if (Number.isNaN(date.getTime())) {
+    if (!date || Number.isNaN(date.getTime())) {
       return "-";
     }
 
-    return date.toLocaleString();
+    return date.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" });
   };
 
   /**

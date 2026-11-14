@@ -178,11 +178,31 @@ def permission_minutes_outside_total_duration(permission_intervals: list[tuple[A
     return max(0, outside)
 
 
-def attendance_issue(check_in: Any, check_out: Any, working_intervals: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Describe incomplete/inconsistent punches without changing attendance status."""
+def attendance_issue(
+    check_in: Any,
+    check_out: Any,
+    working_intervals: list[dict[str, Any]] | None = None,
+    *,
+    attendance_date: Any = None,
+    now: datetime | None = None,
+    scheduled_start: Any = None,
+    scheduled_end: Any = None,
+) -> dict[str, Any]:
+    """Describe incomplete/inconsistent punches without changing attendance status.
+
+    When ``attendance_date`` and ``now`` are given, a Check-In without a Check-Out
+    is only reported once the scheduled work end time has passed (the next day for
+    an overnight shift). Without them the previous, time-agnostic behaviour applies.
+    """
     issues: list[str] = []
     if bool(check_in) != bool(check_out):
-        issues.append("Missing check-out time" if check_in else "Missing check-in time")
+        if not check_in:
+            issues.append("Missing check-in time")
+        elif attendance_date is None or now is None or missing_checkout_issue(
+            status="Present", check_in=check_in, check_out=check_out, attendance_date=attendance_date,
+            now=now, scheduled_start=scheduled_start, scheduled_end=scheduled_end,
+        ):
+            issues.append("Missing check-out time")
     intervals = working_intervals or []
     normalized: list[tuple[int, int]] = []
     for interval in intervals:
@@ -217,6 +237,33 @@ def is_attendance_issue_status(status: Any) -> bool:
     return str(status or "").strip().casefold() == "attendance issue"
 
 
+def missing_checkout_deadline(
+    attendance_date: Any,
+    scheduled_start: Any = None,
+    scheduled_end: Any = None,
+    tzinfo: Any = None,
+) -> datetime | None:
+    """Moment after which a missing Check-Out becomes an Attendance Issue.
+
+    * Normal shift (end > start): the scheduled end time on the attendance date.
+    * Overnight shift (end <= start): the scheduled end time on the NEXT day.
+    * No usable schedule: the end of the attendance date (previous behaviour);
+      no default shift is invented.
+    """
+    try:
+        day = attendance_date if isinstance(attendance_date, date) and not isinstance(attendance_date, datetime) \
+            else date.fromisoformat(str(attendance_date)[:10])
+    except (TypeError, ValueError):
+        return None
+    end_min = _clock_minutes(scheduled_end)
+    if end_min is None:
+        return datetime.combine(day + timedelta(days=1), time.min, tzinfo=tzinfo)
+    start_min = _clock_minutes(scheduled_start)
+    overnight = start_min is not None and end_min <= start_min
+    base = day + timedelta(days=1) if overnight else day
+    return datetime.combine(base, time.min, tzinfo=tzinfo) + timedelta(minutes=end_min)
+
+
 def missing_checkout_issue(
     *,
     status: Any,
@@ -227,28 +274,20 @@ def missing_checkout_issue(
     scheduled_start: Any = None,
     scheduled_end: Any = None,
 ) -> bool:
-    """True when the employee checked in, never checked out and the day is over.
+    """True when the employee checked in, never checked out and the scheduled
+    work end time has already passed.
 
-    The current day is never an issue while it is still open. For an overnight
-    schedule (end <= start) the day stays open until four hours after the
-    scheduled end on the following morning, matching the punch grouping used by
-    the daily calculation.
+    Until the scheduled end time (on the same day, or the following day for an
+    overnight shift) the attendance is still open and is never an issue.
     """
     if str(status or "").strip().casefold() not in _ISSUE_ELIGIBLE_STATUSES:
         return False
     if not check_in or check_out:
         return False
-    try:
-        day = attendance_date if isinstance(attendance_date, date) and not isinstance(attendance_date, datetime) \
-            else date.fromisoformat(str(attendance_date)[:10])
-    except (TypeError, ValueError):
+    deadline = missing_checkout_deadline(attendance_date, scheduled_start, scheduled_end, now.tzinfo)
+    if deadline is None:
         return False
-    cutoff = datetime.combine(day + timedelta(days=1), time.min, tzinfo=now.tzinfo)
-    start_min = _clock_minutes(scheduled_start)
-    end_min = _clock_minutes(scheduled_end)
-    if start_min is not None and end_min is not None and end_min <= start_min:
-        cutoff += timedelta(minutes=end_min, hours=4)
-    return now >= cutoff
+    return now >= deadline
 
 
 def effective_attendance_status(
@@ -271,7 +310,9 @@ def effective_attendance_status(
         now=now, scheduled_start=scheduled_start, scheduled_end=scheduled_end,
     ):
         return ATTENDANCE_ISSUE_STATUS
-    if is_attendance_issue_status(text) and check_in and check_out:
+    if is_attendance_issue_status(text) and check_in:
+        # Check-Out now exists, or the scheduled end time has not passed yet
+        # (e.g. a stale stored issue): the day is a normal Present day.
         return "Present"
     return text
 

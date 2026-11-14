@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { parseInstant } from "../services/attendanceHistoryFormat.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteLeaveNotification,
@@ -58,8 +59,8 @@ function formatDate(value) {
 
 function formatDateTime(value) {
   if (!value) return "";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? "" : parsed.toLocaleString("en-IN", {
+  const parsed = parseInstant(value);
+  return !parsed ? "" : parsed.toLocaleString("en-IN", {
     timeZone: "Asia/Kolkata",
     day: "2-digit",
     month: "short",
@@ -150,6 +151,12 @@ function Leave({ user, onNavigate }) {
   const isApprover = isAdminApprover || canViewApprovalQueue;
 
   const [activeTab, setActiveTab] = useState("dashboard");
+  // Ticks every 30s so cancellation buttons disable as soon as the deadline passes.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [leaveTypes, setLeaveTypes] = useState([]);
   const [balances, setBalances] = useState([]);
   const [requests, setRequests] = useState([]);
@@ -610,11 +617,25 @@ function Leave({ user, onNavigate }) {
       );
     }
     if (!["pending", "approved"].includes(request.status)) return null;
-    if (request.can_cancel) {
-      return <button className="btn btn-sm btn-outline-danger" disabled={processingId === request.id} onClick={() => handleCancel(request)}>{request.status === "approved" ? "Request Cancellation" : "Cancel"}</button>;
-    }
     if (request.cancellation?.status === "pending") return <span className="small text-muted">Cancellation pending</span>;
-    return <span className="small text-muted">Cancel closed</span>;
+    // The server decides can_cancel when the list loads; the deadline is also
+    // re-checked against the live clock so the button disables itself the
+    // moment the cancellation period ends, without a page refresh.
+    const deadlineMs = request.cancel_deadline ? new Date(request.cancel_deadline).getTime() : NaN;
+    const deadlinePassed = Number.isFinite(deadlineMs) && nowMs >= deadlineMs;
+    const cancellable = Boolean(request.can_cancel) && !deadlinePassed;
+    const label = request.status === "approved" ? "Request Cancellation" : "Cancel";
+    return (
+      <button
+        type="button"
+        className="btn btn-sm btn-outline-danger"
+        disabled={!cancellable || processingId === request.id}
+        title={cancellable ? undefined : "The cancellation deadline for this leave has passed."}
+        onClick={() => cancellable && handleCancel(request)}
+      >
+        {label}
+      </button>
+    );
   };
 
   const renderRequestsTable = (rows, approval = false, cancellation = false) => (
@@ -651,8 +672,12 @@ function Leave({ user, onNavigate }) {
               {request.cancellation?.status === "rejected" && !cancellation && (
                 <div className="small text-muted mt-1">Cancellation rejected; leave remains approved.</div>
               )}
-              {!approval && request.can_cancel && request.cancel_deadline && (
-                <div className="small text-muted mt-1">Cancel until {formatDateTime(request.cancel_deadline)}</div>
+              {!approval && request.cancel_deadline && ["pending", "approved"].includes(request.status) && request.cancellation?.status !== "pending" && (
+                <div className="small text-muted mt-1">
+                  {request.can_cancel && !(nowMs >= new Date(request.cancel_deadline).getTime())
+                    ? `Cancel until ${formatDateTime(request.cancel_deadline)}`
+                    : `Cancellation closed on ${formatDateTime(request.cancel_deadline)}`}
+                </div>
               )}
             </td>
             <td className="text-end">{renderActionCell(request, approval, cancellation)}</td>
@@ -663,7 +688,7 @@ function Leave({ user, onNavigate }) {
   );
 
   const visibleLeaveNotifications = notifications.filter((item) => {
-    const parsed = item.created_at ? new Date(item.created_at) : null;
+    const parsed = item.created_at ? parseInstant(item.created_at) : null;
     const matchesDate = !leaveNotificationDate || (parsed && !Number.isNaN(parsed.getTime()) &&
       new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(parsed) === leaveNotificationDate);
     const matchesStar = leaveNotificationStarFilter === "all" ||

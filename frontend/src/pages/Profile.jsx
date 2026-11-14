@@ -5,7 +5,7 @@ import AttendanceDayBreakdown from "../components/AttendanceDayBreakdown";
 import MyHolidayCalendar from "../components/MyHolidayCalendar";
 import { authenticatedFetch as fetch } from "../services/authenticatedFetch";
 import { buildCalendarRange, clampMonth, dateState, isMonthInRange, isSelectableDate, minSelectableDate, monthOptions, yearOptions } from "../services/attendanceCalendarRange";
-import { formatAttendanceClock } from "../services/attendanceHistoryFormat";
+import { formatAttendanceClock, parseInstant } from "../services/attendanceHistoryFormat";
 import { attendanceCalendarHalfSymbol, attendanceCalendarLabel, attendanceCalendarPortions, attendanceCalendarStatusKey, formatAttendanceCount, summarizeAttendancePortions } from "../services/attendanceCalendarStatus";
 import { roleLabel } from "../services/roleLabels";
 
@@ -1367,9 +1367,7 @@ function Profile({ onNavigate }) {
 
   const formattedLastLogin =
     user.last_login
-      ? new Date(
-          user.last_login,
-        ).toLocaleString("en-IN", {
+      ? (parseInstant(user.last_login) || new Date(user.last_login)).toLocaleString("en-IN", {
           timeZone: "Asia/Kolkata",
           day: "2-digit",
           month: "2-digit",

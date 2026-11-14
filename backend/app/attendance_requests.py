@@ -45,6 +45,7 @@ from app.attendance import (
     _is_automatic_attendance_record,
     is_wfh_auto_absent,
     record_effective_status,
+    company_now,
 )
 from app.db.mongodb import db
 from app.attendance_calculations import (
@@ -608,7 +609,12 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
             half_day.update(combine_half_day_statuses(record["first_half_status"], record["second_half_status"]))
             half_day["half_day_eligibility"] = record.get("half_day_eligibility")
             half_day["actual_working_minutes"] = record.get("actual_working_minutes", effective_minutes)
-        issue = attendance_issue(day_check_in, day_check_out, daily_metrics.get("working_intervals") or [])
+        issue = attendance_issue(
+            day_check_in, day_check_out, daily_metrics.get("working_intervals") or [],
+            attendance_date=current, now=company_now(),
+            scheduled_start=schedule.get("scheduled_work_start_time"),
+            scheduled_end=schedule.get("scheduled_work_end_time"),
+        )
         is_issue_date = day_status == ATTENDANCE_ISSUE
         if is_issue_date:
             # An Attendance Issue is neither Present nor Absent in any half-day count.

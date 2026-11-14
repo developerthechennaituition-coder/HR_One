@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HRONE_API_BASE } from "../config/api.js";
 import { roleLabel, ROLE_OPTIONS } from "../services/roleLabels";
 import Pagination from "../components/Pagination";
+import { formatIST } from "../services/attendanceHistoryFormat";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || HRONE_API_BASE).replace(/\/+$/, "");
 const WFH_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
@@ -262,7 +263,7 @@ function WfhAdminSettings({ session }) {
       return;
     }
     const accuracy = employee.home_location_accuracy_meters != null ? `\nReported GPS accuracy: ±${Math.round(employee.home_location_accuracy_meters)} m` : "";
-    const registered = employee.home_location_updated_at ? `\nRegistered/updated: ${new Date(employee.home_location_updated_at).toLocaleString()}` : "";
+    const registered = employee.home_location_updated_at ? `\nRegistered/updated: ${formatIST(employee.home_location_updated_at)}` : "";
     window.alert(`Registered WFH location for ${employee.name}\nLatitude: ${employee.home_latitude}\nLongitude: ${employee.home_longitude}${accuracy}${registered}`);
   };
 
@@ -375,7 +376,7 @@ function WfhAdminSettings({ session }) {
                     {employee.is_wfh_enabled && hasPermission && <small className="d-block text-muted mt-1">{employee.wfh_permitted_from} → {employee.wfh_permitted_to}</small>}
                   </td>
                   <td><button type="button" className={`btn btn-sm ${employee.face_registered ? "btn-outline-success" : "btn-outline-secondary"}`} onClick={() => showFace(employee)}>{employee.face_registered ? "Face Registered" : "Not Registered"}</button></td>
-                  <td><button type="button" className={`btn btn-sm ${locationRegistered ? "btn-outline-success" : "btn-outline-secondary"}`} onClick={() => showLocation(employee)}>{locationRegistered ? "Location Registered" : "Not Registered"}</button>{locationRegistered && employee.home_location_accuracy_meters != null && <small className="d-block text-muted mt-1">±{Math.round(employee.home_location_accuracy_meters)} m</small>}</td>
+                  <td><button type="button" className={`btn btn-sm ${locationRegistered ? "btn-outline-success" : "btn-outline-secondary"}`} onClick={() => showLocation(employee)}>{locationRegistered ? "Location Registered" : "Not Registered"}</button>{locationRegistered && employee.home_location_accuracy_meters != null && <small className="d-block text-muted mt-1">±{Math.round(employee.home_location_accuracy_meters)} m</small>}{locationRegistered && employee.home_location_updated_at && <small className="d-block text-muted">{formatIST(employee.home_location_updated_at)}</small>}</td>
                   <td><div className="d-flex flex-wrap gap-1"><button type="button" className="btn btn-primary btn-sm" onClick={() => saveEmployee(employee)} disabled={savingId === employee.user_id}>{savingId === employee.user_id ? "Saving..." : "Save"}</button><button type="button" className="btn btn-outline-danger btn-sm" onClick={() => resetFace(employee)} disabled={!employee.face_registered || busy}>{busyAction === `${employee.user_id}:face` ? "Resetting..." : "Reset Face"}</button><button type="button" className="btn btn-outline-warning btn-sm" onClick={() => resetLocation(employee)} disabled={!locationRegistered || busy}>{busyAction === `${employee.user_id}:location` ? "Resetting..." : "Reset Location"}</button></div></td>
                 </tr>;
               })}</tbody>
@@ -516,7 +517,7 @@ function WfhAdminSettings({ session }) {
                         <dt className="col-sm-5">Registered at</dt>
                         <dd className="col-sm-7">
                           {faceDetails.registered_at
-                            ? new Date(faceDetails.registered_at).toLocaleString()
+                            ? formatIST(faceDetails.registered_at)
                             : "Not available"}
                         </dd>
                         <dt className="col-sm-5">Photograph</dt>

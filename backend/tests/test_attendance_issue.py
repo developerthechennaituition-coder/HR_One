@@ -55,11 +55,68 @@ class AttendanceIssueTests(unittest.TestCase):
         )
         self.assertEqual(status, "Present")
 
-    def test_overnight_shift_stays_open_until_four_hours_after_end(self):
+    def test_overnight_shift_stays_open_until_scheduled_end_next_day(self):
         kwargs = dict(status="Present", check_in="22:00", check_out=None, attendance_date="2026-11-12",
                       scheduled_start="22:00", scheduled_end="06:00")
-        self.assertFalse(missing_checkout_issue(now=at(13, 9, 59), **kwargs))
-        self.assertTrue(missing_checkout_issue(now=at(13, 10, 0), **kwargs))
+        self.assertFalse(missing_checkout_issue(now=at(12, 23, 30), **kwargs))
+        self.assertFalse(missing_checkout_issue(now=at(13, 5, 59), **kwargs))
+        self.assertTrue(missing_checkout_issue(now=at(13, 6, 0), **kwargs))
+
+    def test_same_day_shift_is_open_until_scheduled_end_time(self):
+        kwargs = dict(status="Present", check_in="09:05", check_out=None, attendance_date="2026-11-13",
+                      scheduled_start="09:00", scheduled_end="18:00")
+        self.assertFalse(missing_checkout_issue(now=at(13, 12, 0), **kwargs))
+        self.assertFalse(missing_checkout_issue(now=at(13, 17, 59), **kwargs))
+        self.assertTrue(missing_checkout_issue(now=at(13, 18, 0), **kwargs))
+        self.assertTrue(missing_checkout_issue(now=at(13, 23, 0), **kwargs))
+
+    def test_past_day_uses_its_own_schedule_end(self):
+        kwargs = dict(status="Present", check_in="09:00", check_out=None, attendance_date="2026-11-10",
+                      scheduled_start="09:00", scheduled_end="18:00")
+        self.assertTrue(missing_checkout_issue(now=at(13, 8, 0), **kwargs))
+
+    def test_early_shift_ends_before_noon(self):
+        kwargs = dict(status="Present", check_in="06:00", check_out=None, attendance_date="2026-11-13",
+                      scheduled_start="06:00", scheduled_end="14:00")
+        self.assertFalse(missing_checkout_issue(now=at(13, 13, 59), **kwargs))
+        self.assertTrue(missing_checkout_issue(now=at(13, 14, 0), **kwargs))
+
+    def test_checked_out_before_end_is_never_issue(self):
+        status = effective_attendance_status(
+            "Present", check_in="09:00", check_out="13:00", attendance_date="2026-11-13", now=at(13, 20),
+            scheduled_start="09:00", scheduled_end="18:00",
+        )
+        self.assertEqual(status, "Present")
+
+    def test_stale_stored_issue_before_deadline_reverts_to_present(self):
+        status = effective_attendance_status(
+            ATTENDANCE_ISSUE_STATUS, check_in="09:00", check_out=None, attendance_date="2026-11-13",
+            now=at(13, 12), scheduled_start="09:00", scheduled_end="18:00",
+        )
+        self.assertEqual(status, "Present")
+
+    def test_stored_issue_after_deadline_stays_issue(self):
+        status = effective_attendance_status(
+            ATTENDANCE_ISSUE_STATUS, check_in="09:00", check_out=None, attendance_date="2026-11-13",
+            now=at(13, 19), scheduled_start="09:00", scheduled_end="18:00",
+        )
+        self.assertEqual(status, ATTENDANCE_ISSUE_STATUS)
+
+    def test_attendance_issue_details_respect_deadline(self):
+        from app.attendance_calculations import attendance_issue
+        kw = dict(attendance_date="2026-11-13", scheduled_start="09:00", scheduled_end="18:00")
+        self.assertFalse(attendance_issue("09:00", None, [], now=at(13, 12), **kw)["has_attendance_issue"])
+        self.assertEqual(
+            attendance_issue("09:00", None, [], now=at(13, 18, 1), **kw)["attendance_issue_details"],
+            ["Missing check-out time"],
+        )
+        # A missing check-in is still reported immediately.
+        self.assertTrue(attendance_issue(None, "17:00", [], now=at(13, 12), **kw)["has_attendance_issue"])
+
+    def test_no_schedule_falls_back_to_end_of_day(self):
+        kwargs = dict(status="Present", check_in="09:00", check_out=None, attendance_date="2026-11-12")
+        self.assertFalse(missing_checkout_issue(now=at(12, 23, 59), **kwargs))
+        self.assertTrue(missing_checkout_issue(now=at(13, 0, 0), **kwargs))
 
     def test_issue_is_not_overridden_to_present_or_absent_by_half_day_rules(self):
         override = half_day_status_override(

@@ -853,13 +853,17 @@ def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user:
 
 def _can_cancel(record: dict[str, Any], viewer: dict[str, Any] | None) -> bool:
     """Employee can cancel until company start time on the leave start date.
-    HR / Admin approvers are exempt from the deadline."""
+    HR / Admin are exempt from the deadline only for other employees' requests."""
     if record.get("status") not in {"pending", "approved"}:
         return False
     if (record.get("cancellation") or {}).get("status") == "pending":
         return False
-    if viewer and _is_admin_or_hr(viewer):
+    # HR / Admin may cancel other employees' leave after the deadline, but the
+    # deadline always applies to their own leave requests.
+    if viewer and _is_admin_or_hr(viewer) and str(record.get("user_id")) != str(viewer.get("_id")):
         return True
+    if not record.get("from_date"):
+        return False
     return company_now() < leave_cancel_deadline(record["from_date"])
 
 

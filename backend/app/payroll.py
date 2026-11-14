@@ -426,7 +426,7 @@ def _attendance_summary_for_employee(employee_id: str, month: int, year: int, pr
     }, {"status": 1, "leave_type_code": 1, "attendance_date": 1, "leave_day_part": 1, "medical_leave": 1,
         "first_half_status": 1, "second_half_status": 1, "check_in_time": 1, "check_out_time": 1,
         "attendance_source": 1, "hr_admin_modified": 1, "approved_permission": 1,
-        "scheduled_work_start_time": 1, "scheduled_work_end_time": 1}))
+        "scheduled_work_start_time": 1, "scheduled_work_end_time": 1, "user_id": 1}))
 
     leave_codes = {
         str(row.get("leave_type_code") or "").upper()

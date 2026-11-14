@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { parseInstant } from "../services/attendanceHistoryFormat.js";
 import NotificationTargetSelect from "../components/NotificationTargetSelect";
 
 import {
@@ -81,7 +82,7 @@ function NotificationManagement({ user = {}, onNavigate }) {
   }, [canManage]);
 
   const filteredNotifications = notifications.filter((item) => {
-    const created = item.created_at ? new Date(item.created_at) : null;
+    const created = item.created_at ? parseInstant(item.created_at) : null;
     const dateMatches = !dateFilter || (created && !Number.isNaN(created.getTime()) &&
       new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(created) === dateFilter);
     const starredMatches = starFilter === "all" ||
@@ -254,8 +255,8 @@ function NotificationManagement({ user = {}, onNavigate }) {
 
   const formatDate = (value) => {
     if (!value) return "";
-    const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? "" : parsed.toLocaleString("en-IN", {
+    const parsed = parseInstant(value);
+    return !parsed ? "" : parsed.toLocaleString("en-IN", {
       timeZone: "Asia/Kolkata",
       dateStyle: "medium",
       timeStyle: "short",

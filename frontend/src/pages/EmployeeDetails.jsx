@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { parseInstant } from "../services/attendanceHistoryFormat.js";
 import { useEffect, useMemo, useState } from "react";
 
 const API_BASE_URL = HRONE_API_BASE;
@@ -60,7 +61,7 @@ function formatDateTime(value) {
   if (!value) return "-";
 
   try {
-    const date = new Date(value);
+    const date = parseInstant(value) || new Date(value);
 
     if (Number.isNaN(date.getTime())) {
       return value;

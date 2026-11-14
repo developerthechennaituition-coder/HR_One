@@ -32,7 +32,9 @@ from app.attendance import (
     employee_joining_date,
     users_collection,
     refresh_automatic_attendance_calculation,
+    _schedule_fields_for_date,
 )
+from app.attendance_calculations import missing_checkout_issue
 from app.db.mongodb import db
 
 
@@ -662,8 +664,23 @@ def _save_daily_attendance(
     }
     # A finished day with a Check-In but no Check-Out is an Attendance Issue,
     # never Present. It reverts to Present as soon as a Check-Out punch arrives.
-    day_is_over = attendance_date < datetime.now(COMPANY_TZ).date().isoformat()
-    missing_checkout = last is None and day_is_over
+    # It only counts once the employee's scheduled work end time has passed
+    # (next day for overnight shifts); the current open day is never an issue.
+    missing_checkout = False
+    if last is None:
+        try:
+            schedule = _schedule_fields_for_date(str(user["_id"]), date.fromisoformat(attendance_date))
+        except Exception:
+            schedule = {}
+        missing_checkout = missing_checkout_issue(
+            status="Present",
+            check_in=first,
+            check_out=None,
+            attendance_date=attendance_date,
+            now=datetime.now(COMPANY_TZ),
+            scheduled_start=schedule.get("scheduled_work_start_time"),
+            scheduled_end=schedule.get("scheduled_work_end_time"),
+        )
     values = {
         "employee_id": user.get("employee_id", ""),
         "status": "Attendance Issue" if missing_checkout else "Present",

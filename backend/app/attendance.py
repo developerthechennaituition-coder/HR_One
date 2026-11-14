@@ -52,7 +52,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from bson import ObjectId
-from fastapi import APIRouter, Header, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -106,7 +106,7 @@ logger = logging.getLogger(__name__)
 WFH_MAX_LOCATION_ACCURACY_METERS = 100
 WFH_MAX_ALLOWED_RADIUS_METERS = 5000
 WFH_MAX_LOCATION_AGE_SECONDS = 120
-WFH_MAX_LOCATION_FUTURE_SKEW_SECONDS = 30
+WFH_MAX_LOCATION_FUTURE_SKEW_SECONDS = 120
 WFH_LATE_CHECK_IN_REQUEST_TYPE = "wfh_late_check_in"
 WFH_LATE_CHECK_IN_EXTENSION = timedelta(hours=2)
 WFH_ATTENDANCE_ENABLED = os.getenv(
@@ -203,15 +203,39 @@ def record_effective_status(record: dict[str, Any] | None, now: datetime | None 
         and not (record.get("check_in_time") or record.get("check_out_time"))
     ):
         return "Absent"
+    check_in = record.get("check_in_time") or record.get("check_in_at")
+    check_out = record.get("check_out_time") or record.get("check_out_at")
+    scheduled_start = record.get("scheduled_work_start_time")
+    scheduled_end = record.get("scheduled_work_end_time")
+    if check_in and not check_out and not scheduled_end:
+        # The punch row may not carry the schedule (e.g. ESSL rows): use the
+        # schedule applicable to the employee on that attendance date.
+        scheduled_start, scheduled_end = _record_schedule_times(record)
     return effective_attendance_status(
         stored,
-        check_in=record.get("check_in_time") or record.get("check_in_at"),
-        check_out=record.get("check_out_time") or record.get("check_out_at"),
+        check_in=check_in,
+        check_out=check_out,
         attendance_date=record.get("attendance_date") or "",
         now=(now or company_now()),
-        scheduled_start=record.get("scheduled_work_start_time"),
-        scheduled_end=record.get("scheduled_work_end_time"),
+        scheduled_start=scheduled_start,
+        scheduled_end=scheduled_end,
     ) or stored
+
+
+def _record_schedule_times(record: dict[str, Any]) -> tuple[Any, Any]:
+    """(start, end) of the schedule applicable to a stored record's employee and date."""
+    user_id = record.get("user_id")
+    try:
+        day = date.fromisoformat(str(record.get("attendance_date") or "")[:10])
+    except ValueError:
+        return None, None
+    if not user_id:
+        return None, None
+    try:
+        schedule = _schedule_fields_for_date(str(user_id), day)
+    except Exception:  # never let a schedule lookup break a status display
+        return None, None
+    return schedule.get("scheduled_work_start_time"), schedule.get("scheduled_work_end_time")
 
 
 def is_wfh_auto_absent(record: dict[str, Any] | None) -> bool:
@@ -473,12 +497,17 @@ class WfhLocationPayload(BaseModel):
     longitude: float = Field(ge=-180, le=180)
     accuracy_m: float = Field(gt=0)
     location_timestamp: float = Field(gt=0)
+    # Milliseconds between the GPS reading and this request, measured on the
+    # device with a monotonic timer. Unlike location_timestamp it does not
+    # depend on the device clock matching the server clock.
+    location_age_ms: float | None = Field(default=None, ge=0)
 
     @field_validator(
         "latitude",
         "longitude",
         "accuracy_m",
         "location_timestamp",
+        "location_age_ms",
     )
     @classmethod
     def validate_finite_location(cls, value: float | None) -> float | None:
@@ -493,6 +522,7 @@ class WfhChallengePayload(BaseModel):
     longitude: float | None = Field(default=None, ge=-180, le=180)
     accuracy_m: float | None = Field(default=None, gt=0)
     location_timestamp: float | None = Field(default=None, gt=0)
+    location_age_ms: float | None = Field(default=None, ge=0)
 
 
 class WfhFacePayload(BaseModel):
@@ -1379,19 +1409,44 @@ def _configured_wfh_location_max_age_seconds() -> float:
     return max_age
 
 
-def _validate_wfh_location_timestamp(location_timestamp: float) -> None:
-    location_time_seconds = location_timestamp / 1000
+def _validate_wfh_location_timestamp(
+    location_timestamp: float,
+    location_age_ms: float | None = None,
+) -> None:
+    max_age = _configured_wfh_location_max_age_seconds()
+
+    def outdated(age_seconds: float, method: str) -> HTTPException:
+        # Coordinates are never logged; only the freshness numbers are.
+        logger.warning(
+            "WFH location rejected as outdated: age=%.1fs limit=%.0fs method=%s",
+            age_seconds, max_age, method,
+        )
+        return HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"Your location information is outdated: the reading was {round(age_seconds)} s old "
+            f"when it reached the server (limit {round(max_age)} s). "
+            "Please try again to take a fresh reading.",
+        )
+
+    if location_age_ms is not None:
+        # Preferred: the age was measured on the device itself, so a device or
+        # server clock that is a few minutes off cannot reject a fresh reading.
+        age_seconds = location_age_ms / 1000
+        if age_seconds > max_age:
+            raise outdated(age_seconds, "device-timer")
+        return
+    # Legacy clients: compare the reported timestamp with the server clock.
+    # Browsers send epoch milliseconds; tolerate epoch seconds too.
+    location_time_seconds = location_timestamp / 1000 if location_timestamp > 1e11 else location_timestamp
     age_seconds = unix_time() - location_time_seconds
     if age_seconds < -WFH_MAX_LOCATION_FUTURE_SKEW_SECONDS:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "Your location information is invalid. Please try again.",
+            "Your device clock appears to be ahead of the server time, so the location reading was rejected. "
+            "Set your device date and time to automatic and try again.",
         )
-    if age_seconds > _configured_wfh_location_max_age_seconds():
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "Your location information is outdated. Please try again.",
-        )
+    if age_seconds > max_age:
+        raise outdated(age_seconds, "device-clock")
 
 
 def _validate_wfh_location(
@@ -1408,7 +1463,7 @@ def _validate_wfh_location(
             "Enable location services and browser location permission, then retry. "
             "If this computer cannot obtain a precise location, use an approved GPS-capable mobile device.",
         )
-    _validate_wfh_location_timestamp(payload.location_timestamp)
+    _validate_wfh_location_timestamp(payload.location_timestamp, payload.location_age_ms)
 
     candidates: list[dict[str, Any]] = []
     home_latitude = user.get("home_latitude")
@@ -1884,7 +1939,11 @@ def redeem_wfh_email_fallback(payload: WfhEmailFallbackRedeem):
 def get_my_wfh_settings(
     authorization: str | None = Header(default=None),
     purpose: Literal["check_in", "check_out"] | None = Query(default=None),
+    response: Response = None,
 ):
+    # server_time_ms must never come from a cached copy of this response.
+    if response is not None:
+        response.headers["Cache-Control"] = "no-store"
     # Authentication and role are still enforced. Only the employee-level
     # enablement flag is relaxed so the page can show an explicit "not enabled"
     # state instead of a generic error. No WFH details are exposed in that case.
@@ -1893,6 +1952,7 @@ def get_my_wfh_settings(
         return {
             "is_wfh_enabled": False,
             "wfh_company_enabled": bool(WFH_ATTENDANCE_ENABLED),
+            "server_time_ms": unix_time() * 1000,
         }
     if purpose is not None:
         _assert_wfh_email_scope(authorization, purpose)
@@ -1902,6 +1962,9 @@ def get_my_wfh_settings(
     user_id = str(user["_id"])
     record = _today_wfh_attendance(user_id)
     return {
+        # Lets the browser align location timestamps with the server clock so a
+        # wrong device clock cannot make a fresh GPS reading look outdated.
+        "server_time_ms": unix_time() * 1000,
         "is_wfh_enabled": user.get("is_wfh_enabled") is True,
         "wfh_company_enabled": bool(WFH_ATTENDANCE_ENABLED),
         "wfh_permitted_from": user.get("wfh_permitted_from"),
@@ -1914,7 +1977,7 @@ def get_my_wfh_settings(
         ),
         "location_registration_required": bool(user.get("wfh_location_registration_required", False)) or user.get("home_latitude") is None or user.get("home_longitude") is None,
         "home_location_accuracy_meters": user.get("home_location_accuracy_meters"),
-        "home_location_updated_at": user.get("home_location_updated_at"),
+        "home_location_updated_at": _utc_iso(user.get("home_location_updated_at")),
         "allowed_radius": user.get("allowed_radius", 100),
         "approved_locations": [],
         "max_location_accuracy_meters": _configured_wfh_accuracy_limit(),
@@ -2157,7 +2220,7 @@ def generate_due_wfh_absences(now: datetime | None = None) -> dict[str, int]:
 
 
 def mark_attendance_issues(now: datetime | None = None) -> dict[str, int]:
-    """Persist 'Attendance Issue' for finished days with a Check-In but no Check-Out.
+    """Persist 'Attendance Issue' once the scheduled work end time has passed with a Check-In but no Check-Out.
 
     Only Present records are converted. Leave/holiday/weekly-off/half-day/manual
     Absent records and finalized payroll months are never changed. The original
@@ -2168,20 +2231,25 @@ def mark_attendance_issues(now: datetime | None = None) -> dict[str, int]:
     marked = skipped = 0
     candidates = attendance_collection.find({
         "status": "Present",
-        "attendance_date": {"$lt": today_iso},
+        # Today is included: a shift whose scheduled end time has passed is evaluated below.
+        "attendance_date": {"$lte": today_iso},
         "check_in_time": {"$nin": [None, ""]},
         "$or": [{"check_out_time": None}, {"check_out_time": ""}],
     })
     payroll_cache: dict[tuple[str, str], bool] = {}
     for record in candidates:
+        scheduled_start = record.get("scheduled_work_start_time")
+        scheduled_end = record.get("scheduled_work_end_time")
+        if not scheduled_end:
+            scheduled_start, scheduled_end = _record_schedule_times(record)
         if not missing_checkout_issue(
             status=record.get("status"),
             check_in=record.get("check_in_time"),
             check_out=record.get("check_out_time"),
             attendance_date=record.get("attendance_date"),
             now=now_local,
-            scheduled_start=record.get("scheduled_work_start_time"),
-            scheduled_end=record.get("scheduled_work_end_time"),
+            scheduled_start=scheduled_start,
+            scheduled_end=scheduled_end,
         ):
             continue
         # ESSL days may have a later raw punch that the daily row has not absorbed yet.
@@ -2260,7 +2328,7 @@ def list_wfh_employee_settings(
             ),
             "home_location_timestamp": employee.get("home_location_timestamp"),
             "home_location_updated_by": employee.get("home_location_updated_by"),
-            "home_location_updated_at": employee.get("home_location_updated_at"),
+            "home_location_updated_at": _utc_iso(employee.get("home_location_updated_at")),
             "home_location_verification_method": employee.get("home_location_verification_method"),
             "home_location_manually_verified": employee.get("home_location_manually_verified", False),
             "home_location_capture": (
@@ -2443,7 +2511,7 @@ def update_wfh_employee_settings(
         "home_location_verification_method": employee.get("home_location_verification_method"),
         "home_location_manually_verified": employee.get("home_location_manually_verified", False),
         "home_location_updated_by": employee.get("home_location_updated_by"),
-        "home_location_updated_at": employee.get("home_location_updated_at"),
+        "home_location_updated_at": _utc_iso(employee.get("home_location_updated_at")),
         "home_location_capture": (
             {
                 "accuracy": payload.home_location_accuracy_meters,
@@ -2468,7 +2536,7 @@ def register_my_wfh_location(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "WFH is not enabled for your account.")
     if user.get("home_latitude") is not None and user.get("home_longitude") is not None and not user.get("wfh_location_registration_required", False):
         raise HTTPException(status.HTTP_409_CONFLICT, "Your WFH location is already registered. Contact HR Admin to reset it before registering a new location.")
-    _validate_wfh_location_timestamp(payload.location_timestamp)
+    _validate_wfh_location_timestamp(payload.location_timestamp, payload.location_age_ms)
     if payload.accuracy_m > _configured_wfh_accuracy_limit():
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Location accuracy must be within ±{round(_configured_wfh_accuracy_limit())} metres. Please retry from your phone with location services enabled.")
     now = datetime.now(timezone.utc)
@@ -2487,7 +2555,7 @@ def register_my_wfh_location(
             "updated_at": now,
         }},
     )
-    return {"location_registered": True, "latitude": payload.latitude, "longitude": payload.longitude, "accuracy_meters": payload.accuracy_m, "registered_at": now.isoformat()}
+    return {"location_registered": True, "latitude": payload.latitude, "longitude": payload.longitude, "accuracy_meters": payload.accuracy_m, "registered_at": _utc_iso(now)}
 
 
 @router.delete("/wfh/admin/employees/{user_id}/location")
@@ -2624,7 +2692,7 @@ def get_wfh_employee_face_details(
             "employee_id": employee.get("employee_id", ""),
             "role": employee.get("role", "Employee"),
         },
-        "registered_at": face_record.get("created_at").isoformat() if face_record.get("created_at") else None,
+        "registered_at": _utc_iso(face_record.get("created_at")),
         "photograph_available": photo_data_url is not None,
         "photograph_data_url": photo_data_url,
     }
@@ -2705,6 +2773,7 @@ def create_wfh_face_challenge(
             longitude=payload.longitude,
             accuracy_m=payload.accuracy_m,
             location_timestamp=payload.location_timestamp,
+            location_age_ms=payload.location_age_ms,
         )
         _validate_wfh_location(user, location)
         if not _face_is_registered(user_id):
@@ -2730,6 +2799,7 @@ def create_wfh_face_challenge(
             "user_id": user_id,
             "purpose": payload.purpose,
             "actions": actions,
+            "created_at": datetime.now(timezone.utc),
             "expires_at": expires_at,
         }
     )
@@ -2738,6 +2808,24 @@ def create_wfh_face_challenge(
         "actions": actions,
         "expires_at": expires_at,
     }
+
+
+def _wfh_event_time(challenge: dict[str, Any]) -> datetime:
+    """Company-local time at which the verified attempt started.
+
+    Face matching and the camera capture can take a couple of minutes; the
+    employee's attendance time is when they started, not when the server
+    finished processing. Falls back to the current time for older challenges.
+    """
+    now = company_now()
+    started = challenge.get("created_at")
+    if isinstance(started, datetime):
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        started = started.astimezone(COMPANY_TZ)
+        if timedelta(0) <= now - started <= timedelta(minutes=5):
+            return started
+    return now
 
 
 def _consume_wfh_face_challenge(
@@ -2883,12 +2971,12 @@ def wfh_check_in(
     _assert_wfh_email_scope(authorization, "check_in")
     user_id = str(user["_id"])
     assert_on_or_after_joining(user, company_today())
-    distance, radius, approved_location_name, approved_latitude, approved_longitude, approved_location_id, _ = _validate_wfh_biometric_attendance(
+    distance, radius, approved_location_name, approved_latitude, approved_longitude, approved_location_id, challenge = _validate_wfh_biometric_attendance(
         user,
         payload,
         "check_in",
     )
-    now = company_now()
+    now = _wfh_event_time(challenge)
     verified_at = now.astimezone(timezone.utc)
     date_iso = now.date().isoformat()
     # Link the approved late permission that authorised this check-in (audit trail).
@@ -2958,12 +3046,12 @@ def wfh_check_out(
     _assert_wfh_email_scope(authorization, "check_out")
     user_id = str(user["_id"])
     assert_on_or_after_joining(user, company_today())
-    distance, radius, approved_location_name, approved_latitude, approved_longitude, approved_location_id, _ = _validate_wfh_biometric_attendance(
+    distance, radius, approved_location_name, approved_latitude, approved_longitude, approved_location_id, challenge = _validate_wfh_biometric_attendance(
         user,
         payload,
         "check_out",
     )
-    now = company_now()
+    now = _wfh_event_time(challenge)
     verified_at = now.astimezone(timezone.utc)
     date_iso = now.date().isoformat()
     result = attendance_collection.update_one(
@@ -3137,7 +3225,12 @@ def list_attendance(
             half.update(combine_half_day_statuses(record["first_half_status"], record["second_half_status"]))
             half["half_day_eligibility"] = record.get("half_day_eligibility")
             half["actual_working_minutes"] = record.get("actual_working_minutes", effective_minutes)
-        issue = attendance_issue(check_in, check_out, daily.get("working_intervals") or [])
+        issue = attendance_issue(
+            check_in, check_out, daily.get("working_intervals") or [],
+            attendance_date=selected, now=company_now(),
+            scheduled_start=daily.get("scheduled_work_start_time"),
+            scheduled_end=daily.get("scheduled_work_end_time"),
+        )
         early, late = _going_by_minutes(check_out, daily.get("scheduled_work_end_time"))
         row.update({**half, **issue,
             "actual_elapsed_minutes": int(daily.get("elapsed_minutes") or 0),
@@ -5645,7 +5738,12 @@ def get_daily_attendance_breakdown(
         half_day.update(combine_half_day_statuses(record["first_half_status"], record["second_half_status"]))
         half_day["half_day_eligibility"] = record.get("half_day_eligibility")
         half_day["actual_working_minutes"] = record.get("actual_working_minutes", effective_minutes)
-    issue = attendance_issue(check_in, check_out, daily.get("working_intervals") or [])
+    issue = attendance_issue(
+        check_in, check_out, daily.get("working_intervals") or [],
+        attendance_date=selected, now=company_now(),
+        scheduled_start=daily.get("scheduled_work_start_time"),
+        scheduled_end=daily.get("scheduled_work_end_time"),
+    )
     scheduled_out = daily.get("scheduled_work_end_time")
     early_going_by, late_going_by = _going_by_minutes(check_out, scheduled_out)
     _resolved_day_status = record.get("status") or daily.get("status") or "Not Marked"
@@ -6440,7 +6538,13 @@ def _complete_monthly_report(user_id: str, employee: dict[str, Any], year: int, 
             "effective_working_minutes": effective_minutes,
             "half_day_threshold_met": bool(schedule.get("half_day_working_duration") and total_duration_minutes >= int(schedule.get("half_day_working_duration") or 0)),
             "working_intervals": (base.get("working_intervals") if legacy is not None else day_metrics.get("working_intervals")) or [],
-            **attendance_issue(check_in, check_out, (base.get("working_intervals") if legacy is not None else day_metrics.get("working_intervals")) or []),
+            **attendance_issue(
+                check_in, check_out,
+                (base.get("working_intervals") if legacy is not None else day_metrics.get("working_intervals")) or [],
+                attendance_date=selected, now=company_now(),
+                scheduled_start=schedule.get("scheduled_work_start_time"),
+                scheduled_end=schedule.get("scheduled_work_end_time"),
+            ),
             "early_going_by_minutes": _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[0],
             "late_going_by_minutes": _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[1],
             "early_going_by": _format_duration(_going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[0]) if _going_by_minutes(check_out, schedule.get("scheduled_work_end_time"))[0] is not None else "—",

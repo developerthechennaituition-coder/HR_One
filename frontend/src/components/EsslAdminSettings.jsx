@@ -1,4 +1,5 @@
 import { HRONE_API_BASE } from "../config/api.js";
+import { parseInstant } from "../services/attendanceHistoryFormat.js";
 import { useCallback, useEffect, useState } from "react";
 import { roleLabel, ROLE_OPTIONS } from "../services/roleLabels";
 import Pagination from "./Pagination";
@@ -38,7 +39,7 @@ const emptyConfig = {
 
 function formatDateTime(value) {
   if (!value) return "—";
-  return new Date(value).toLocaleString("en-IN", {
+  return (parseInstant(value) || new Date(value)).toLocaleString("en-IN", {
     timeZone: "Asia/Kolkata",
   });
 }

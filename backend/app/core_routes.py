@@ -76,7 +76,7 @@ ORGANIZATION_TIMEZONE = ZoneInfo(os.getenv("ORG_TIMEZONE", "Asia/Kolkata"))
 
 def log_event(message: str):
     """Write important HRMS events with a local timestamp for operational tracing."""
-    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(ORGANIZATION_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp}, {message}", flush=True)
 
 companies_collection = db["companies"]

@@ -993,7 +993,7 @@ def get_team_member_attendance(
     attendance_rows = []
     if records:
         from datetime import date as _date
-        from app.attendance import _calculate_daily_attendance, record_effective_status
+        from app.attendance import _calculate_daily_attendance, company_now, record_effective_status
         from app.attendance_calculations import attendance_issue
 
         for attendance_record in records:
@@ -1007,6 +1007,9 @@ def get_team_member_attendance(
                     daily.get("first_check_in") or attendance_record.get("check_in_time"),
                     daily.get("last_check_out") or attendance_record.get("check_out_time"),
                     daily.get("working_intervals") or [],
+                    attendance_date=selected_day, now=company_now(),
+                    scheduled_start=daily.get("scheduled_work_start_time"),
+                    scheduled_end=daily.get("scheduled_work_end_time"),
                 )
                 row.update(issue)
             except (TypeError, ValueError):
