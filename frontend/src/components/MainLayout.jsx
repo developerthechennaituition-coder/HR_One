@@ -1,32 +1,32 @@
 import { HRONE_API_BASE } from "../config/api.js";
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 
 import Sidebar from "./Sidebar";
 import Header from "./Header";
 
-import CompanySetup from "../pages/CompanySetup";
-import EmployeeMaster from "../pages/EmployeeMaster";
-import EmployeeSalarySetup from "../pages/EmployeeSalarySetup";
-import PayrollWorkspace from "../pages/PayrollWorkspace";
-import EmployeePayslips from "../pages/EmployeePayslips";
-import EmployeeDetails from "../pages/EmployeeDetails";
-import HolidayCalendarSetup from "../pages/HolidayCalendarSetup";
-import UserManagement from "../pages/UserManagement";
-import Attendance from "../pages/Attendance";
-import EmployeeAttendance from "../pages/EmployeeAttendance";
-import WfhAttendance from "../pages/WfhAttendance";
-import WfhAdminSettings from "../pages/WfhAdminSettings";
-import UserAttendance from "../pages/UserAttendance";
-import EsslSetup from "../pages/EsslSetup";
-import AccessDenied from "../pages/AccessDenied";
-import Profile from "../pages/Profile";
-import ChangePassword from "../pages/ChangePassword";
-import Leave from "../pages/Leave";
-import NotificationManagement from "../pages/NotificationManagement";
-import Dashboard from "../pages/Dashboard";
+const CompanySetup = lazy(() => import("../pages/CompanySetup"));
+const EmployeeMaster = lazy(() => import("../pages/EmployeeMaster"));
+const EmployeeSalarySetup = lazy(() => import("../pages/EmployeeSalarySetup"));
+const PayrollWorkspace = lazy(() => import("../pages/PayrollWorkspace"));
+const EmployeePayslips = lazy(() => import("../pages/EmployeePayslips"));
+const EmployeeDetails = lazy(() => import("../pages/EmployeeDetails"));
+const HolidayCalendarSetup = lazy(() => import("../pages/HolidayCalendarSetup"));
+const UserManagement = lazy(() => import("../pages/UserManagement"));
+const Attendance = lazy(() => import("../pages/Attendance"));
+const EmployeeAttendance = lazy(() => import("../pages/EmployeeAttendance"));
+const WfhAttendance = lazy(() => import("../pages/WfhAttendance"));
+const WfhAdminSettings = lazy(() => import("../pages/WfhAdminSettings"));
+const UserAttendance = lazy(() => import("../pages/UserAttendance"));
+const EsslSetup = lazy(() => import("../pages/EsslSetup"));
+const AccessDenied = lazy(() => import("../pages/AccessDenied"));
+const Profile = lazy(() => import("../pages/Profile"));
+const ChangePassword = lazy(() => import("../pages/ChangePassword"));
+const Leave = lazy(() => import("../pages/Leave"));
+const NotificationManagement = lazy(() => import("../pages/NotificationManagement"));
+const Dashboard = lazy(() => import("../pages/Dashboard"));
 
-import TeamMembers from "../pages/TeamMembers";
-import TeamMemberDetails from "../pages/TeamMemberDetails";
+const TeamMembers = lazy(() => import("../pages/TeamMembers"));
+const TeamMemberDetails = lazy(() => import("../pages/TeamMemberDetails"));
 
 import { canManageUsers } from "../auth";
 
@@ -1514,7 +1514,21 @@ function MainLayout({ session, onLogout }) {
         />
 
         <main className="main-content">
-          {renderPage()}
+          <Suspense
+            fallback={
+              <div
+                className="d-flex align-items-center justify-content-center"
+                role="status"
+                aria-live="polite"
+                style={{ minHeight: "240px" }}
+              >
+                <span className="spinner-border" aria-hidden="true" />
+                <span className="visually-hidden">Loading page...</span>
+              </div>
+            }
+          >
+            {renderPage()}
+          </Suspense>
         </main>
       </div>
     </div>

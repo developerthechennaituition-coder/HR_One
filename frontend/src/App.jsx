@@ -1,20 +1,20 @@
 // Session-aware entry point for public auth pages and the authenticated shell.
 
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 
-import MainLayout from "./components/MainLayout";
-import Login from "./pages/Login";
-import ActivateAccount from "./pages/ActivateAccount";
+const MainLayout = lazy(() => import("./components/MainLayout"));
+const Login = lazy(() => import("./pages/Login"));
+const ActivateAccount = lazy(() => import("./pages/ActivateAccount"));
 
-import ForgotPassword from "./pages/ForgotPassword";
-import VerifyResetOTP from "./pages/VerifyResetOTP";
-import ResetPassword from "./pages/ResetPassword";
-import WfhEmailVerification from "./pages/WfhEmailVerification";
+const ForgotPassword = lazy(() => import("./pages/ForgotPassword"));
+const VerifyResetOTP = lazy(() => import("./pages/VerifyResetOTP"));
+const ResetPassword = lazy(() => import("./pages/ResetPassword"));
+const WfhEmailVerification = lazy(() => import("./pages/WfhEmailVerification"));
 
 import { readStoredSession } from "./auth";
 
 
-function App() {
+function AppContent() {
   const [session, setSession] = useState(readStoredSession);
 
   const pathname = window.location.pathname;
@@ -102,5 +102,25 @@ function App() {
   );
 }
 
+
+function App() {
+  return (
+    <Suspense
+      fallback={
+        <div
+          className="d-flex align-items-center justify-content-center"
+          role="status"
+          aria-live="polite"
+          style={{ minHeight: "100vh" }}
+        >
+          <span className="spinner-border" aria-hidden="true" />
+          <span className="visually-hidden">Loading application...</span>
+        </div>
+      }
+    >
+      <AppContent />
+    </Suspense>
+  );
+}
 
 export default App;
