@@ -89,7 +89,11 @@ function NotificationBell({ onNavigate }) {
       });
     };
 
+    let intervalId = null;
+    let authenticationExpired = false;
+
     const loadSnapshot = async () => {
+      if (authenticationExpired) return;
       try {
         const snapshot = await getNotificationSnapshot();
         if (cancelled) return;
@@ -108,12 +112,18 @@ function NotificationBell({ onNavigate }) {
         }
         previousIdsRef.current = currentIds;
       } catch (error) {
+        if (error?.status === 401) {
+          authenticationExpired = true;
+          if (intervalId !== null) window.clearInterval(intervalId);
+          window.dispatchEvent(new CustomEvent("hrms-authentication-expired"));
+          return;
+        }
         console.error("Unable to load notification snapshot:", error);
       }
     };
 
     loadSnapshot();
-    const intervalId = window.setInterval(loadSnapshot, 3000);
+    intervalId = window.setInterval(loadSnapshot, 3000);
     window.addEventListener("hrms-notifications-updated", loadSnapshot);
 
     return () => {

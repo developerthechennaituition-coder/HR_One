@@ -14,7 +14,7 @@ const configuredBase = (import.meta.env.VITE_API_BASE_URL || "").trim();
 
 export const HRONE_API_BASE = (
   configuredBase ||
-  (import.meta.env.DEV ? "" : "http://127.0.0.1:8000")
+  (import.meta.env.DEV ? "" : "https://hrms-api.lmsdesk.in")
 ).replace(/\/+$/, "");
 
 export default HRONE_API_BASE;

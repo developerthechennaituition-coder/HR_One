@@ -29,7 +29,7 @@ from app.attendance import (
     sync_leave_for_today,
 )
 from app.db.mongodb import db
-from app.session import active_sessions
+from app.session import authenticate_token
 from app.activation import send_hr_email_with_attachment
 
 router = APIRouter(prefix="/api/leave", tags=["Leave Management"])
@@ -371,11 +371,10 @@ def _parse_object_id(raw_id: str, name: str = "id") -> ObjectId:
 def _current_user(authorization: str | None) -> dict[str, Any]:
     if not isinstance(authorization, str) or not authorization:
         raise HTTPException(status_code=401, detail="Authentication required")
-    token = authorization.removeprefix("Bearer ").strip()
-    user_id = active_sessions.get(token)
-    if not user_id or not ObjectId.is_valid(user_id):
-        raise HTTPException(status_code=401, detail="Session expired. Please login again.")
-    user = users_collection.find_one({"_id": ObjectId(user_id), "is_active": True})
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user = authenticate_token(token.strip())
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     return user

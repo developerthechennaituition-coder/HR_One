@@ -1,4 +1,4 @@
-export function authenticatedFetch(input, init = {}) {
+export async function authenticatedFetch(input, init = {}) {
   let session = null;
   try {
     session = JSON.parse(sessionStorage.getItem("hrms_session") || "null");
@@ -7,11 +7,16 @@ export function authenticatedFetch(input, init = {}) {
   }
   const token =
     session?.token || session?.access_token || session?.session_token;
-  return fetch(input, {
+  const response = await fetch(input, {
     ...init,
     headers: {
       ...(init.headers || {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
   });
+
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("hrms-authentication-expired"));
+  }
+  return response;
 }

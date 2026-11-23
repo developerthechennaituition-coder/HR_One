@@ -64,7 +64,7 @@ from pydantic import BaseModel, Field, field_validator
 from pymongo.errors import DuplicateKeyError
 
 from app.db.mongodb import db
-from app.session import active_sessions
+from app.session import authenticate_token
 from app.working_details import applicable_schedule, format_hours_minutes
 from app.weekly_off_planner import (
     MAX_WEEKLY_OFFS_PER_MONTH,
@@ -630,22 +630,11 @@ def _current_user(
             "Authentication required",
         )
 
-    token = authorization.removeprefix("Bearer ").strip()
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
 
-    user_id = active_sessions.get(token)
-
-    if not user_id or not ObjectId.is_valid(user_id):
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
-            "Authentication required",
-        )
-
-    user = users_collection.find_one(
-        {
-            "_id": ObjectId(user_id),
-            "is_active": True,
-        }
-    )
+    user = authenticate_token(token.strip())
 
     if not user:
         raise HTTPException(

@@ -85,63 +85,23 @@ def parse_object_id(value: str, field_name: str = "id"):
 def get_authenticated_user(
     authorization: str | None = Header(default=None),
 ):
-    """
-    Uses the existing HRMS active_sessions dictionary.
-
-    Current project:
-        active_sessions[token] = user_id
-    """
+    """Resolve the caller through the shared MongoDB-backed session store."""
+    from app.session import authenticate_token
 
     if not isinstance(authorization, str):
         authorization = None
+    token = None
+    if authorization:
+        scheme, separator, value = authorization.strip().partition(" ")
+        if separator and scheme.casefold() == "bearer":
+            token = value.strip()
 
-    token = (
-        authorization.removeprefix("Bearer ").strip()
-        if authorization
-        else None
-    )
-
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required",
-        )
-
-    # Import inside function to avoid circular import.
-    from app.main import active_sessions
-
-    session_user_id = active_sessions.get(token)
-
-    if not session_user_id or not isinstance(session_user_id, str):
+    user = authenticate_token(token)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired session",
         )
-
-    try:
-        user_object_id = ObjectId(session_user_id)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid user session",
-        )
-
-    user = notifications_users_collection().find_one(
-        {"_id": user_object_id}
-    )
-
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-        )
-
-    if not user.get("is_active", False):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Account is inactive",
-        )
-
     return user
 
 

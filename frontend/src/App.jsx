@@ -1,6 +1,6 @@
 // Session-aware entry point for public auth pages and the authenticated shell.
 
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 
 const MainLayout = lazy(() => import("./components/MainLayout"));
 const Login = lazy(() => import("./pages/Login"));
@@ -16,6 +16,19 @@ import { readStoredSession } from "./auth";
 
 function AppContent() {
   const [session, setSession] = useState(readStoredSession);
+
+  useEffect(() => {
+    const handleAuthenticationExpired = () => {
+      try {
+        sessionStorage.removeItem("hrms_session");
+      } catch {
+        // Continue to the signed-out view even if storage is unavailable.
+      }
+      setSession(null);
+    };
+    window.addEventListener("hrms-authentication-expired", handleAuthenticationExpired);
+    return () => window.removeEventListener("hrms-authentication-expired", handleAuthenticationExpired);
+  }, []);
 
   const pathname = window.location.pathname;
 

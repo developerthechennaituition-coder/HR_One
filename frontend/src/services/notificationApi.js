@@ -82,8 +82,9 @@ async function notificationRequest(
       data?.detail ||
       data?.message ||
       "Notification request failed.";
-
-    throw new Error(errorMessage);
+    const error = new Error(errorMessage);
+    error.status = response.status;
+    throw error;
   }
 
   return data;

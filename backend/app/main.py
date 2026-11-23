@@ -22,7 +22,7 @@ from app.employee_details import router as employee_details_router
 from app.reporting_manager import router as reporting_manager_router
 from app.leave import router as leave_router
 from app.payroll import router as payroll_router, ensure_payroll_collections
-from app.session import active_sessions
+from app.session import ensure_session_indexes
 from app.core_routes import router as core_router, _organization_user
 
 #Attendance
@@ -87,6 +87,7 @@ def _run_wfh_absence_scheduler() -> None:
 @app.on_event("startup")
 def start_wfh_absence_scheduler() -> None:
     global _wfh_absence_scheduler_thread
+    ensure_session_indexes()
     if _wfh_absence_scheduler_thread and _wfh_absence_scheduler_thread.is_alive():
         return
     # The sweep uses an atomic upsert protected by the unique

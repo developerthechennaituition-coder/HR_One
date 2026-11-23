@@ -18,21 +18,15 @@ salaries_collection = db["employee_salary_profiles"]
 
 def current_user(authorization: str | None, x_user_id: str | None = None) -> dict:
     """Resolve the authenticated session using the application's session store."""
-    from app.session import active_sessions
+    from app.session import authenticate_token
     token = None
-    if authorization:
-        value = authorization.strip()
-        if value.lower().startswith("bearer "):
-            token = value[7:].strip()
-    user_id = active_sessions.get(token) if token else None
-    # Do not trust a user-id header as authentication: callers must present a
-    # valid session token so one employee cannot impersonate another.
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if not ObjectId.is_valid(str(user_id)):
-        raise HTTPException(status_code=401, detail="Invalid session user")
-    user = users_collection.find_one({"_id": ObjectId(str(user_id))})
-    if not user or user.get("is_active") is False:
+    if isinstance(authorization, str):
+        scheme, separator, value = authorization.strip().partition(" ")
+        if separator and scheme.casefold() == "bearer":
+            token = value.strip()
+    # A user-id header is never accepted as proof of authentication.
+    user = authenticate_token(token)
+    if not user:
         raise HTTPException(status_code=401, detail="Active user session required")
     return user
 

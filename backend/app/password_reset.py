@@ -881,35 +881,9 @@ def reset_password(
     )
 
 
-    # --------------------------------------------------------
-    # Invalidate all existing login sessions
-    #
-    # Your current project keeps active_sessions in main.py.
-    # Importing it inside the function avoids circular import
-    # during application startup.
-    # --------------------------------------------------------
-
-    try:
-
-        from app.main import active_sessions
-
-        tokens_to_remove = [
-            token
-            for token, session_user_id
-            in active_sessions.items()
-            if session_user_id == user_id
-        ]
-
-        for token in tokens_to_remove:
-            active_sessions.pop(
-                token,
-                None,
-            )
-
-    except ImportError:
-        # Password reset itself is already completed.
-        # Session invalidation is a secondary protection.
-        pass
+    # Invalidate all existing login sessions across every API worker.
+    from app.session import revoke_user_sessions
+    revoke_user_sessions(user_id)
 
 
     return {

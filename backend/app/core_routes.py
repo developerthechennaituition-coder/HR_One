@@ -27,7 +27,7 @@ from app.employee_details import router as employee_details_router
 from app.reporting_manager import router as reporting_manager_router
 from app.leave import router as leave_router, reroute_pending_leave_requests
 from app.payroll import router as payroll_router, ensure_payroll_collections
-from app.session import active_sessions
+from app.session import (get_session_user_id, create_session, revoke_session, revoke_user_sessions, count_user_sessions)
 from app.religion_holidays import (
     employee_religion,
     employee_religions,
@@ -282,7 +282,7 @@ def _organization_user(
     if not authorization:
         raise HTTPException(status_code=401, detail="Authentication required")
     token = authorization.removeprefix("Bearer ").strip()
-    user_id = active_sessions.get(token)
+    user_id = get_session_user_id(token)
     if not user_id or not ObjectId.is_valid(user_id):
         raise HTTPException(status_code=401, detail="Session expired. Please login again.")
     user = users_collection.find_one({"_id": ObjectId(user_id), "is_active": True})
@@ -1662,7 +1662,6 @@ def login_user(payload: UserLoginPayload):
         users_collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
         log_event(f"Login failed: identifier={identifier}, failed_attempts={failed_attempts}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    token = secrets.token_urlsafe(32)
     users_collection.update_one(
         {"_id": user["_id"]},
         {
@@ -1673,11 +1672,8 @@ def login_user(payload: UserLoginPayload):
     )
     user["last_login"] = now
     user["login_count"] = int(user.get("login_count", 0) or 0) + 1
-    active_sessions[token] = str(user["_id"])
-    user["active_login_count"] = sum(
-        session_user_id == str(user["_id"])
-        for session_user_id in active_sessions.values()
-    )
+    token = create_session(str(user["_id"]))
+    user["active_login_count"] = count_user_sessions(str(user["_id"]))
     log_event(f"Login successful: user_id={user['_id']}, identifier={identifier}")
     return {"token": token, "user": serialize_user(user)}
 
@@ -1686,15 +1682,12 @@ def login_user(payload: UserLoginPayload):
 def get_current_user(authorization: str | None = Header(default=None), x_user_id: str | None = Header(default=None)):
     if not isinstance(authorization, str):
         authorization = None
-    token = authorization.removeprefix("Bearer ") if authorization else None
-    session_user_id = active_sessions.get(token) if token else x_user_id
+    token = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else None
+    session_user_id = get_session_user_id(token) if token else None
     if not session_user_id or not isinstance(session_user_id, str):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     user = get_user(session_user_id)
-    user["active_login_count"] = sum(
-        active_session_user_id == session_user_id
-        for active_session_user_id in active_sessions.values()
-    )
+    user["active_login_count"] = count_user_sessions(session_user_id)
     user["joining_date"] = employee_joining_date(
         {"_id": ObjectId(session_user_id), "date_of_joining": user.get("date_of_joining")}
     )
@@ -1709,8 +1702,8 @@ def change_password(
     if not isinstance(authorization, str):
         authorization = None
 
-    token = authorization.removeprefix("Bearer ") if authorization else None
-    session_user_id = active_sessions.get(token) if token else None
+    token = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else None
+    session_user_id = get_session_user_id(token) if token else None
 
     if not session_user_id or not isinstance(session_user_id, str):
         raise HTTPException(
@@ -1768,7 +1761,8 @@ def change_password(
 @router.post("/api/auth/logout", response_model=AuthMessageResponse)
 def logout_user(authorization: str | None = Header(default=None)):
     if isinstance(authorization, str) and authorization:
-        active_sessions.pop(authorization.removeprefix("Bearer "), None)
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
+        revoke_session(token)
     return {"message": "Logged out successfully"}
 
 
@@ -1790,9 +1784,7 @@ def deactivate_user(user_id: str):
     db["employee_details"].delete_one({"user_id": str(object_id)})
 
     # Invalidate any active login session for this deleted account.
-    for token, session_user_id in list(active_sessions.items()):
-        if str(session_user_id) == str(object_id):
-            active_sessions.pop(token, None)
+    revoke_user_sessions(str(object_id))
 
     return {"id": user_id, "message": "User deleted successfully"}
 

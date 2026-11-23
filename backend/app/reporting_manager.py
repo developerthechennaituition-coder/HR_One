@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from app.attendance import employee_joining_date
 from app.db.mongodb import db
-from app.session import active_sessions
+from app.session import authenticate_token
 
 
 router = APIRouter(
@@ -56,22 +56,11 @@ def _current_user(authorization: str | None) -> dict[str, Any]:
             detail="Authentication required",
         )
 
-    token = authorization.removeprefix("Bearer ").strip()
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Authentication required")
 
-    user_id = active_sessions.get(token)
-
-    if not user_id or not ObjectId.is_valid(user_id):
-        raise HTTPException(
-            status_code=401,
-            detail="Session expired. Please login again.",
-        )
-
-    user = users_collection.find_one(
-        {
-            "_id": ObjectId(user_id),
-            "is_active": True,
-        }
-    )
+    user = authenticate_token(token.strip())
 
     if not user:
         raise HTTPException(

@@ -138,31 +138,26 @@ def get_authenticated_user(
     authorization: str | None = None,
     x_user_id: str | None = None,
 ) -> dict:
-    """Use the same active_sessions dictionary as main.py."""
+    """Resolve the user only from a valid shared bearer session.
 
-    # Import at request time to avoid a module-import circular dependency.
-    from app.main import active_sessions
+    x_user_id remains in the function signature for route compatibility but is
+    deliberately never treated as authentication.
+    """
+    from app.session import authenticate_token
 
     token = None
-
     if isinstance(authorization, str):
-        authorization = authorization.strip()
-        if authorization.lower().startswith("bearer "):
-            token = authorization[7:].strip()
+        scheme, separator, value = authorization.strip().partition(" ")
+        if separator and scheme.casefold() == "bearer":
+            token = value.strip()
 
-    session_user_id = active_sessions.get(token) if token else None
-
-    # Keep compatibility with the existing HRMS x_user_id fallback.
-    if not session_user_id and x_user_id:
-        session_user_id = x_user_id
-
-    if not session_user_id:
+    user = authenticate_token(token)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
-
-    return get_user_by_id(str(session_user_id))
+    return user
 
 
 def is_hr_admin(user: dict) -> bool:
