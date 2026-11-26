@@ -13,6 +13,19 @@ const API_URL = HRONE_API_BASE + "/api/leave";
 // Permission can be applied for today and the next 14 days (checked by the backend too).
 const PERMISSION_FORWARD_DAYS = 14;
 
+function getSupportingDocumentMime(file) {
+  const declared = String(file?.type || "").split(";", 1)[0].trim().toLowerCase();
+  const extension = String(file?.name || "").split(".").pop().toLowerCase();
+  const allowed = new Set(["application/pdf", "image/png", "image/jpeg"]);
+  if (allowed.has(declared)) return declared;
+  if (!declared || declared === "application/octet-stream") {
+    if (extension === "pdf") return "application/pdf";
+    if (extension === "png") return "image/png";
+    if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  }
+  return "";
+}
+
 async function fileToBase64(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   let binary = "";
@@ -207,6 +220,7 @@ function Leave({ user, onNavigate }) {
     medical_certificate_required: true,
     religion_holidays_enabled: true,
   });
+  const [savedSupportingDocumentRequired, setSavedSupportingDocumentRequired] = useState(true);
 
   // Remember which leave type is open in Leave Setup without re-triggering loadData.
   const setupIdRef = useRef("");
@@ -233,12 +247,13 @@ function Leave({ user, onNavigate }) {
         apiRequest("/notifications"),
         apiRequest("/company-policy"),
       ]);
-      setLeaveTypes(types || []);
+      setLeaveTypes((types || []).filter((item) => String(item.code || "").toUpperCase() !== "EL"));
       setBalances(balanceData || []);
       setRequests(requestData || []);
       setDashboard(dashboardData || null);
       setNotifications(Array.isArray(notificationData) ? notificationData : notificationData?.notifications || []);
       setCompanyPolicy((current) => ({ ...current, ...companyPolicyData }));
+      setSavedSupportingDocumentRequired(Boolean(companyPolicyData?.medical_certificate_required ?? true));
       apiRequest("/my-approval-role")
         .then((data) => setApprovalCategory(data?.category || ""))
         .catch(() => setApprovalCategory(""));
@@ -340,7 +355,8 @@ function Leave({ user, onNavigate }) {
   const selectedType = useMemo(() => leaveTypes.find((item) => item.id === leaveTypeId), [leaveTypes, leaveTypeId]);
   const selectedSetupType = useMemo(() => leaveTypes.find((item) => item.id === setupType.id), [leaveTypes, setupType.id]);
   const isMedicalLeaveType = String(selectedType?.code || "").toUpperCase() === "ML";
-  const requiresMedicalCertificate = Boolean(companyPolicy.medical_certificate_required && isMedicalLeaveType);
+  // The HR Admin company rule controls both visibility and mandatory validation.
+  const requiresSupportingDocument = isMedicalLeaveType && savedSupportingDocumentRequired;
   const unreadLeaveNotificationCount = notifications.filter((item) => !item.is_read).length;
 
   // Leave: today .. day 90 (today + 89). Permission: today .. today + 14. India time.
@@ -383,12 +399,13 @@ function Leave({ user, onNavigate }) {
     if (dayPart !== "full_day" && !selectedType?.allow_half_day) return setError("Half-day leave is not allowed for this leave type.");
     if (dayPart !== "full_day" && fromDate !== toDate) return setError("Half-day leave can be applied for a single date only.");
     if (selectedType?.requires_attachment && !attachmentName.trim()) return setError("Attachment reference is required for this leave type.");
-    if (requiresMedicalCertificate && !attachmentFile) return setError("Upload a medical certificate PDF, PNG or JPEG file before submitting.");
-    if (attachmentFile && (attachmentFile.size > 5 * 1024 * 1024 || !["application/pdf", "image/png", "image/jpeg"].includes(attachmentFile.type))) return setError("Medical certificate must be a PDF, PNG or JPEG file smaller than 5 MB.");
+    if (requiresSupportingDocument && !attachmentFile) return setError("A supporting document is required for Medical Leave. Please upload a PDF, PNG or JPEG file.");
+    const attachmentMime = attachmentFile ? getSupportingDocumentMime(attachmentFile) : "";
+    if (attachmentFile && (attachmentFile.size > 5 * 1024 * 1024 || !attachmentMime)) return setError("Supporting document must be a valid PDF, PNG or JPEG file smaller than 5 MB.");
     setSubmitting(true);
     try {
       const attachmentContent = attachmentFile ? await fileToBase64(attachmentFile) : null;
-      const saved = await apiRequest("/apply", { method: "POST", body: JSON.stringify({ leave_type_id: leaveTypeId, from_date: fromDate, to_date: toDate, day_part: dayPart, reason: reason.trim(), attachment_name: attachmentFile?.name || attachmentName.trim() || null, attachment_content_base64: attachmentContent, attachment_content_type: attachmentFile?.type || null }) });
+      const saved = await apiRequest("/apply", { method: "POST", body: JSON.stringify({ leave_type_id: leaveTypeId, from_date: fromDate, to_date: toDate, day_part: dayPart, reason: reason.trim(), attachment_name: attachmentFile?.name || attachmentName.trim() || null, attachment_content_base64: attachmentContent, attachment_content_type: attachmentMime || null }) });
       window.dispatchEvent(new Event("hrms-notifications-updated"));
       setSuccess(`Leave application submitted to your ${saved?.approval_level || "approver"}${saved?.assigned_approver_name ? ` (${saved.assigned_approver_name})` : ""}.${saved?.approver_notified === false ? " The approver notification could not be created; the request is in their queue." : ""}`); setFromDate(""); setToDate(""); setReason(""); setAttachmentName(""); setAttachmentFile(null); setDayPart("full_day"); await loadData();
     } catch (requestError) { setError(requestError.message || "Unable to submit leave application."); }
@@ -477,12 +494,13 @@ function Leave({ user, onNavigate }) {
 
   const downloadAttachment = async (request) => {
     const token = getSession()?.token;
+    const previewWindow = window.open("", "_blank");
     try {
       const response = await fetch(`${API_URL}/requests/${request.id}/attachment`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!response.ok) {
-        let message = "Unable to download the leave attachment.";
+        let message = "Unable to open the supporting document.";
         try {
           const data = await response.json();
           message = data?.detail || message;
@@ -492,13 +510,20 @@ function Leave({ user, onNavigate }) {
         throw new Error(message);
       }
       const url = URL.createObjectURL(await response.blob());
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = request.attachment_name || "leave-certificate";
-      anchor.click();
-      URL.revokeObjectURL(url);
+      if (previewWindow) {
+        previewWindow.location.href = url;
+        window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+      } else {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.target = "_blank";
+        anchor.rel = "noopener";
+        anchor.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+      }
     } catch (requestError) {
-      setError(requestError.message || "Unable to download the leave attachment.");
+      if (previewWindow) previewWindow.close();
+      setError(requestError.message || "Unable to open the supporting document.");
     }
   };
 
@@ -546,7 +571,7 @@ function Leave({ user, onNavigate }) {
   const handleSavePolicy = async (event) => {
     event.preventDefault(); if (!setupPolicy.leave_type_id) return setError("Select a leave type for the policy.");
     setSavingSetup(true); setError(""); setSuccess("");
-    try { await apiRequest(`/policies/${setupPolicy.leave_type_id}`, { method: "PUT", body: JSON.stringify({ annual_entitlement: Number(setupPolicy.annual_entitlement), allocation_period: setupType.code === "LOP" ? "unlimited" : setupPolicy.allocation_period, monthly_entitlement: Number(setupPolicy.monthly_entitlement || 0), is_unlimited: setupType.code === "LOP" || setupPolicy.is_unlimited, eligible_work_stages: setupPolicy.eligible_work_stages || [], carry_forward_allowed: setupPolicy.carry_forward_allowed, max_carry_forward: Number(setupPolicy.max_carry_forward), accrual_enabled: false, accrual_frequency: "annual", is_active: setupPolicy.is_active }) }); setSuccess("Leave policy updated successfully."); await loadData(); }
+    try { await apiRequest(`/policies/${setupPolicy.leave_type_id}`, { method: "PUT", body: JSON.stringify({ annual_entitlement: Number(setupPolicy.annual_entitlement), allocation_period: setupType.code === "LOP" ? "unlimited" : setupType.code === "CL" ? "monthly" : setupPolicy.allocation_period, monthly_entitlement: Number(setupPolicy.monthly_entitlement || 0), is_unlimited: setupType.code === "LOP" || setupPolicy.is_unlimited, eligible_work_stages: setupPolicy.eligible_work_stages || [], carry_forward_allowed: setupPolicy.carry_forward_allowed, max_carry_forward: Number(setupPolicy.max_carry_forward), accrual_enabled: false, accrual_frequency: "annual", is_active: setupPolicy.is_active }) }); setSuccess("Leave policy updated successfully."); await loadData(); }
     catch (requestError) { setError(requestError.message || "Unable to update leave policy."); }
     finally { setSavingSetup(false); }
   };
@@ -568,6 +593,12 @@ function Leave({ user, onNavigate }) {
         }),
       });
       setCompanyPolicy((current) => ({ ...current, ...savedPolicy }));
+      const documentRequired = Boolean(savedPolicy?.medical_certificate_required ?? true);
+      setSavedSupportingDocumentRequired(documentRequired);
+      if (!documentRequired) {
+        setAttachmentFile(null);
+        setAttachmentName("");
+      }
       setSuccess("Company leave policy updated successfully.");
     } catch (requestError) {
       setError(requestError.message || "Unable to update company leave policy.");
@@ -649,7 +680,7 @@ function Leave({ user, onNavigate }) {
             <td>{formatDate(request.from_date)} - {formatDate(request.to_date)}<div className="small text-muted">{request.day_part_label}</div></td>
             <td className="text-nowrap">{request.created_at ? <><div className="fw-medium">{formatDateTime(request.created_at).split(", ")[0]}</div><div className="small text-muted">{formatDateTime(request.created_at).split(", ").slice(1).join(", ")}</div></> : <span className="text-muted">—</span>}</td>
             <td>{Number(request.days).toFixed(1)}</td>
-            <td>{request.reason}{request.attachment_name && <div><button type="button" className="btn btn-link btn-sm p-0" onClick={() => downloadAttachment(request)}><i className="bi bi-paperclip me-1" />{request.attachment_name}</button></div>}</td>
+            <td>{request.reason}{request.attachment_name && <div><button type="button" className="btn btn-link btn-sm p-0" onClick={() => downloadAttachment(request)}><i className="bi bi-paperclip me-1" />View: {request.attachment_name}</button></div>}</td>
             <td>
               <span className={badgeClass(request.status)}>
                 {requestStatusLabel(request)}
@@ -727,7 +758,7 @@ function Leave({ user, onNavigate }) {
             <StatCard title="Unpaid Leave Used (LOP)" value={dashboard?.summary?.unpaid_leave_used ?? 0} subtitle="Approved unpaid days" icon="bi-calendar-x" />
           </div>
           <div className="row g-4">
-            <div className="col-12"><div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Leave Type Balances</h5></div><div className="card-body"><div className="table-responsive"><table className="table table-hover align-middle mb-0"><thead className="table-light"><tr><th>Leave Type</th><th>Category</th><th>Period</th><th>Allocated</th><th>Used</th><th>Pending</th><th>Available</th></tr></thead><tbody>{(dashboard?.leave_type_balances || balances).map((balance) => <tr key={balance.leave_type_id}><td><strong>{balance.code} - {balance.name}</strong></td><td><span className="badge bg-light text-dark">{balance.is_paid ? "Paid" : "Unpaid"}</span></td><td>{(balance.allocation_period || "annual").replace(/^./, (x) => x.toUpperCase())}</td><td>{balance.allocated ?? balance.entitled}</td><td>{Number(balance.used || 0).toFixed(1)}</td><td>{Number(balance.pending || 0).toFixed(1)}</td><td>{balance.available === "Unlimited" ? "Unlimited" : Number(balance.available || 0).toFixed(1)}</td></tr>)}</tbody></table></div></div></div></div>
+            <div className="col-12"><div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Leave Type Balances</h5></div><div className="card-body"><div className="table-responsive"><table className="table table-hover align-middle mb-0"><thead className="table-light"><tr><th>Leave Type</th><th>Category</th><th>Period</th><th>Allocated</th><th>Used</th><th>Pending</th><th>Available</th></tr></thead><tbody>{(dashboard?.leave_type_balances || balances).map((balance) => <tr key={balance.leave_type_id}><td><strong>{balance.code} - {balance.name}</strong></td><td><span className="badge bg-light text-dark">{balance.is_paid ? "Paid" : "Unpaid"}</span></td><td>{balance.allocation_period === "six_month_cycle" ? "Six-Month Cycle" : (balance.allocation_period || "annual").replace(/^./, (x) => x.toUpperCase())}</td><td>{balance.allocated ?? balance.entitled}</td><td>{Number(balance.used || 0).toFixed(1)}</td><td>{Number(balance.pending || 0).toFixed(1)}</td><td>{balance.available === "Unlimited" ? "Unlimited" : Number(balance.available || 0).toFixed(1)}</td></tr>)}</tbody></table></div></div></div></div>
             <div className="col-lg-6"><div className="card border-0 shadow-sm h-100"><div className="card-header bg-white"><h5 className="mb-0">Leave Usage by Type</h5></div><div className="card-body">{Object.keys(dashboard?.days_by_leave_type || {}).length === 0 ? <div className="text-muted">No leave usage yet.</div> : Object.entries(dashboard.days_by_leave_type).map(([code, days]) => <div className="d-flex justify-content-between border-bottom py-2" key={code}><span>{code}</span><strong>{Number(days).toFixed(1)} day(s)</strong></div>)}</div></div></div>
             <div className="col-lg-6"><div className="card border-0 shadow-sm h-100"><div className="card-header bg-white"><h5 className="mb-0">Request Summary</h5></div><div className="card-body"><div className="d-flex justify-content-between py-2"><span>Total requests</span><strong>{dashboard?.summary?.total_requests ?? 0}</strong></div><div className="d-flex justify-content-between py-2"><span>Approved days</span><strong>{dashboard?.summary?.approved_days ?? 0}</strong></div><div className="d-flex justify-content-between py-2"><span>All requested days</span><strong>{dashboard?.summary?.total_days ?? 0}</strong></div></div></div></div>
           </div>
@@ -739,10 +770,9 @@ function Leave({ user, onNavigate }) {
             <div className="col-md-4"><label className="form-label">From Date</label><input type="date" className="form-control" value={fromDate} min={todayIso} max={leaveMaxDate} onChange={(e) => handleFromDateChange(e.target.value)} required /></div>
             <div className="col-md-4"><label className="form-label">To Date</label><input type="date" className="form-control" value={toDate} min={fromDate || todayIso} max={leaveMaxDate} disabled={dayPart !== "full_day"} onChange={(e) => setToDate(e.target.value)} required /><small className="text-muted">Today up to {formatDate(leaveMaxDate)} (90 days).</small></div>
             <div className="col-md-4"><label className="form-label">Day Type</label><select className="form-select" value={dayPart} onChange={(e) => handleDayPartChange(e.target.value)} disabled={!selectedType?.allow_half_day}><option value="full_day">Full Day</option><option value="first_half">First Half</option><option value="second_half">Second Half</option></select></div>
-            {requiresMedicalCertificate && <div className="col-md-4"><label className="form-label">Medical Certificate</label><input type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" className="form-control" onChange={(e) => { const file = e.target.files?.[0] || null; setAttachmentFile(file); setAttachmentName(file?.name || ""); }} required /><small className="text-muted">PDF, PNG or JPEG, maximum 5 MB.</small></div>}
-            {selectedType?.requires_attachment && !requiresMedicalCertificate && <div className="col-md-4"><label className="form-label">Attachment Reference</label><input className="form-control" value={attachmentName} onChange={(e) => setAttachmentName(e.target.value)} placeholder="File name / reference" required /></div>}
+            {requiresSupportingDocument && <div className="col-12 col-md-6 col-lg-4"><label className="form-label" htmlFor="leave-supporting-document">Supporting Document <span className="text-danger">*</span></label><input id="leave-supporting-document" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" className="form-control" required={requiresSupportingDocument} aria-required="true" onChange={(e) => { const file = e.target.files?.[0] || null; setAttachmentFile(file); setAttachmentName(file?.name || ""); }} /><small className="text-muted">Required by company leave policy. Medical certificate, function invitation, travel ticket or other supporting document. PDF, PNG or JPEG, maximum 5 MB.</small></div>}
             <div className="col-12"><label className="form-label">Reason</label><textarea className="form-control" rows="3" maxLength="1000" value={reason} onChange={(e) => setReason(e.target.value)} required /></div>
-            {selectedBalance && <div className="col-12"><div className="alert alert-light border mb-0"><strong>{selectedBalance.name}:</strong> {selectedBalance.available === "Unlimited" ? "Unlimited leave available" : `${Number(selectedBalance.available).toFixed(1)} day(s) available. Carry forward: ${Number(selectedBalance.carry_forward).toFixed(1)}.`}</div></div>}
+            {selectedBalance && <div className="col-12"><div className="alert alert-light border mb-0"><strong>{selectedBalance.name}:</strong> {selectedBalance.available === "Unlimited" ? "Unlimited leave available" : `${Number(selectedBalance.available).toFixed(1)} day(s) available. Carry forward: ${Number(selectedBalance.carry_forward).toFixed(1)}.`}{selectedBalance.code === "ML" && selectedBalance.cycle_start && <div className="small text-muted mt-1">Six-month cycle: {formatDate(selectedBalance.cycle_start)} to {formatDate(selectedBalance.cycle_end)}. Balance resets at the next cycle; previous cycle records remain stored.</div>}</div></div>}
             {approvalPreview && <div className="col-12"><div className={`alert ${approvalPreview.problem ? "alert-danger" : "alert-info"} mb-0`} role="status">
               {approvalPreview.problem
                 ? <><i className="bi bi-exclamation-triangle me-2" />{approvalPreview.problem}</>
@@ -774,7 +804,7 @@ function Leave({ user, onNavigate }) {
       ) : activeTab === "setup" && isAdminApprover ? (
         <div className="row g-4">
           <div className="col-lg-6"><div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Leave Type Configuration</h5></div><div className="card-body"><form onSubmit={handleSaveType}><div className="mb-3"><label className="form-label">Leave Type</label><select className="form-select" value={setupType.id} onChange={(e) => handleTypeSelect(e.target.value)}><option value="">Select leave type</option>{leaveTypes.map((type) => <option key={type.id} value={type.id}>{type.code} - {type.name}</option>)}</select></div><div className="mb-3"><label className="form-label">Name</label><input className="form-control" value={setupType.name} onChange={(e) => setSetupType({ ...setupType, name: e.target.value })} /></div><div className="mb-3"><label className="form-label">Description</label><textarea className="form-control" rows="2" value={setupType.description} onChange={(e) => setSetupType({ ...setupType, description: e.target.value })} /></div><div className="form-check mb-2"><input className="form-check-input" type="checkbox" checked={setupType.is_paid} onChange={(e) => setSetupType({ ...setupType, is_paid: e.target.checked })} id="paid" /><label className="form-check-label" htmlFor="paid">Paid Leave</label></div><div className="form-check mb-2"><input className="form-check-input" type="checkbox" checked={setupType.allow_half_day} onChange={(e) => setSetupType({ ...setupType, allow_half_day: e.target.checked })} id="half" /><label className="form-check-label" htmlFor="half">Allow Half Day</label></div><div className="form-check mb-2"><input className="form-check-input" type="checkbox" checked={setupType.requires_attachment} onChange={(e) => setSetupType({ ...setupType, requires_attachment: e.target.checked })} id="attach" /><label className="form-check-label" htmlFor="attach">Attachment Required</label></div><div className="form-check mb-3"><input className="form-check-input" type="checkbox" checked={setupType.is_active} onChange={(e) => setSetupType({ ...setupType, is_active: e.target.checked })} id="active" /><label className="form-check-label" htmlFor="active">Active</label></div><button className="btn btn-primary" disabled={savingSetup || !selectedSetupType}>{savingSetup ? "Saving..." : "Save Leave Type"}</button></form></div></div></div>
-          <div className="col-lg-6"><div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Advanced Leave Policy</h5></div><div className="card-body"><form onSubmit={handleSavePolicy}><div className="mb-3"><label className="form-label">Leave Type</label><select className="form-select" value={setupPolicy.leave_type_id} onChange={(e) => handleTypeSelect(e.target.value)}><option value="">Select leave type</option>{leaveTypes.map((type) => <option key={type.id} value={type.id}>{type.code} - {type.name}</option>)}</select></div>{setupType.code === "LOP" ? <div className="alert alert-info py-2">LOP is configured as unlimited unpaid leave. A finite allocation is not required.</div> : <><div className="mb-3"><label className="form-label">Allocation Period</label><select className="form-select" value={setupPolicy.allocation_period || "annual"} onChange={(e) => setSetupPolicy({ ...setupPolicy, allocation_period: e.target.value })}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></div>{setupPolicy.allocation_period === "monthly" ? <div className="mb-3"><label className="form-label">Leave Days per Month</label><input type="number" min="0" step="0.5" className="form-control" value={setupPolicy.monthly_entitlement} onChange={(e) => setSetupPolicy({ ...setupPolicy, monthly_entitlement: e.target.value })} /></div> : <div className="mb-3"><label className="form-label">Leave Days per Year</label><input type="number" min="0" step="0.5" className="form-control" value={setupPolicy.annual_entitlement} onChange={(e) => setSetupPolicy({ ...setupPolicy, annual_entitlement: e.target.value })} /></div>}</>}<div className="mb-3"><label className="form-label d-block">Eligible Work Stages</label>{["Probation", "Employee"].map((stage) => <div className="form-check form-check-inline" key={stage}><input className="form-check-input" type="checkbox" id={`eligible-${stage}`} checked={(setupPolicy.eligible_work_stages || ["Probation", "Employee"]).includes(stage)} onChange={(e) => setSetupPolicy((current) => ({ ...current, eligible_work_stages: e.target.checked ? [...(current.eligible_work_stages || []), stage] : (current.eligible_work_stages || []).filter((value) => value !== stage) }))} /><label className="form-check-label" htmlFor={`eligible-${stage}`}>{stage}</label></div>)}</div><div className="form-check mb-2"><input className="form-check-input" type="checkbox" checked={setupPolicy.carry_forward_allowed && setupPolicy.allocation_period !== "monthly"} disabled={setupPolicy.allocation_period === "monthly" || setupType.code === "LOP"} onChange={(e) => setSetupPolicy({ ...setupPolicy, carry_forward_allowed: e.target.checked })} id="carry" /><label className="form-check-label" htmlFor="carry">Allow Carry Forward</label></div><div className="mb-3"><label className="form-label">Maximum Carry Forward</label><input type="number" min="0" step="0.5" className="form-control" disabled={!setupPolicy.carry_forward_allowed || setupPolicy.allocation_period === "monthly" || setupType.code === "LOP"} value={setupPolicy.max_carry_forward} onChange={(e) => setSetupPolicy({ ...setupPolicy, max_carry_forward: e.target.value })} /></div><button className="btn btn-primary" disabled={savingSetup}>{savingSetup ? "Saving..." : "Save Leave Policy"}</button></form></div></div></div>
+          <div className="col-lg-6"><div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Advanced Leave Policy</h5></div><div className="card-body"><form onSubmit={handleSavePolicy}><div className="mb-3"><label className="form-label">Leave Type</label><select className="form-select" value={setupPolicy.leave_type_id} onChange={(e) => handleTypeSelect(e.target.value)}><option value="">Select leave type</option>{leaveTypes.map((type) => <option key={type.id} value={type.id}>{type.code} - {type.name}</option>)}</select></div>{setupType.code === "LOP" ? <div className="alert alert-info py-2">LOP is configured as unlimited unpaid leave. A finite allocation is not required.</div> : setupType.code === "CL" ? <><div className="alert alert-info py-2">CL is allocated by HR Admin for each calendar month. Unused CL automatically moves into the employee’s ML balance at month end.</div><div className="mb-3"><label className="form-label">CL Days per Month</label><input type="number" min="0" step="0.5" className="form-control" value={setupPolicy.monthly_entitlement} onChange={(e) => setSetupPolicy({ ...setupPolicy, monthly_entitlement: e.target.value })} /></div></> : <><div className="mb-3"><label className="form-label">Allocation Period</label><select className="form-select" value={setupPolicy.allocation_period || "annual"} onChange={(e) => setSetupPolicy({ ...setupPolicy, allocation_period: e.target.value })}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></div>{setupPolicy.allocation_period === "monthly" ? <div className="mb-3"><label className="form-label">Leave Days per Month</label><input type="number" min="0" step="0.5" className="form-control" value={setupPolicy.monthly_entitlement} onChange={(e) => setSetupPolicy({ ...setupPolicy, monthly_entitlement: e.target.value })} /></div> : <div className="mb-3"><label className="form-label">Leave Days per Year</label><input type="number" min="0" step="0.5" className="form-control" value={setupPolicy.annual_entitlement} onChange={(e) => setSetupPolicy({ ...setupPolicy, annual_entitlement: e.target.value })} /></div>}</>}<div className="mb-3"><label className="form-label d-block">Eligible Work Stages</label>{["Probation", "Employee"].map((stage) => <div className="form-check form-check-inline" key={stage}><input className="form-check-input" type="checkbox" id={`eligible-${stage}`} checked={(setupPolicy.eligible_work_stages || ["Probation", "Employee"]).includes(stage)} onChange={(e) => setSetupPolicy((current) => ({ ...current, eligible_work_stages: e.target.checked ? [...(current.eligible_work_stages || []), stage] : (current.eligible_work_stages || []).filter((value) => value !== stage) }))} /><label className="form-check-label" htmlFor={`eligible-${stage}`}>{stage}</label></div>)}</div><div className="form-check mb-2"><input className="form-check-input" type="checkbox" checked={setupPolicy.carry_forward_allowed && setupPolicy.allocation_period !== "monthly"} disabled={setupPolicy.allocation_period === "monthly" || setupType.code === "LOP"} onChange={(e) => setSetupPolicy({ ...setupPolicy, carry_forward_allowed: e.target.checked })} id="carry" /><label className="form-check-label" htmlFor="carry">Allow Carry Forward</label></div><div className="mb-3"><label className="form-label">Maximum Carry Forward</label><input type="number" min="0" step="0.5" className="form-control" disabled={!setupPolicy.carry_forward_allowed || setupPolicy.allocation_period === "monthly" || setupType.code === "LOP"} value={setupPolicy.max_carry_forward} onChange={(e) => setSetupPolicy({ ...setupPolicy, max_carry_forward: e.target.value })} /></div><button className="btn btn-primary" disabled={savingSetup}>{savingSetup ? "Saving..." : "Save Leave Policy"}</button></form></div></div></div>
           <div className="col-12"><div className="card border-0 shadow-sm"><div className="card-header bg-white"><h5 className="mb-0">Company Leave Rules</h5><small className="text-muted">These rules are checked by the backend for every leave request.</small></div><div className="card-body"><form onSubmit={handleSaveCompanyPolicy}><div className="row g-3">
             <div className="col-md-3"><label className="form-label">Weekly Offs per Month</label><input type="number" min="1" max="4" className="form-control" value={companyPolicy.weekly_offs_per_month} onChange={(e) => setCompanyPolicy({ ...companyPolicy, weekly_offs_per_month: e.target.value })} disabled={!isHrAdmin || savingSetup} /></div>
             <div className="col-md-9"><span className="form-label d-block">Weekly Off Days</span><div className="d-flex flex-wrap gap-3">{["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].map((day) => <div className="form-check" key={day}><input className="form-check-input" type="checkbox" id={`weekly-off-${day}`} checked={(companyPolicy.weekly_off_weekdays || []).includes(day)} onChange={(e) => setCompanyPolicy({ ...companyPolicy, weekly_off_weekdays: e.target.checked ? [...(companyPolicy.weekly_off_weekdays || []), day] : (companyPolicy.weekly_off_weekdays || []).filter((item) => item !== day) })} disabled={!isHrAdmin || savingSetup || (!(companyPolicy.weekly_off_weekdays || []).includes(day) && (companyPolicy.weekly_off_weekdays || []).length >= 6)} /><label className="form-check-label" htmlFor={`weekly-off-${day}`}>{day[0].toUpperCase() + day.slice(1)}</label></div>)}</div>{!(companyPolicy.weekly_off_weekdays || []).length && <small className="text-warning-emphasis">No weekly off is configured. Select the company's weekly off day(s); they are used for leave day counts and the attendance calendar.</small>}</div>
@@ -783,7 +813,7 @@ function Leave({ user, onNavigate }) {
             <div className="col-md-6"><label className="form-label">Employee Leave Approval</label><div className="form-control bg-light h-auto">1 day: Reporting Manager · 2 days: HOD · more than 2 days: HR Admin</div></div>
             <div className="col-md-6"><label className="form-label">Reporting Manager / HR Admin Leave</label><div className="form-control bg-light h-auto">Reporting Manager: 1 day HOD, 2+ days HR Admin · HR Admin: assigned HR Admin</div></div>
             
-            <div className="col-md-6"><div className="form-check"><input id="medical-certificate" type="checkbox" className="form-check-input" checked={companyPolicy.medical_certificate_required} onChange={(e) => setCompanyPolicy({ ...companyPolicy, medical_certificate_required: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="medical-certificate">Require medical certificate for Medical Leave</label></div></div>
+            <div className="col-md-6"><div className="form-check"><input id="medical-certificate" type="checkbox" className="form-check-input" checked={companyPolicy.medical_certificate_required} onChange={(e) => setCompanyPolicy({ ...companyPolicy, medical_certificate_required: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="medical-certificate">Required supporting document for Medical Leave</label></div></div>
             <div className="col-md-6"><div className="form-check"><input id="religion-holidays" type="checkbox" className="form-check-input" checked={companyPolicy.religion_holidays_enabled} onChange={(e) => setCompanyPolicy({ ...companyPolicy, religion_holidays_enabled: e.target.checked })} disabled={!isHrAdmin || savingSetup} /><label className="form-check-label" htmlFor="religion-holidays">Enable religion-specific calendar holidays</label></div></div>
             {isHrAdmin && <div className="col-12"><button className="btn btn-primary" disabled={savingSetup}>{savingSetup ? "Saving..." : "Save Company Rules"}</button></div>}
           </div></form></div></div></div>
