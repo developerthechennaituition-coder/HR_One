@@ -1842,7 +1842,7 @@ export default function EmployeeDetails({
             label="Work Stage"
             name="work_stage"
             value={employee.work_stage || "Employee"}
-            options={["Probation", "Employee"]}
+            options={["Probation", "Employee", "Internship"]}
             editing={isEditing}
             onChange={handleChange}
           />

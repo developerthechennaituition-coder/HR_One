@@ -3,7 +3,7 @@ import { HRONE_API_BASE } from "../config/api.js";
 import { buildChangeRows, formatAttendanceClock, formatIST } from "../services/attendanceHistoryFormat.js";
 
 const API = `${HRONE_API_BASE}/api/attendance`;
-const STATUSES = ["Present", "Half-Day Present", "Absent", "Holiday", "Leave", "Weekly Off", "Medical Leave", "Permission", "Not Applicable", "Not Marked"];
+const STATUSES = ["Present", "Half-Day Present", "Absent", "Holiday", "Leave", "Casual Leave (CL)", "Medical Leave (ML)", "Weekly Off", "Permission", "Not Applicable", "Not Marked"];
 const LOCKED_PAYROLL = new Set(["Approved", "Processed", "Paid"]);
 
 function companyDateParts() {
@@ -92,6 +92,9 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
   const [weeklyOffError, setWeeklyOffError] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [leaveBalance, setLeaveBalance] = useState(null);
+  const [leaveBalanceLoading, setLeaveBalanceLoading] = useState(false);
+  const [leaveBalanceError, setLeaveBalanceError] = useState("");
   const [editingDate, setEditingDate] = useState("");
   const [expandedDate, setExpandedDate] = useState("");
   const [historyDate, setHistoryDate] = useState("");
@@ -165,6 +168,23 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
     return () => controller.abort();
   }, [department]);
 
+  useEffect(() => {
+    if (!employeeId || !selectedMonth) { setLeaveBalance(null); return undefined; }
+    const controller = new AbortController();
+    setLeaveBalanceLoading(true); setLeaveBalanceError(""); setLeaveBalance(null);
+    const [year, month] = selectedMonth.split("-").map(Number);
+    fetch(`${API}/historical/user/${encodeURIComponent(employeeId)}/leave-balance?year=${year}&month=${month}`, {
+      headers: getHeadersRef.current(), signal: controller.signal,
+    }).then(async (response) => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.detail || "Unable to load CL/ML balances.");
+      if (!controller.signal.aborted) setLeaveBalance(data);
+    }).catch((err) => {
+      if (err.name !== "AbortError" && !controller.signal.aborted) setLeaveBalanceError(err.message || "Unable to load CL/ML balances.");
+    }).finally(() => { if (!controller.signal.aborted) setLeaveBalanceLoading(false); });
+    return () => controller.abort();
+  }, [employeeId, selectedMonth, records]);
+
   // Drop every piece of per-employee state (and invalidate in-flight requests).
   const clearAttendanceContext = useCallback(() => {
     recordsRequest.current += 1;
@@ -174,6 +194,7 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
     setHistory([]); setHistoryDate(""); setHistoryLoading(false);
     setExpandedDate(""); setEditingDate("");
     setError(""); setMessage("");
+    setLeaveBalance(null); setLeaveBalanceError(""); setLeaveBalanceLoading(false);
   }, []);
 
   const changeDepartment = (value) => {
@@ -578,7 +599,14 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                                     <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setEditingDate("")}>Cancel edit</button>
                                   </div>
                                   <div className="row g-3">
-                                    <div className="col-12 col-md-3"><label className="form-label">Attendance Status</label><select className="form-select" value={edit.status} onChange={(e) => setEdit((old) => ({ ...old, status: e.target.value }))}>{STATUSES.map((status) => <option key={status}>{status}</option>)}</select></div>
+                                    <div className="col-12 col-md-3"><label className="form-label">Attendance Status</label><select className="form-select" value={edit.status} onChange={(e) => setEdit((old) => ({ ...old, status: e.target.value }))}>{STATUSES.map((status) => {
+                                      const currentStatus = records.find((item) => item.attendance_date === editingDate)?.status;
+                                      const clUnavailable = status === "Casual Leave (CL)" && Number(leaveBalance?.cl?.available ?? 0) < 1 && currentStatus !== status;
+                                      const mlUnavailable = status === "Medical Leave (ML)" && Number(leaveBalance?.ml?.available ?? 0) < 1 && currentStatus !== status;
+                                      return <option key={status} value={status} disabled={clUnavailable || mlUnavailable}>
+                                        {status}{clUnavailable ? " — unavailable" : mlUnavailable ? " — unavailable" : ""}
+                                      </option>;
+                                    })}</select></div>
                                     {edit.status === "Present" && <>
                                       <div className="col-6 col-md-2"><label className="form-label">Check-in</label><input type="time" className="form-control" value={edit.check_in_time} onChange={(e) => setEdit((old) => ({ ...old, check_in_time: e.target.value }))} /></div>
                                       <div className="col-6 col-md-2"><label className="form-label">Check-out</label><input type="time" className="form-control" value={edit.check_out_time} onChange={(e) => setEdit((old) => ({ ...old, check_out_time: e.target.value }))} /></div>
@@ -615,6 +643,28 @@ export default function HistoricalAttendanceModal({ getHeaders, onClose, onWeekl
                                     <div className="col-6 col-md-3"><label className="form-label">Permission End</label><input type="time" className="form-control" value={edit.permission_end_time} onChange={(e) => setEdit((old) => ({ ...old, permission_end_time: e.target.value }))} /></div>
                                     <div className="col-12 col-md-5"><label className="form-label">Permission Reason</label><input className="form-control" value={edit.permission_reason} onChange={(e) => setEdit((old) => ({ ...old, permission_reason: e.target.value }))} /></div>
                                     <div className="col-12 col-md-7"><label className="form-label">Reason for Modification <span className="text-danger">*</span></label><input className="form-control" maxLength={500} value={edit.modification_reason} onChange={(e) => setEdit((old) => ({ ...old, modification_reason: e.target.value }))} placeholder="Explain why this attendance is being corrected" /></div>
+                                    <div className="col-12">
+                                      <div className="border rounded-3 p-3 bg-light-subtle">
+                                        <div className="fw-semibold mb-2">Available Leave Balance</div>
+                                        {leaveBalanceLoading ? <div className="small text-muted">Loading CL/ML balances…</div>
+                                          : leaveBalanceError ? <div className="small text-danger">{leaveBalanceError}</div>
+                                            : leaveBalance ? <div className="row g-2">
+                                              <div className="col-12 col-md-6">
+                                                <div className="small fw-semibold">Casual Leave (CL)</div>
+                                                <div className="small">Monthly entitlement: {leaveBalance.cl?.entitlement ?? 0} day(s)</div>
+                                                <div className="small">Used: {leaveBalance.cl?.used ?? 0} · Pending: {leaveBalance.cl?.pending ?? 0}</div>
+                                                <div className="small fw-semibold">Available: {leaveBalance.cl?.available ?? 0} day(s)</div>
+                                              </div>
+                                              <div className="col-12 col-md-6">
+                                                <div className="small fw-semibold">Medical Leave (ML)</div>
+                                                <div className="small">Credited: {leaveBalance.ml?.credited ?? 0} day(s)</div>
+                                                <div className="small">Used: {leaveBalance.ml?.used ?? 0} · Pending: {leaveBalance.ml?.pending ?? 0}</div>
+                                                <div className="small">Cycle: {leaveBalance.ml?.cycle_start || "—"} – {leaveBalance.ml?.cycle_end || "—"}</div>
+                                                <div className="small fw-semibold">Available: {leaveBalance.ml?.available ?? 0} day(s)</div>
+                                              </div>
+                                            </div> : <div className="small text-muted">Select an employee and month to view balances.</div>}
+                                      </div>
+                                    </div>
                                     <div className="col-12 d-flex justify-content-end"><button type="button" className="btn btn-primary" disabled={saving} onClick={saveEdit}>{saving ? "Saving…" : "Save Attendance Change"}</button></div>
                                   </div>
                                 </div>

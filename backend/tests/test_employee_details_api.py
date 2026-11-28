@@ -22,6 +22,7 @@ class EmployeeDetailsApiTests(unittest.TestCase):
 
     def test_employee_master_fields_are_saved(self):
         payload = EmployeeExtraDetailsPayload(
+            work_stage="Internship",
             gender="Female",
             marital_status="Married",
             department="Engineering",
@@ -32,6 +33,7 @@ class EmployeeDetailsApiTests(unittest.TestCase):
         )
         user = {"_id": self.user_id, "role": "Employee"}
         saved_details = {
+            "work_stage": "Internship",
             "gender": "Female",
             "marital_status": "Married",
             "department": "Engineering",

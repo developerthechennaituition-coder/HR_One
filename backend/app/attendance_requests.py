@@ -48,6 +48,7 @@ from app.attendance import (
     company_now,
 )
 from app.db.mongodb import db
+from app.weekly_off_planner import monthly_weekly_off_entitlement
 from app.attendance_calculations import (
     ATTENDANCE_ISSUE_STATUS,
     calculate_half_day_portions,
@@ -72,9 +73,9 @@ payroll_collection = db["monthly_payroll_records"]
 leave_notifications_collection = db["leave_notifications"]
 notification_sequences_collection = db["notification_sequences"]
 
-RequestStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"]
+RequestStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Casual Leave", "Medical Leave", "Permission"]
 # HR Admin may also finalize a requested date as Not Applicable (counted as LOP).
-FinalStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission", "Not Applicable"]
+FinalStatus = Literal["Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Casual Leave", "Medical Leave", "Permission", "Not Applicable"]
 NOT_APPLICABLE = "Not Applicable"
 BEFORE_JOINING = "Before Joining"
 ATTENDANCE_ISSUE = ATTENDANCE_ISSUE_STATUS
@@ -86,15 +87,15 @@ ISSUE_FIELDS = (
 # Permitted corrections by the date's current attendance status. Leave dates
 # are owned by the Leave module and future/pre-joining dates are not eligible.
 STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    "Not Marked": ("Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
-    NOT_APPLICABLE: ("Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
-    "Absent": ("Present", "Half-Day Present", "Holiday", "Weekly Off", "Medical Leave", "Permission"),
-    "Weekly Off": ("Present", "Medical Leave", "Absent"),
-    "Present": ("Present", "Half-Day Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
-    "Half-Day Present": ("Present", "Half-Day Present", "Absent", "Medical Leave", "Weekly Off", "Permission"),
+    "Not Marked": ("Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Casual Leave", "Medical Leave", "Permission"),
+    NOT_APPLICABLE: ("Present", "Half-Day Present", "Absent", "Holiday", "Weekly Off", "Casual Leave", "Medical Leave", "Permission"),
+    "Absent": ("Present", "Half-Day Present", "Holiday", "Weekly Off", "Casual Leave", "Medical Leave", "Permission"),
+    "Weekly Off": ("Present", "Casual Leave", "Medical Leave", "Absent"),
+    "Present": ("Present", "Half-Day Present", "Absent", "Casual Leave", "Medical Leave", "Weekly Off", "Permission"),
+    "Half-Day Present": ("Present", "Half-Day Present", "Absent", "Casual Leave", "Medical Leave", "Weekly Off", "Permission"),
     "Holiday": ("Present",),
     # Check-in without check-out. HR enters the missing Check-Out when approving Present.
-    ATTENDANCE_ISSUE: ("Present", "Half-Day Present", "Absent"),
+    ATTENDANCE_ISSUE: ("Present", "Half-Day Present", "Absent", "Casual Leave", "Medical Leave"),
 }
 MEDICAL_LEAVE_MONTHLY_LIMIT = leave.MEDICAL_LEAVE_DAYS_PER_MONTH
 MEDICAL_LEAVE_CODE = leave.MEDICAL_LEAVE_CODE
@@ -121,6 +122,12 @@ def ensure_attendance_request_indexes() -> None:
     attendance_requests_collection.create_index([("status", 1), ("submitted_at", -1)])
     attendance_requests_collection.create_index([("employee_id", 1), ("status", 1), ("periods", 1)])
     attendance_requests_collection.create_index([("user_id", 1), ("status", 1), ("periods", 1)])
+    # Weekly Off workflow notifications use a separate idempotency key so a
+    # concurrent retry cannot create duplicate approver/employee alerts.
+    leave_notifications_collection.create_index(
+        "weekly_off_event_key", unique=True, sparse=True,
+        name="weekly_off_event_key_unique",
+    )
 
 
 @router.on_event("startup")
@@ -392,8 +399,10 @@ def _day_status(current: date, record: dict[str, Any] | None, ctx: dict[str, Any
     return "Not Marked"
 
 
-def _weekly_off_limit() -> int:
-    """Weekly Offs per Month from the HR-managed company policy."""
+def _weekly_off_limit(user: dict[str, Any] | None = None, year: int | None = None, month: int | None = None) -> int:
+    """Return the same joining-month prorated entitlement used by Weekly Off selection."""
+    if user is not None and year is not None and month is not None:
+        return monthly_weekly_off_entitlement(leave._joining_date(user), year, month)
     try:
         return min(4, int(leave._company_policy().get("weekly_offs_per_month") or DEFAULT_WEEKLY_OFF_MONTHLY_LIMIT))
     except (TypeError, ValueError):
@@ -440,7 +449,9 @@ def _month_usage(user: dict[str, Any], ctx: dict[str, Any], exclude_request_id: 
     current = ctx["start"]
     while current <= ctx["end"]:
         record = ctx["records"].get(current.isoformat())
-        if _day_status(current, record, whole_month) == "Weekly Off":
+        # The joining-month entitlement is prorated and dates before joining
+        # must never consume the employee's Weekly Off allowance.
+        if (not ctx.get("joining") or current >= ctx["joining"]) and _day_status(current, record, whole_month) == "Weekly Off":
             weekly_off += 1
         if record and (record.get("medical_leave") or (
             str(record.get("status") or "").casefold() == "leave"
@@ -506,7 +517,28 @@ def _medical_leave_availability(usage: dict[str, int], weekly_limit: int, extra_
     return True, None
 
 
-def _status_options(base_status: str, usage: dict[str, int], weekly_limit: int) -> tuple[list[str], list[str]]:
+def _leave_correction_availability(user: dict[str, Any], selected: date | str, code: str, exclude_request_id: str | None = None) -> tuple[bool, str]:
+    """Use Leave Management's CL monthly entitlement and ML six-month ledger."""
+    if isinstance(selected, str):
+        selected = date.fromisoformat(selected)
+    user_id = str(user["_id"])
+    leave_type = db["leave_types"].find_one({"code": code, "is_active": True})
+    if not leave_type:
+        return False, f"{code} is not configured in Leave Management."
+    if code == "CL":
+        policy = leave._get_policy(str(leave_type["_id"])) or {}
+        entitlement = min(float(policy.get("monthly_entitlement", 0) or 0), 1.0)
+        used, pending = leave._monthly_leave_usage(
+            user_id, str(leave_type["_id"]), selected.year, selected.month, exclude_request_id,
+        )
+        available = max(entitlement - used - pending, 0.0)
+        return available >= 1, f"CL monthly entitlement is exhausted for {selected.strftime('%B %Y')}."
+    ml = leave._ml_cycle_balance(user, company_today(), exclude_request_id=exclude_request_id)
+    available = max(float(ml.get("available", 0) or 0), 0.0)
+    return available >= 1, f"ML balance is insufficient in the current six-month cycle ({ml['cycle_start']} to {ml['cycle_end']})."
+
+
+def _status_options(base_status: str, usage: dict[str, int], weekly_limit: int, user: dict[str, Any] | None = None, selected: date | None = None) -> tuple[list[str], list[str]]:
     """Permitted statuses for a date plus explanations for limit-blocked ones."""
     options: list[str] = []
     notes: list[str] = []
@@ -518,10 +550,18 @@ def _status_options(base_status: str, usage: dict[str, int], weekly_limit: int) 
                 f"({usage['weekly_off_used']} recorded or requested)."
             )
             continue
-        if option == "Medical Leave" and not medical[0]:
-            notes.append(f"Medical Leave is unavailable: {medical[1]}")
+        if option in {"Casual Leave", "Medical Leave"}:
             continue
         options.append(option)
+    if user and selected:
+        for label, code in (("Casual Leave", "CL"), ("Medical Leave", "ML")):
+            if label not in STATUS_TRANSITIONS.get(base_status, ()):
+                continue
+            available, reason = _leave_correction_availability(user, selected, code)
+            if available:
+                options.append(label)
+            else:
+                notes.append(f"{label} unavailable: {reason}")
     return options, notes
 
 
@@ -551,7 +591,7 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
     payroll_status = _payroll_status(employee_id, period)
     payroll_lock = payroll_status in PAYROLL_FINALIZED_STATUSES
     usage = _month_usage(user, ctx)
-    weekly_limit = _weekly_off_limit()
+    weekly_limit = _weekly_off_limit(user, year, month)
     medical = _medical_leave_availability(usage, weekly_limit)
 
     days: list[dict[str, Any]] = []
@@ -575,11 +615,14 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
                 "requested_status": requested.get("requested_status"),
             }
 
-        options, option_notes = _status_options(day_status, usage, weekly_limit)
+        options, option_notes = _status_options(day_status, usage, weekly_limit, user, current)
         schedule = applicable_schedule(user_id, current, details=employee_working_details)
         daily_metrics = _calculate_daily_attendance(user_id, current, user)
         day_check_in = daily_metrics.get("first_check_in") or (record or {}).get("check_in_time")
         day_check_out = daily_metrics.get("last_check_out") or (record or {}).get("check_out_time")
+        if day_status == ATTENDANCE_ISSUE:
+            day_check_in = (record or {}).get("check_in_time")
+            day_check_out = (record or {}).get("check_out_time")
         day_total_minutes = int(daily_metrics.get("working_minutes") or 0)
         approved_permission_intervals = [
             (item.get("start_time"), item.get("end_time"))
@@ -663,7 +706,11 @@ def _build_calendar(user: dict[str, Any], year: int, month: int) -> dict[str, An
         days.append({
             "attendance_date": iso,
             "status": resolved_day_status,
-            "status_label": "Medical Leave" if record and record.get("medical_leave") else resolved_day_status,
+            "status_label": (
+                "Casual Leave (CL)" if record and record.get("leave_type_code") == "CL"
+                else "Medical Leave (ML)" if record and record.get("leave_type_code") == "ML"
+                else resolved_day_status
+            ),
             "attendance_category": _attendance_category(record),
             # Expose the source/type and persisted modification timestamp to
             # read-only calendar consumers (including Team Member Details).
@@ -827,6 +874,46 @@ def _is_hr_admin(user: dict[str, Any]) -> bool:
 
 def _release_claims(request_id: str) -> None:
     attendance_request_date_claims_collection.delete_many({"request_id": request_id})
+
+
+def _reserve_final_casual_leave_claims(request: dict[str, Any], decisions: dict[str, Any]) -> None:
+    selected_dates = [
+        date.fromisoformat(iso)
+        for iso, decision in decisions.items()
+        if decision.action == "approve" and decision.final_status == "Casual Leave"
+    ]
+    if not selected_dates:
+        return
+    request_id = str(request["_id"])
+    claims = leave.leave_cl_monthly_claims_collection
+    claimed_months = {
+        item["month"] for item in claims.find({"request_id": request_id}, {"month": 1})
+    }
+    missing_dates = [item for item in selected_dates if item.strftime("%Y-%m") not in claimed_months]
+    if missing_dates:
+        cl_type = leave.leave_types_collection.find_one({"code": "CL", "is_active": True})
+        if not cl_type:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Casual Leave is not configured in Leave Management.")
+        leave._reserve_cl_monthly_claims(
+            str(request["user_id"]), str(cl_type["_id"]), missing_dates, request_id,
+        )
+
+
+def _finalize_casual_leave_claims(request_id: str, results: list[dict[str, Any]]) -> None:
+    applied_months = {
+        item["attendance_date"][:7]
+        for item in results
+        if item.get("applied") and item.get("final_status") == "Casual Leave"
+    }
+    claims = leave.leave_cl_monthly_claims_collection
+    for claim in claims.find({"request_id": request_id}, {"month": 1}):
+        if claim.get("month") in applied_months:
+            claims.update_one(
+                {"_id": claim["_id"]},
+                {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
+            )
+        else:
+            claims.delete_one({"_id": claim["_id"]})
 
 
 def _local_text(value: datetime) -> str:
@@ -1007,7 +1094,7 @@ def create_attendance_request(
                 calendars[key] = {"limits": calendar["limits"], "days": {day["attendance_date"]: day for day in calendar["days"]}}
             except HTTPException as exc:
                 calendars[key] = {"limits": None, "days": {}, "error": exc.detail}
-            added[key] = {"Weekly Off": 0, "Medical Leave": 0}
+            added[key] = {"Weekly Off": 0, "Medical Leave": 0, "Casual Leave": 0}
         calendar = calendars[key]
         day = calendar["days"].get(iso)
         if not day:
@@ -1067,11 +1154,16 @@ def create_attendance_request(
                 problems.append(f"{iso}: Weekly Off would exceed the monthly limit of {limits['weekly_off_limit']}.")
                 continue
             added[key]["Weekly Off"] += 1
-        if item.requested_status == "Medical Leave":
-            if limits["medical_leave_used"] + added[key]["Medical Leave"] + 1 > limits["medical_leave_limit"]:
-                problems.append(f"{iso}: Medical Leave would exceed the monthly limit of {limits['medical_leave_limit']}.")
+        if item.requested_status in {"Casual Leave", "Medical Leave"}:
+            leave_code = "CL" if item.requested_status == "Casual Leave" else "ML"
+            available, reason = _leave_correction_availability(user, item.attendance_date, leave_code)
+            already_requested = added[key].get(item.requested_status, 0)
+            if not available or already_requested:
+                problems.append(f"{iso}: {reason or f'{item.requested_status} is already reserved for this request month/cycle.'}")
                 continue
-            added[key]["Medical Leave"] += 1
+            added[key][item.requested_status] = already_requested + 1
+        if item.requested_status == "Medical Leave":
+            pass  # ML is validated against the existing six-month Leave Management balance.
         items.append({
             "attendance_date": iso,
             # Original attendance is kept separately; the record is unchanged until approval.
@@ -1132,14 +1224,32 @@ def create_attendance_request(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "These dates cannot be requested: " + "; ".join(problems))
 
     request_id = ObjectId()
+    casual_leave_dates = [
+        item.attendance_date for item in requested
+        if item.requested_status == "Casual Leave"
+    ]
     try:
         for iso in isos:
             attendance_request_date_claims_collection.insert_one(
                 {"user_id": user_id, "attendance_date": iso, "request_id": str(request_id), "created_at": datetime.now(timezone.utc)}
             )
+        if casual_leave_dates:
+            cl_type = leave.leave_types_collection.find_one({"code": "CL", "is_active": True})
+            if not cl_type:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Casual Leave is not configured in Leave Management.")
+            leave._reserve_cl_monthly_claims(
+                user_id, str(cl_type["_id"]), casual_leave_dates, str(request_id),
+            )
     except DuplicateKeyError as exc:
         attendance_request_date_claims_collection.delete_many({"request_id": str(request_id)})
         raise HTTPException(status.HTTP_409_CONFLICT, "Another attendance request already covers one of these dates. Refresh and try again.") from exc
+    except HTTPException:
+        attendance_request_date_claims_collection.delete_many({"request_id": str(request_id)})
+        raise
+    except Exception:
+        attendance_request_date_claims_collection.delete_many({"request_id": str(request_id)})
+        leave._release_cl_monthly_claims(str(request_id))
+        raise
 
     now = datetime.now(timezone.utc)
     record = {
@@ -1166,18 +1276,20 @@ def create_attendance_request(
         attendance_requests_collection.insert_one(record)
     except Exception as exc:
         _release_claims(str(request_id))
+        leave._release_cl_monthly_claims(str(request_id))
         logger.exception("Unable to save attendance request for user %s", user_id)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Your attendance request could not be saved. Please try again.") from exc
 
     # Concurrent requests for different dates could both pass the limit check;
     # recheck with this request's reservations included and roll back if over.
-    weekly_limit = _weekly_off_limit()
     for year, month in {(item.attendance_date.year, item.attendance_date.month) for item in requested
                         if item.requested_status in {"Weekly Off", "Medical Leave"}}:
+        weekly_limit = _weekly_off_limit(user, year, month)
         usage = _month_usage(user, _month_context(user, year, month))
         if usage["weekly_off_used"] > weekly_limit or usage["medical_leave_used"] > MEDICAL_LEAVE_MONTHLY_LIMIT:
             attendance_requests_collection.delete_one({"_id": request_id, "status": "pending"})
             _release_claims(str(request_id))
+            leave._release_cl_monthly_claims(str(request_id))
             raise HTTPException(status.HTTP_409_CONFLICT, "Another request used the remaining Weekly Off / Medical Leave allowance for this month. Refresh and try again.")
 
     _audit(user, "ATTENDANCE_REQUEST_SUBMITTED", record, {"dates": isos})
@@ -1206,13 +1318,17 @@ def create_attendance_request(
 @router.get("/my")
 def my_attendance_requests(authorization: str | None = Header(default=None)):
     user = _current_user(authorization)
-    return [_serialize(item) for item in attendance_requests_collection.find({"user_id": str(user["_id"])}).sort("submitted_at", -1)]
+    return [_serialize(item) for item in attendance_requests_collection.find({
+        "user_id": str(user["_id"]), "request_type": {"$ne": "weekly_off_selection"},
+    }).sort("submitted_at", -1)]
 
 
 @router.post("/{request_id}/cancel")
 def cancel_attendance_request(request_id: str, authorization: str | None = Header(default=None)):
     user = _current_user(authorization)
     request = _load_request(request_id)
+    if request.get("request_type") == "weekly_off_selection":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Use the Weekly Off page to cancel this selection.")
     if request.get("user_id") != str(user["_id"]):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can cancel only your own attendance requests.")
     now = datetime.now(timezone.utc)
@@ -1224,6 +1340,7 @@ def cancel_attendance_request(request_id: str, authorization: str | None = Heade
     if not updated:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only pending requests can be cancelled. This request has already been processed.")
     _release_claims(str(request["_id"]))
+    leave._release_cl_monthly_claims(str(request["_id"]))
     _audit(user, "ATTENDANCE_REQUEST_CANCELLED", updated)
     return _serialize(updated)
 
@@ -1242,7 +1359,7 @@ def list_attendance_requests(
     authorization: str | None = Header(default=None),
 ):
     _require_hr_admin(authorization, "Only HR Admin or Administrator can review attendance requests.")
-    query: dict[str, Any] = {}
+    query: dict[str, Any] = {"request_type": {"$ne": "weekly_off_selection"}}
     if request_status and request_status != "all":
         if request_status not in REQUEST_STATUSES:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid request status filter.")
@@ -1304,6 +1421,8 @@ def _record_matches_original(item: dict[str, Any], record: dict[str, Any] | None
 def get_attendance_request(request_id: str, authorization: str | None = Header(default=None)):
     user = _current_user(authorization)
     request = _load_request(request_id)
+    if request.get("request_type") == "weekly_off_selection":
+        raise HTTPException(status.HTTP_409_CONFLICT, "View this request from the Weekly Off page.")
     is_admin = _is_hr_admin(user)
     if not is_admin and request.get("user_id") != str(user["_id"]):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not authorized to view this attendance request.")
@@ -1345,6 +1464,7 @@ def get_attendance_request(request_id: str, authorization: str | None = Header(d
         if not can_respond:
             continue
         day = date.fromisoformat(item["attendance_date"])
+        weekly_limit = _weekly_off_limit(employee, day.year, day.month)
         key = (day.year, day.month)
         if key not in month_cache:
             ctx = _month_context(employee, *key)
@@ -1357,7 +1477,7 @@ def get_attendance_request(request_id: str, authorization: str | None = Header(d
                 f"Attendance for this date changed after the request was submitted (now {current_status}); "
                 "approving will not overwrite it."
             )
-        options, notes = _status_options(item["original_status"], usage, weekly_limit)
+        options, notes = _status_options(item["original_status"], usage, weekly_limit, employee, date.fromisoformat(item["attendance_date"]))
         if item["original_status"] != NOT_APPLICABLE:
             options.append(NOT_APPLICABLE)
         item["allowed_final_statuses"] = options
@@ -1487,18 +1607,20 @@ def _apply_date_decision(
         return False, final_status, "An approved full-day leave covers this date; attendance was not changed."
 
     # Revalidate monthly limits immediately before writing.
-    if final_status in {"Weekly Off", "Medical Leave"}:
+    if final_status in {"Weekly Off", "Casual Leave", "Medical Leave"}:
         usage = _month_usage(employee, ctx, exclude_request_id=request_id)
-        if final_status == "Weekly Off" and usage["weekly_off_used"] >= _weekly_off_limit():
-            return False, final_status, f"Weekly Off would exceed the monthly limit of {_weekly_off_limit()}."
-        if final_status == "Medical Leave":
-            available, reason = _medical_leave_availability(usage, _weekly_off_limit())
+        weekly_limit = _weekly_off_limit(employee, day.year, day.month)
+        if final_status == "Weekly Off" and usage["weekly_off_used"] >= weekly_limit:
+            return False, final_status, f"Weekly Off would exceed the monthly limit of {weekly_limit}."
+        if final_status in {"Casual Leave", "Medical Leave"}:
+            code = "CL" if final_status == "Casual Leave" else "ML"
+            available, reason = _leave_correction_availability(employee, attendance_date, code, request_id)
             if not available:
-                return False, final_status, f"Medical Leave is unavailable: {reason}"
+                return False, final_status, reason
 
     now = datetime.now(timezone.utc)
     values: dict[str, Any] = {
-        "status": "Leave" if final_status == "Medical Leave" else final_status,
+        "status": "Leave" if final_status in {"Casual Leave", "Medical Leave"} else final_status,
         # Times come only from the employee request / HR decision; never invented.
         "check_in_time": check_in,
         "check_out_time": check_out,
@@ -1532,12 +1654,15 @@ def _apply_date_decision(
             values["medical_leave"] = half_day_fields["medical_leave"]
         else:
             unset.update({field: "" for field in LEAVE_FIELDS})
-    elif final_status == "Medical Leave":
+    elif final_status in {"Casual Leave", "Medical Leave"}:
+        leave_code = "CL" if final_status == "Casual Leave" else MEDICAL_LEAVE_CODE
         values.update({
-            "leave_type_code": MEDICAL_LEAVE_CODE,
+            "status": "Leave",
+            "leave_type_code": leave_code,
             "leave_day_part": "full_day",
             "leave_request_id": None,
-            "medical_leave": True,
+            "medical_leave": leave_code == MEDICAL_LEAVE_CODE,
+            "attendance_source": "ATTENDANCE_REQUEST",
         })
     else:
         unset.update({field: "" for field in LEAVE_FIELDS})
@@ -1656,7 +1781,6 @@ def _validate_decisions(request: dict[str, Any], payload: AttendanceRequestRespo
 
     problems: list[str] = []
     added: dict[str, dict[str, int]] = {}
-    weekly_limit = _weekly_off_limit()
     # Weekly Off days approved in this response also unlock Medical Leave.
     approved_weekly_offs: dict[str, int] = {}
     for iso, decision in decisions.items():
@@ -1707,25 +1831,25 @@ def _validate_decisions(request: dict[str, Any], payload: AttendanceRequestRespo
         if time_problem:
             problems.append(f"{iso}: {time_problem}")
             continue
-        if decision.final_status in {"Weekly Off", "Medical Leave"}:
+        if decision.final_status in {"Weekly Off", "Casual Leave", "Medical Leave"}:
             period = iso[:7]
             if period not in usage_cache:
                 day = date.fromisoformat(iso)
                 usage_cache[period] = _month_usage(employee, _month_context(employee, day.year, day.month), exclude_request_id=str(request["_id"]))
-                added[period] = {"Weekly Off": 0, "Medical Leave": 0}
+                added[period] = {"Weekly Off": 0, "Medical Leave": 0, "Casual Leave": 0}
             used = usage_cache[period]
+            day_for_limit = date.fromisoformat(iso)
+            weekly_limit = _weekly_off_limit(employee, day_for_limit.year, day_for_limit.month)
             if decision.final_status == "Weekly Off" and used["weekly_off_used"] + added[period]["Weekly Off"] >= weekly_limit:
                 problems.append(f"{iso}: Weekly Off would exceed the monthly limit of {weekly_limit}.")
                 continue
-            if decision.final_status == "Medical Leave":
-                if used["medical_leave_used"] + added[period]["Medical Leave"] + 1 > MEDICAL_LEAVE_MONTHLY_LIMIT:
-                    problems.append(f"{iso}: Medical Leave would exceed the monthly limit of {MEDICAL_LEAVE_MONTHLY_LIMIT}.")
-                    continue
-                available, reason = _medical_leave_availability(used, weekly_limit, approved_weekly_offs.get(period, 0))
+            if decision.final_status in {"Casual Leave", "Medical Leave"}:
+                code = "CL" if decision.final_status == "Casual Leave" else "ML"
+                available, reason = _leave_correction_availability(employee, date.fromisoformat(iso), code, str(request["_id"]))
                 if not available:
-                    problems.append(f"{iso}: Medical Leave is unavailable: {reason}")
+                    problems.append(f"{iso}: {reason}")
                     continue
-            added[period][decision.final_status] += 1
+            added[period][decision.final_status] = added[period].get(decision.final_status, 0) + 1
     if problems:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Correct these decisions: " + "; ".join(problems))
     return decisions
@@ -1739,6 +1863,8 @@ def respond_to_attendance_request(
 ):
     admin = _require_hr_admin(authorization, "Only HR Admin or Administrator can respond to attendance requests.")
     request = _load_request(request_id)
+    if request.get("request_type") == "weekly_off_selection":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Use the Weekly Off page to review this request.")
     if request.get("user_id") == str(admin["_id"]):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You cannot respond to your own attendance request. Another HR Admin must review it.")
     if request.get("status") not in ACTIVE_REQUEST_STATUSES:
@@ -1769,6 +1895,12 @@ def respond_to_attendance_request(
             {"_id": claimed["_id"], "processing_token": token},
             {"$set": {"status": "pending", "updated_at": datetime.now(timezone.utc)}, "$unset": {"processing_token": "", "processing_by": "", "processing_started_at": ""}},
         )
+
+    try:
+        _reserve_final_casual_leave_claims(claimed, decisions)
+    except Exception:
+        release_to_pending()
+        raise
 
     # Serialize responses per employee and month so concurrent approvals cannot
     # exceed the monthly Weekly Off / Medical Leave limits.
@@ -1854,6 +1986,7 @@ def respond_to_attendance_request(
     )
     if not finished:
         raise HTTPException(status.HTTP_409_CONFLICT, "This request was taken over by another reviewer after a timeout. Refresh to see its current state.")
+    _finalize_casual_leave_claims(str(claimed["_id"]), results)
     _release_claims(str(claimed["_id"]))
     _audit(admin, "ATTENDANCE_REQUEST_RESPONDED", finished, {
         "status": overall,

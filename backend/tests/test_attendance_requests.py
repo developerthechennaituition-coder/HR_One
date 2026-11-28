@@ -19,7 +19,7 @@ from pymongo.errors import PyMongoError  # noqa: E402
 from app import attendance_requests as ar  # noqa: E402
 from app import attendance as attendance_module, leave, payroll  # noqa: E402
 from app.db.mongodb import client, db, ensure_audit_logs_collection  # noqa: E402
-from app.session import active_sessions  # noqa: E402
+from app.session import create_session, revoke_session  # noqa: E402
 
 TODAY = date(2026, 10, 15)
 
@@ -65,6 +65,15 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         ensure_audit_logs_collection()  # Same $jsonSchema validator as the live database.
         db["leave_notifications"].create_index("leave_notification_id", unique=True)
         ar.ensure_attendance_request_indexes()
+        leave.leave_ml_carryforwards_collection.create_index(
+            [("user_id", 1), ("month", 1)], unique=True,
+        )
+        leave.leave_ml_cycles_collection.create_index(
+            [("user_id", 1), ("cycle_start", 1)], unique=True,
+        )
+        leave.leave_cl_monthly_claims_collection.create_index(
+            [("user_id", 1), ("leave_type_id", 1), ("month", 1)], unique=True,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -73,7 +82,8 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
     def setUp(self):
         for name in ["users", "attendance", "attendance_requests", "attendance_request_date_claims",
                      "monthly_payroll_records", "leave_notifications", "employee_holiday_calendars", "holidays", "leave_policies",
-                     "leave_types", "leave_balances", "leave_requests", "permission_requests", "essl_raw_punches", "audit_logs"]:
+                     "leave_types", "leave_balances", "leave_requests", "leave_ml_carryforwards", "leave_ml_cycles",
+                     "leave_cl_monthly_claims", "permission_requests", "essl_raw_punches", "audit_logs"]:
             db[name].delete_many({})
         self.today = patch.object(ar, "company_today", return_value=TODAY)
         self.today.start()
@@ -102,9 +112,8 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
     def make_user(self, name, employee_id, role, **extra):
         user = {"_id": ObjectId(), "name": name, "employee_id": employee_id, "role": role, "is_active": True, "department": "Finance", **extra}
         db["users"].insert_one(user)
-        token = f"token-{user['_id']}"
-        active_sessions[token] = str(user["_id"])
-        self.addCleanup(active_sessions.pop, token, None)
+        token = create_session(str(user["_id"]))
+        self.addCleanup(revoke_session, token)
         user["auth"] = f"Bearer {token}"
         return user
 
@@ -679,6 +688,87 @@ class AttendanceRequestWorkflowTests(unittest.TestCase):
         # The yearly Medical Leave balance is one day for every month.
         db["leave_policies"].update_one({"leave_type_id": "__company_policy__"}, {"$set": {"probation_period_months": 3}})
         self.assertEqual(leave._medical_entitlement(self.other, 3.0), 12.0)
+
+    def test_attendance_issue_supports_unique_cl_ml_options_and_updates_leave_balance(self):
+        cl_id = db["leave_types"].insert_one({
+            "code": "CL", "name": "Casual Leave", "is_active": True, "is_paid": True,
+        }).inserted_id
+        db["leave_types"].insert_one({
+            "code": "ML", "name": "Medical Leave", "is_active": True, "is_paid": True,
+        })
+        db["leave_policies"].insert_one({
+            "leave_type_id": str(cl_id), "monthly_entitlement": 1.0,
+            "annual_entitlement": 12.0, "is_active": True,
+        })
+        issue_date = "2026-10-10"
+        db["attendance"].update_one(
+            {"user_id": str(self.employee["_id"]), "attendance_date": issue_date},
+            {"$set": {
+                "user_id": str(self.employee["_id"]), "employee_id": "E-201",
+                "attendance_date": issue_date, "status": "Attendance Issue",
+                "check_in_time": "09:00", "check_out_time": None,
+            }},
+            upsert=True,
+        )
+
+        day = self.calendar_day(self.employee, issue_date)
+        self.assertEqual(day["status"], "Attendance Issue")
+        self.assertEqual(day["request_options"].count("Casual Leave"), 1)
+        self.assertEqual(day["request_options"].count("Medical Leave"), 1)
+        self.assertNotIn("Leave", day["request_options"])
+        self.assertTrue({"Present", "Half-Day Present", "Absent", "Casual Leave", "Medical Leave"}.issubset(day["request_options"]))
+
+        created = ar.create_attendance_request(payload((issue_date, "Casual Leave")), self.employee["auth"])
+        used, pending = leave._monthly_leave_usage(
+            str(self.employee["_id"]), str(cl_id), 2026, 10,
+        )
+        self.assertEqual((used, pending), (0.0, 1.0))
+        self.assert_http(
+            422, ar.create_attendance_request,
+            payload(("2026-10-12", "Casual Leave")), self.employee["auth"],
+        )
+        ar.respond_to_attendance_request(
+            created["id"], decisions((issue_date, "Casual Leave")), self.hr["auth"],
+        )
+
+        record = db["attendance"].find_one({
+            "user_id": str(self.employee["_id"]), "attendance_date": issue_date,
+        })
+        self.assertEqual((record["status"], record["leave_type_code"]), ("Leave", "CL"))
+        used, pending = leave._monthly_leave_usage(
+            str(self.employee["_id"]), str(cl_id), 2026, 10,
+        )
+        self.assertEqual((used, pending), (1.0, 0.0))
+        claim = leave.leave_cl_monthly_claims_collection.find_one({
+            "user_id": str(self.employee["_id"]), "month": "2026-10",
+        })
+        self.assertEqual(claim["status"], "approved")
+
+        cl_balance = leave._balance_response(
+            {"_id": ObjectId(), "user_id": str(self.employee["_id"]), "leave_type_id": str(cl_id), "year": 2026},
+            db["leave_types"].find_one({"_id": cl_id}), self.employee, date(2026, 10, 15),
+        )
+        self.assertEqual((cl_balance["used"], cl_balance["available"]), (1.0, 0.0))
+
+        medical_issue_date = "2026-10-11"
+        db["attendance"].insert_one({
+            "user_id": str(self.employee["_id"]), "employee_id": "E-201",
+            "attendance_date": medical_issue_date, "status": "Attendance Issue",
+            "check_in_time": "09:00", "check_out_time": None,
+        })
+        medical_request = ar.create_attendance_request(
+            payload((medical_issue_date, "Medical Leave")), self.employee["auth"],
+        )
+        ar.respond_to_attendance_request(
+            medical_request["id"], decisions((medical_issue_date, "Medical Leave")), self.hr["auth"],
+        )
+        ml_type = db["leave_types"].find_one({"code": "ML"})
+        ml_balance = leave._balance_response(
+            {"_id": ObjectId(), "user_id": str(self.employee["_id"]), "leave_type_id": str(ml_type["_id"]), "year": 2026},
+            ml_type, self.employee, date(2026, 10, 15),
+        )
+        self.assertEqual((ml_balance["used"], ml_balance["pending"]), (1.0, 0.0))
+        self.assertEqual(ml_balance["available"], ml_balance["entitled"] - 1.0)
 
     def test_retired_sl_leave_type_is_merged_into_ml(self):
         user_id = str(self.other["_id"])

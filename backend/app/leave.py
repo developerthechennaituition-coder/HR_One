@@ -46,12 +46,15 @@ notification_sequences_collection = db["notification_sequences"]
 audit_logs_collection = db["audit_logs"]
 leave_ml_carryforwards_collection = db["leave_ml_carryforwards"]
 leave_ml_cycles_collection = db["leave_ml_cycles"]
+# Atomic per-employee/per-month CL request claims prevent concurrent duplicate reservations.
+leave_cl_monthly_claims_collection = db["leave_cl_monthly_claims"]
 logger = logging.getLogger(__name__)
 
 APPROVER_ROLES = {"hr admin", "administrator", "hr manager"}
 # Medical Leave (code ML) supports policy-controlled supporting documents; allocation is policy-configurable.
 MEDICAL_LEAVE_CODE = "ML"
-# Monthly cap used by attendance request validation (Medical Leave: 1 day/month).
+# Legacy attendance-correction requests retain their one-day/month ML correction cap.
+# New CL/ML leave applications use the Leave Management balance and six-month ML ledger.
 MEDICAL_LEAVE_DAYS_PER_MONTH = 1
 HR_ADMIN_ROLE = "hr admin"
 # The HOD role keeps its stored identifier "HR Manager" (permissions and
@@ -108,10 +111,10 @@ class LeavePolicyCreate(BaseModel):
     @field_validator("eligible_work_stages")
     @classmethod
     def valid_eligible_stages(cls, value: list[str]) -> list[str]:
-        allowed = {"Probation", "Employee"}
+        allowed = {"Probation", "Employee", "Internship"}
         cleaned = list(dict.fromkeys(str(item).strip().title() for item in value if str(item).strip()))
         if not set(cleaned).issubset(allowed):
-            raise ValueError("Eligible Work Stages may contain only Probation and Employee.")
+            raise ValueError("Eligible Work Stages may contain only Probation, Employee, or Internship.")
         return cleaned
 
     @field_validator("accrual_frequency")
@@ -188,10 +191,10 @@ class LeavePolicyUpdate(BaseModel):
     @classmethod
     def valid_update_eligible_stages(cls, value: list[str] | None) -> list[str] | None:
         if value is None: return None
-        allowed = {"Probation", "Employee"}
+        allowed = {"Probation", "Employee", "Internship"}
         cleaned = list(dict.fromkeys(str(item).strip().title() for item in value if str(item).strip()))
         if not set(cleaned).issubset(allowed):
-            raise ValueError("Eligible Work Stages may contain only Probation and Employee.")
+            raise ValueError("Eligible Work Stages may contain only Probation, Employee, or Internship.")
         return cleaned
 
     @field_validator("accrual_frequency")
@@ -244,6 +247,8 @@ def ensure_leave_indexes() -> None:
     )
     leave_ml_carryforwards_collection.create_index([("user_id", 1), ("month", 1)], unique=True)
     leave_ml_cycles_collection.create_index([("user_id", 1), ("cycle_start", 1)], unique=True)
+    leave_cl_monthly_claims_collection.create_index([("user_id", 1), ("leave_type_id", 1), ("month", 1)], unique=True)
+    leave_cl_monthly_claims_collection.create_index("request_id")
     leave_requests_collection.create_index([("user_id", 1), ("created_at", -1)])
     leave_requests_collection.create_index([("status", 1), ("created_at", -1)])
     leave_requests_collection.create_index([("user_id", 1), ("from_date", 1), ("to_date", 1)])
@@ -299,7 +304,7 @@ def ensure_leave_indexes() -> None:
 
     defaults = [
         {"code": "CL", "name": "Casual Leave", "description": "Casual leave", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
-        {"code": MEDICAL_LEAVE_CODE, "name": "Medical Leave", "description": "Medical leave - 1 day per month", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
+        {"code": MEDICAL_LEAVE_CODE, "name": "Medical Leave", "description": "Medical leave funded by unused monthly Casual Leave within a six-month cycle", "is_paid": True, "allow_half_day": True, "requires_attachment": False, "is_active": True},
         {"code": "LOP", "name": "Loss of Pay", "description": "Leave without pay", "is_paid": False, "allow_half_day": True, "requires_attachment": False, "is_active": True},
     ]
     default_entitlements = {"CL": 12, MEDICAL_LEAVE_CODE: 0, "LOP": 0}
@@ -680,7 +685,7 @@ def _get_policy(leave_type_id: str) -> dict[str, Any] | None:
 def _employee_work_stage(user: dict[str, Any]) -> str:
     details = employee_details_collection.find_one({"user_id": str(user.get("_id"))}, {"work_stage": 1}) or {}
     value = str(details.get("work_stage") or user.get("work_stage") or "Employee").strip().title()
-    return value if value in {"Probation", "Employee"} else "Employee"
+    return value if value in {"Probation", "Employee", "Internship"} else "Employee"
 
 
 def _leave_allocation_period(leave_type: dict[str, Any], policy: dict[str, Any] | None) -> str:
@@ -701,7 +706,13 @@ def _leave_stage_allowed(user: dict[str, Any], leave_type: dict[str, Any]) -> bo
     return _employee_work_stage(user) in eligible
 
 
-def _monthly_leave_usage(user_id: str, leave_type_id: str, year: int, month: int) -> tuple[float, float]:
+def _monthly_leave_usage(
+    user_id: str,
+    leave_type_id: str,
+    year: int,
+    month: int,
+    exclude_attendance_request_id: str | None = None,
+) -> tuple[float, float]:
     start = date(year, month, 1)
     end = date(year + (month == 12), (month % 12) + 1, 1)
     used = pending = 0.0
@@ -720,7 +731,72 @@ def _monthly_leave_usage(user_id: str, leave_type_id: str, year: int, month: int
             used += amount
         else:
             pending += amount
+    leave_type = leave_types_collection.find_one({"_id": ObjectId(leave_type_id)}, {"code": 1})
+    leave_code = str((leave_type or {}).get("code") or "").upper()
+    if leave_code in {"CL", MEDICAL_LEAVE_CODE}:
+        for record in db["attendance"].find({
+            "user_id": user_id,
+            "attendance_date": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+            "leave_type_code": leave_code,
+            "attendance_source": {"$in": ["HISTORICAL_ATTENDANCE_CORRECTION", "ATTENDANCE_REQUEST"]},
+            "leave_request_id": {"$in": [None, ""]},
+        }, {"leave_day_part": 1}):
+            used += 0.5 if record.get("leave_day_part") in {"first_half", "second_half"} else 1.0
+        query: dict[str, Any] = {
+            "user_id": user_id,
+            "status": {"$in": ["pending", "processing"]},
+            "request_type": {"$ne": "weekly_off_selection"},
+            "periods": start.strftime("%Y-%m"),
+        }
+        if exclude_attendance_request_id and ObjectId.is_valid(exclude_attendance_request_id):
+            query["_id"] = {"$ne": ObjectId(exclude_attendance_request_id)}
+        requested_status = "Casual Leave" if leave_code == "CL" else "Medical Leave"
+        for request in db["attendance_requests"].find(query, {"dates": 1}):
+            pending += sum(
+                1.0 for item in request.get("dates", [])
+                if str(item.get("attendance_date", "")).startswith(start.strftime("%Y-%m"))
+                and item.get("requested_status") == requested_status
+            )
     return round(used, 2), round(pending, 2)
+
+
+def _reserve_cl_monthly_claims(user_id: str, leave_type_id: str, working_dates: list[date], request_id: str) -> None:
+    """Reserve one CL request per employee/month, including concurrent submissions."""
+    months = sorted({value.strftime("%Y-%m") for value in working_dates})
+    reserved_months: list[str] = []
+    try:
+        for month_key in months:
+            claim = {
+                "user_id": user_id, "leave_type_id": leave_type_id,
+                "month": month_key, "request_id": request_id,
+                "status": "pending", "created_at": datetime.now(timezone.utc),
+            }
+            leave_cl_monthly_claims_collection.insert_one(claim)
+            reserved_months.append(month_key)
+    except DuplicateKeyError as error:
+        if reserved_months:
+            leave_cl_monthly_claims_collection.delete_many({"request_id": request_id, "month": {"$in": reserved_months}})
+        raise HTTPException(
+            status_code=409,
+            detail=f"You have already submitted or used your Casual Leave for {month_key}. Only one CL request is allowed per calendar month.",
+        ) from error
+    except Exception:
+        if reserved_months:
+            leave_cl_monthly_claims_collection.delete_many({"request_id": request_id, "month": {"$in": reserved_months}})
+        raise
+
+
+def _release_cl_monthly_claims(request_id: str) -> None:
+    if request_id:
+        leave_cl_monthly_claims_collection.delete_many({"request_id": request_id})
+
+
+def _commit_cl_monthly_claims(request_id: str) -> None:
+    if request_id:
+        leave_cl_monthly_claims_collection.update_many(
+            {"request_id": request_id},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
+        )
 
 
 def _employee_id_for_user(user: dict[str, Any]) -> str | None:
@@ -867,7 +943,12 @@ def _six_month_cycle(joined: date, as_of: date) -> tuple[date, date]:
     return start, _add_months(start, 6)
 
 
-def _ml_cycle_balance(user: dict[str, Any], as_of: date, process_rollovers: bool = True) -> dict[str, Any]:
+def _ml_cycle_balance(
+    user: dict[str, Any],
+    as_of: date,
+    process_rollovers: bool = True,
+    exclude_request_id: str | None = None,
+) -> dict[str, Any]:
     """Persist unused monthly CL credits and the employee's six-month ML ledgers."""
     user_id = str(user["_id"])
     joined = _joining_date(user) or as_of
@@ -900,7 +981,8 @@ def _ml_cycle_balance(user: dict[str, Any], as_of: date, process_rollovers: bool
     if process_rollovers and cl_type:
         cl_id = str(cl_type["_id"])
         cl_policy = _get_policy(cl_id) or {}
-        monthly_limit = float(cl_policy.get("monthly_entitlement", 0) or 0)
+        # Company policy may configure the monthly amount, but CL is capped at one day per month.
+        monthly_limit = min(float(cl_policy.get("monthly_entitlement", 0) or 0), 1.0)
         month_cursor = date(joined.year, joined.month, 1)
         current_month = date(as_of.year, as_of.month, 1)
         while month_cursor < current_month:
@@ -962,6 +1044,27 @@ def _ml_cycle_balance(user: dict[str, Any], as_of: date, process_rollovers: bool
             used += amount
         else:
             pending += amount
+    for record in db["attendance"].find({
+        "user_id": user_id,
+        "attendance_date": {"$gte": cycle_start.isoformat(), "$lt": cycle_end.isoformat()},
+        "leave_type_code": MEDICAL_LEAVE_CODE,
+        "attendance_source": {"$in": ["HISTORICAL_ATTENDANCE_CORRECTION", "ATTENDANCE_REQUEST"]},
+        "leave_request_id": {"$in": [None, ""]},
+    }, {"leave_day_part": 1}):
+        used += 0.5 if record.get("leave_day_part") in {"first_half", "second_half"} else 1.0
+    attendance_request_query: dict[str, Any] = {
+        "user_id": user_id,
+        "status": {"$in": ["pending", "processing"]},
+        "request_type": {"$ne": "weekly_off_selection"},
+    }
+    if exclude_request_id and ObjectId.is_valid(exclude_request_id):
+        attendance_request_query["_id"] = {"$ne": ObjectId(exclude_request_id)}
+    for request in db["attendance_requests"].find(attendance_request_query, {"dates": 1}):
+        pending += sum(
+            1.0 for item in request.get("dates", [])
+            if cycle_start.isoformat() <= str(item.get("attendance_date", "")) < cycle_end.isoformat()
+            and item.get("requested_status") == "Medical Leave"
+        )
     credited = float(cycle_doc.get("credited", 0) or 0)
     return {
         "cycle_start": cycle_start.isoformat(), "cycle_end": cycle_end.isoformat(),
@@ -971,7 +1074,7 @@ def _ml_cycle_balance(user: dict[str, Any], as_of: date, process_rollovers: bool
     }
 
 
-def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user: dict[str, Any], as_of_date: date | None = None) -> dict[str, Any]:
     policy = _get_policy(str(balance["leave_type_id"]))
     entitled = _effective_entitled(balance, policy, int(balance["year"]))
     used = float(balance.get("used", 0))
@@ -991,12 +1094,14 @@ def _balance_response(balance: dict[str, Any], leave_type: dict[str, Any], user:
         carry_forward = ml["credited"]
         allocation_period = "six_month_cycle"
     elif code == "CL":
-        now_local = company_now().date()
-        monthly_entitlement = float((policy or {}).get("monthly_entitlement", 0) or 0)
+        now_local = as_of_date or company_now().date()
+        monthly_entitlement = min(float((policy or {}).get("monthly_entitlement", 0) or 0), 1.0)
         used, pending = _monthly_leave_usage(str(user["_id"]), str(balance["leave_type_id"]), now_local.year, now_local.month)
         displayed_entitled = monthly_entitlement
         available = max(displayed_entitled - used - pending, 0.0)
     monthly_entitlement = float((policy or {}).get("monthly_entitlement", 0) or 0)
+    if code == "CL":
+        monthly_entitlement = min(monthly_entitlement, 1.0)
     if allocation_period == "monthly" and code not in {"CL", MEDICAL_LEAVE_CODE}:
         now_local = company_now().date()
         used, pending = _monthly_leave_usage(str(user["_id"]), str(balance["leave_type_id"]), now_local.year, now_local.month)
@@ -1142,17 +1247,20 @@ def list_leave_types(authorization: str | None = Header(default=None)):
 
 
 @router.get("/balance")
-def get_leave_balance(authorization: str | None = Header(default=None), year: int | None = None):
+def get_leave_balance(authorization: str | None = Header(default=None), year: int | None = None, month: int | None = None):
     user = _current_user(authorization)
-    target_year = year or datetime.now(timezone.utc).year
+    target_year = year or company_now().year
     if target_year < 2000 or target_year > 2100:
         raise HTTPException(status_code=400, detail="Invalid year")
+    if month is not None and not 1 <= month <= 12:
+        raise HTTPException(status_code=400, detail="Invalid month")
+    as_of_date = date(target_year, month, 1) if month is not None else company_now().date()
     response_data = []
     for leave_type in leave_types_collection.find({"is_active": True, "code": {"$ne": "EL"}}).sort("name", 1):
         if not _is_admin_or_hr(user) and not _leave_stage_allowed(user, leave_type):
             continue
         balance = _ensure_balance(str(user["_id"]), str(leave_type["_id"]), target_year)
-        response_data.append(_balance_response(balance, leave_type, user))
+        response_data.append(_balance_response(balance, leave_type, user, as_of_date=as_of_date))
     return response_data
 
 
@@ -1269,7 +1377,7 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
             raise HTTPException(status_code=400, detail=f"Insufficient Medical Leave balance for the current six-month cycle. Available: {cycle['available']:g} day(s).")
     allocation_period = _leave_allocation_period(leave_type, policy)
     if leave_type.get("is_paid", True) and allocation_period == "monthly":
-        monthly_limit = float(policy.get("monthly_entitlement", 0) or 0)
+        monthly_limit = min(float(policy.get("monthly_entitlement", 0) or 0), 1.0) if str(leave_type.get("code") or "").upper() == "CL" else float(policy.get("monthly_entitlement", 0) or 0)
         if monthly_limit <= 0:
             raise HTTPException(status_code=400, detail=f"A monthly allocation must be configured for {leave_type.get('name', 'this leave type')}.")
         requested_by_month: dict[tuple[int, int], float] = {}
@@ -1278,6 +1386,8 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
             requested_by_month[month_key] = requested_by_month.get(month_key, 0.0) + (0.5 if payload.day_part != "full_day" else 1.0)
         for (selected_year, selected_month), requested_month_days in requested_by_month.items():
             used_month, pending_month = _monthly_leave_usage(user_id, payload.leave_type_id, selected_year, selected_month)
+            if str(leave_type.get("code") or "").upper() == "CL" and used_month + pending_month > 1e-9:
+                raise HTTPException(status_code=409, detail=f"You have already submitted or used your Casual Leave for {calendar.month_name[selected_month]} {selected_year}. Only one CL request is allowed per calendar month.")
             if used_month + pending_month + requested_month_days > monthly_limit + 1e-9:
                 available_month = max(monthly_limit - used_month - pending_month, 0.0)
                 raise HTTPException(status_code=400, detail=f"Insufficient {leave_type.get('name', 'leave')} balance for {calendar.month_name[selected_month]} {selected_year}. Available: {available_month:g} day(s).")
@@ -1308,11 +1418,25 @@ def apply_leave(payload: LeaveApplicationCreate, authorization: str | None = Hea
     if attachment_bytes is not None:
         record["attachment_data"] = Binary(attachment_bytes)
         record["attachment_content_type"] = attachment_mime_type
-    result = leave_requests_collection.insert_one(record)
-    record["_id"] = result.inserted_id
+    if str(leave_type.get("code") or "").upper() == "CL":
+        request_id = str(ObjectId())
+        record["_id"] = ObjectId(request_id)
+        leave_requests_collection.insert_one(record)
+        try:
+            # The request exists before its unique month claims are acquired, so
+            # a process restart cannot leave an orphan reservation without a request.
+            _reserve_cl_monthly_claims(user_id, payload.leave_type_id, working_dates, request_id)
+        except Exception:
+            leave_requests_collection.delete_one({"_id": ObjectId(request_id), "status": "pending"})
+            raise
+        inserted_id = record["_id"]
+    else:
+        result = leave_requests_collection.insert_one(record)
+        record["_id"] = result.inserted_id
+        inserted_id = result.inserted_id
     _update_balance(user_id, payload.leave_type_id, payload.from_date.year, pending_delta=days)
-    record["approver_notified"] = _safe_notify(_notify, approver_id, "New Leave Request", f"{user.get('name', 'Employee')} submitted {days:g} day(s) of {leave_type.get('name')} for your {APPROVAL_STAGES[approval_stage][2]} approval.", request_id=str(result.inserted_id))
-    _audit(user, "LEAVE_APPLIED", str(result.inserted_id), {"days": days, "leave_type": leave_type.get("code"), "approval_stage": approval_stage, "approver_id": approver_id})
+    record["approver_notified"] = _safe_notify(_notify, approver_id, "New Leave Request", f"{user.get('name', 'Employee')} submitted {days:g} day(s) of {leave_type.get('name')} for your {APPROVAL_STAGES[approval_stage][2]} approval.", request_id=str(inserted_id))
+    _audit(user, "LEAVE_APPLIED", str(inserted_id), {"days": days, "leave_type": leave_type.get("code"), "approval_stage": approval_stage, "approver_id": approver_id})
     return _request_response(record, user)
 
 
@@ -1447,6 +1571,8 @@ def approve_leave(request_id: str, payload: LeaveDecisionPayload, authorization:
 
     year = int(record["from_date"][:4])
     _update_balance(record["user_id"], record["leave_type_id"], year, used_delta=days, pending_delta=-days)
+    if str((leave_types_collection.find_one({"_id": _parse_object_id(record["leave_type_id"], "leave type")}) or {}).get("code") or "").upper() == "CL":
+        _commit_cl_monthly_claims(request_id)
     approved_record = leave_requests_collection.find_one({"_id": object_id})
     sync_leave_for_today(approved_record)
     _notify(record["user_id"], "Leave Approved", f"Your {days:g} day(s) leave request has been approved by {approver.get('name', 'your approver')}.", request_id=request_id)
@@ -1482,6 +1608,8 @@ def reject_leave(request_id: str, payload: LeaveDecisionPayload, authorization: 
         raise HTTPException(status_code=409, detail="Leave request was already processed")
     year = int(record["from_date"][:4])
     _update_balance(record["user_id"], record["leave_type_id"], year, pending_delta=-float(record["days"]))
+    if str((leave_types_collection.find_one({"_id": _parse_object_id(record["leave_type_id"], "leave type")}) or {}).get("code") or "").upper() == "CL":
+        _release_cl_monthly_claims(request_id)
     _notify(record["user_id"], "Leave Rejected", f"Your leave request was rejected. {payload.remarks or ''}".strip(), request_id=request_id)
     _audit(approver, "LEAVE_REJECTED", request_id, {"employee_user_id": record["user_id"], "days": record["days"], "stage": stage})
     return _request_response(leave_requests_collection.find_one({"_id": object_id}), approver)
@@ -1539,6 +1667,8 @@ def cancel_leave(
         _update_balance(record["user_id"], record["leave_type_id"], year, used_delta=-days)
         # Attendance link: remove every "Leave" record created by this request.
         remove_leave_attendance(request_id)
+    if str((leave_types_collection.find_one({"_id": _parse_object_id(record["leave_type_id"], "leave type")}) or {}).get("code") or "").upper() == "CL":
+        _release_cl_monthly_claims(request_id)
     cancellation_message = (
         f"Your {days:g} day(s) leave request was cancelled by you."
         if record["user_id"] == user_id
@@ -2075,6 +2205,8 @@ def decide_leave_cancellation(
         # Reversed exactly once: only the update that moved approved -> cancelled gets here.
         _update_balance(record["user_id"], record["leave_type_id"], int(record["from_date"][:4]), used_delta=-days)
         remove_leave_attendance(request_id)
+        if str((leave_types_collection.find_one({"_id": _parse_object_id(record["leave_type_id"], "leave type")}) or {}).get("code") or "").upper() == "CL":
+            _release_cl_monthly_claims(request_id)
         _safe_notify(_notify, record["user_id"], "Leave Cancellation Approved", f"Your cancellation of {days:g} day(s) leave from {record['from_date']} was approved by {approver.get('name', 'your approver')}.", request_id=request_id)
     else:
         _safe_notify(_notify, record["user_id"], "Leave Cancellation Rejected", f"Your cancellation request for the leave from {record['from_date']} was rejected; the leave remains approved. {payload.remarks or ''}".strip(), request_id=request_id)

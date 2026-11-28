@@ -18,7 +18,8 @@ from fastapi import HTTPException  # noqa: E402
 from app import attendance as att  # noqa: E402
 from app.db.mongodb import client, db  # noqa: E402
 from app.weekly_off_planner import (  # noqa: E402
-    rank_weekdays, suggest_weekly_off_dates, validate_weekly_off_selection,
+    monthly_weekly_off_entitlement, rank_weekdays, suggest_weekly_off_dates,
+    validate_weekly_off_selection,
 )
 
 TODAY = date(2026, 11, 7)  # Saturday
@@ -35,6 +36,13 @@ def weekdays_of(year, month, weekday, last_day=None):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_joining_month_weekly_off_entitlement(self):
+        self.assertEqual(monthly_weekly_off_entitlement(d("2026-10-01"), 2026, 10), 4)
+        self.assertEqual(monthly_weekly_off_entitlement(d("2026-10-06"), 2026, 10), 4)
+        self.assertEqual(monthly_weekly_off_entitlement(d("2026-10-10"), 2026, 10), 3)
+        self.assertEqual(monthly_weekly_off_entitlement(d("2026-10-28"), 2026, 10), 0)
+        self.assertEqual(monthly_weekly_off_entitlement(d("2026-10-31"), 2026, 11), 4)
+
     def test_most_common_weekday_wins_and_max_four(self):
         candidates = weekdays_of(2026, 10, 6) + weekdays_of(2026, 10, 2)[:2]  # 4 Sundays, 2 Wednesdays
         picked = suggest_weekly_off_dates(candidates, 4)

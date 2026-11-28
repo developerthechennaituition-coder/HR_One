@@ -12,7 +12,7 @@ import {
 } from "../services/attendanceRequestApi";
 
 const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const STATUS_FILTERS = ["Not Marked", "Absent", "Attendance Issue", "Half-Day Present", "Present", "Weekly Off", "Holiday", "Not Applicable", "all"];
+const STATUS_FILTERS = ["Not Marked", "Absent", "Attendance Issue", "Half-Day Present", "Present", "Casual Leave", "Medical Leave", "Weekly Off", "Holiday", "Not Applicable", "all"];
 const ACTIVE_STATUSES = new Set(["pending", "processing"]);
 
 const requestDateKey = (value) => {
@@ -66,7 +66,7 @@ export function DateDecisionList({ dates }) {
         <li key={item.attendance_date}>
           <strong>{formatRequestDate(item.attendance_date)}</strong>
           {item.original_status && <span className="text-muted"> · was {item.original_status}{timeSuffix(item.original_check_in_time, item.original_check_out_time)}</span>}
-          <div>Requested {item.requested_status}{timeSuffix(item.requested_check_in_time, item.requested_check_out_time)}{item.requested_status === "Permission" ? ` (${item.requested_permission_start_time}–${item.requested_permission_end_time})` : ""}</div>
+          <div>Requested {item.requested_status === "Casual Leave" ? "Casual Leave (CL)" : item.requested_status === "Medical Leave" ? "Medical Leave (ML)" : item.requested_status}{timeSuffix(item.requested_check_in_time, item.requested_check_out_time)}{item.requested_status === "Permission" ? ` (${item.requested_permission_start_time}–${item.requested_permission_end_time})` : ""}</div>
           {item.requested_status === "Half-Day Present" && (
             <div className="small">
               First half: {item.requested_first_half_status || "—"}{timeSuffix(item.requested_first_half_check_in_time, item.requested_first_half_check_out_time)}
@@ -190,7 +190,10 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
   const visibleDays = useMemo(() => (calendar?.days || []).filter((day) => {
     if (day.is_future) return false;
     if (dateFilter) return day.attendance_date === dateFilter;
-    return statusFilter === "all" ? day.eligible_for_request || day.request : day.status === statusFilter;
+    if (statusFilter === "all") return day.eligible_for_request || day.request;
+    if (statusFilter === "Casual Leave") return day.status_label === "Casual Leave (CL)";
+    if (statusFilter === "Medical Leave") return day.status_label === "Medical Leave (ML)";
+    return day.status === statusFilter;
   }), [calendar, dateFilter, statusFilter]);
 
   const selectedDates = Object.keys(selected).sort();
@@ -431,7 +434,7 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                   <div className="col-6 col-md-3">
                     <label className="form-label small mb-1" htmlFor="ar-status-filter">Attendance status</label>
                     <select id="ar-status-filter" className="form-select form-select-sm" value={statusFilter} disabled={Boolean(dateFilter)} onChange={(e) => setStatusFilter(e.target.value)}>
-                      {STATUS_FILTERS.map((value) => <option key={value} value={value}>{value === "all" ? "All eligible dates" : value === "Attendance Issue" ? "⚠ Issue Date (Attendance Issue)" : value}</option>)}
+                      {STATUS_FILTERS.map((value) => <option key={value} value={value}>{value === "all" ? "All eligible dates" : value === "Attendance Issue" ? "⚠ Issue Date (Attendance Issue)" : value === "Casual Leave" ? "Casual Leave (CL)" : value === "Medical Leave" ? "Medical Leave (ML)" : value}</option>)}
                     </select>
                   </div>
                   <div className="col-6 col-md-4">
@@ -445,14 +448,14 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
 
                 {limits && (
                   <div className="small text-muted mb-2">
-                    This month: Weekly Off {limits.weekly_off_used} of {limits.weekly_off_limit} used · Medical Leave {limits.medical_leave_used} of {limits.medical_leave_limit} used
+                    This month: Weekly Off {limits.weekly_off_used} of {limits.weekly_off_limit} used. CL and ML availability is checked against Leave Management balances.
                   </div>
                 )}
 
                 {Object.values(selected).some((entry) => entry.day.status === "Attendance Issue") && (
                   <div className="alert alert-warning py-2 small mb-2" role="note">
                     <span className="attendance-issue-symbol me-1" aria-hidden="true">⚠</span>
-                    Attendance Issue dates have a check-in but no check-out. Request <strong>Present</strong> (you may suggest your check-out time); HR Admin must approve the request by entering the missing check-out time. Until then the date is not counted as Present.
+                    Attendance Issue dates have a check-in but no check-out. You may request Present, Half-Day Present, Absent, Casual Leave, or Medical Leave. HR Admin must approve the request; for Present, they must enter the missing check-out time.
                   </div>
                 )}
 
@@ -495,7 +498,7 @@ function MyAttendanceRequests({ calendar, year, month, maxYear, maxMonth, open, 
                                     value={entry.requested_status} disabled={submitting}
                                     onChange={(e) => updateEntry(iso, { requested_status: e.target.value })}>
                                     <option value="">Select status...</option>
-                                    {day.request_options.map((option) => <option key={option} value={option}>{option}</option>)}
+                                    {day.request_options.map((option) => <option key={option} value={option}>{option === "Casual Leave" ? "Casual Leave (CL)" : option === "Medical Leave" ? "Medical Leave (ML)" : option}</option>)}
                                   </select>
                                 ) : null}
                               </td>

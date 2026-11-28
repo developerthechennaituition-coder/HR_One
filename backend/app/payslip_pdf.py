@@ -51,6 +51,10 @@ def _company_snapshot(employee_id: str | None = None) -> dict:
                 "is_active": {"$ne": False},
             }) or {}
 
+    # A deleted employee or an unmatched company assignment can legitimately
+    # produce no company document. Keep the lookup read-only and return a
+    # safe empty/default snapshot instead of dereferencing None.
+    company = company if isinstance(company, dict) else {}
     location = str(company.get("location") or "").strip()
     branch = str(company.get("branch") or "").strip()
     display_location = location or branch
@@ -61,6 +65,24 @@ def _company_snapshot(employee_id: str | None = None) -> dict:
         "address": display_location,
         "location": location,
         "branch": branch,
+    }
+
+
+def _payslip_company_data(row: dict) -> dict:
+    """Prefer the company details saved with the finalized payroll record.
+
+    Older payroll records may not contain a snapshot, so fall back to the
+    current employee/company assignment. A missing/deleted employee must not
+    prevent historical payslip viewing or PDF generation.
+    """
+    resolved = _company_snapshot(row.get("employee_id"))
+    saved = row.get("company_snapshot")
+    saved = saved if isinstance(saved, dict) else {}
+    # Historical values take precedence; current values fill only missing
+    # fields for records created before company snapshots were stored.
+    return {
+        **(resolved if isinstance(resolved, dict) else {}),
+        **{key: value for key, value in saved.items() if value not in (None, "")},
     }
 
 
@@ -137,10 +159,7 @@ def payslip_view_data(row: dict) -> dict:
                 continue
         return result
 
-    company = _company_snapshot(row.get("employee_id")) or {}
-    saved_company = row.get("company_snapshot") or {}
-    if not (company.get("location") or company.get("branch")) and saved_company:
-        company = {**saved_company, **{key: value for key, value in company.items() if value not in (None, "")}}
+    company = _payslip_company_data(row)
     snapshot = row.get("salary_snapshot") or {}
     profile = {}
     if not all((
@@ -486,16 +505,7 @@ def _payslip_pdf_response(row: dict, inline: bool = False):
     # ---------------------------------------------------------
     # PAYSLIP DATA
     # ---------------------------------------------------------
-    resolved_company = _company_snapshot(row.get("employee_id")) or {}
-    saved_company = row.get("company_snapshot") or {}
-    company = resolved_company
-    if not (company.get("location") or company.get("branch")) and saved_company:
-        # Preserve the stored snapshot only if the current employee assignment
-        # cannot provide a location/branch.
-        company = {
-            **saved_company,
-            **{key: value for key, value in company.items() if value not in (None, "")},
-        }
+    company = _payslip_company_data(row)
     # Prefer the employee-specific company location. Show branch only when the
     # location is not configured; branch code must never appear under company name.
     company_address = str(company.get("location") or "").strip()

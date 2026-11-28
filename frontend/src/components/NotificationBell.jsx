@@ -8,92 +8,96 @@ function NotificationBell({ onNavigate }) {
   const previousIdsRef = useRef(null);
   const audioRef = useRef(null);
   const audioUnlockedRef = useRef(false);
+  const pendingSoundsRef = useRef(0);
+  const snapshotInFlightRef = useRef(false);
+  const soundPlayingRef = useRef(false);
 
   useEffect(() => {
-    let cancelled = false;
-    let objectUrl = null;
-
-    // Load the sound as one in-memory Blob. Streaming it straight into
-    // <audio> uses HTTP range requests, which fail in some cache setups
-    // (net::ERR_CACHE_OPERATION_NOT_SUPPORTED) and leave no playable source.
-    fetch(notificationSound)
-      .then((response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.blob();
-      })
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        const audio = new Audio(objectUrl);
-        audio.preload = "auto";
-        audio.volume = 1;
-        audioRef.current = audio;
-      })
-      .catch((error) => {
-        if (!cancelled) console.warn("Notification sound could not be loaded:", error);
-      });
+    // Create the media element synchronously so an early user gesture is not
+    // lost while an asynchronous Blob fetch is still in progress.
+    const audio = new Audio(notificationSound);
+    audio.preload = "auto";
+    audio.volume = 1;
+    audioRef.current = audio;
+    audio.load();
 
     return () => {
-      cancelled = true;
-      audioRef.current?.pause();
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
       audioRef.current = null;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, []);
 
   useEffect(() => {
-    const events = ["click", "keydown", "touchstart"];
-    const removeListeners = () => {
-      events.forEach((name) => window.removeEventListener(name, unlockAudio));
+    const audio = audioRef.current;
+    if (!audio) return undefined;
+
+    const playNextQueuedSound = () => {
+      if (!audioUnlockedRef.current || soundPlayingRef.current || pendingSoundsRef.current <= 0) return;
+      soundPlayingRef.current = true;
+      audio.currentTime = 0;
+      const playback = audio.play();
+      if (playback && typeof playback.then === "function") {
+        playback.then(() => {
+          pendingSoundsRef.current = Math.max(0, pendingSoundsRef.current - 1);
+        }).catch((error) => {
+          soundPlayingRef.current = false;
+          audioUnlockedRef.current = false;
+          console.warn("Notification sound playback was blocked:", error);
+        });
+      } else {
+        pendingSoundsRef.current = Math.max(0, pendingSoundsRef.current - 1);
+      }
     };
 
-    // Browsers allow audio only after a user gesture. Retry on each gesture
-    // until it succeeds (the sound may still be loading on the first one).
-    function unlockAudio() {
-      const audio = audioRef.current;
-      if (!audio || audioUnlockedRef.current) return;
+    const onEnded = () => {
+      soundPlayingRef.current = false;
+      playNextQueuedSound();
+    };
+    const onAudioError = () => {
+      soundPlayingRef.current = false;
+      audioUnlockedRef.current = false;
+    };
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("error", onAudioError);
 
+    const events = ["click", "keydown", "touchstart"];
+    const unlockAudio = () => {
+      if (audioUnlockedRef.current) return;
+      // A muted play/pause initiated directly by a user gesture unlocks
+      // subsequent notification playback in browsers with autoplay policy.
       audio.muted = true;
-      audio.play()
-        .then(() => {
+      const unlock = audio.play();
+      if (unlock && typeof unlock.then === "function") {
+        unlock.then(() => {
           audio.pause();
           audio.currentTime = 0;
           audio.muted = false;
           audioUnlockedRef.current = true;
-          removeListeners();
-        })
-        .catch(() => {
+          playNextQueuedSound();
+        }).catch(() => {
           audio.muted = false;
         });
-    }
+      }
+    };
+    events.forEach((name) => window.addEventListener(name, unlockAudio, { passive: true }));
 
-    events.forEach((name) => window.addEventListener(name, unlockAudio));
-    return removeListeners;
+    return () => {
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("error", onAudioError);
+      events.forEach((name) => window.removeEventListener(name, unlockAudio));
+    };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-
-    const playNotificationSound = () => {
-      const audio = audioRef.current;
-      if (!audio || !audioUnlockedRef.current) {
-        if (!audioUnlockedRef.current) {
-          console.warn("Notification sound is waiting for user interaction.");
-        }
-        return;
-      }
-
-      audio.currentTime = 0;
-      audio.play().catch((error) => {
-        console.error("Notification sound playback failed:", error);
-      });
-    };
-
     let intervalId = null;
     let authenticationExpired = false;
 
     const loadSnapshot = async () => {
-      if (authenticationExpired) return;
+      if (authenticationExpired || snapshotInFlightRef.current) return;
+      snapshotInFlightRef.current = true;
       try {
         const snapshot = await getNotificationSnapshot();
         if (cancelled) return;
@@ -106,9 +110,27 @@ function NotificationBell({ onNavigate }) {
         const previousIds = previousIdsRef.current;
 
         setUnreadCount(Number(snapshot?.unread_count || 0));
+        // First load establishes a baseline: old inbox items never make a sound.
         if (previousIds !== null) {
-          const hasNewNotification = [...currentIds].some((id) => !previousIds.has(id));
-          if (hasNewNotification) playNotificationSound();
+          const newCount = [...currentIds].filter((id) => !previousIds.has(id)).length;
+          if (newCount > 0) {
+            pendingSoundsRef.current += newCount;
+            const audio = audioRef.current;
+            if (audio && audioUnlockedRef.current && !soundPlayingRef.current) {
+              audio.currentTime = 0;
+              soundPlayingRef.current = true;
+              const playback = audio.play();
+              if (playback && typeof playback.then === "function") {
+                playback.then(() => {
+                  pendingSoundsRef.current = Math.max(0, pendingSoundsRef.current - 1);
+                }).catch((error) => {
+                  soundPlayingRef.current = false;
+                  audioUnlockedRef.current = false;
+                  console.warn("Notification sound playback failed:", error);
+                });
+              }
+            }
+          }
         }
         previousIdsRef.current = currentIds;
       } catch (error) {
@@ -119,6 +141,8 @@ function NotificationBell({ onNavigate }) {
           return;
         }
         console.error("Unable to load notification snapshot:", error);
+      } finally {
+        snapshotInFlightRef.current = false;
       }
     };
 

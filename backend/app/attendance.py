@@ -444,7 +444,9 @@ class WfhSettingsPayload(BaseModel):
     )
     home_location_accuracy_meters: float | None = Field(default=None, gt=0)
     home_location_timestamp: float | None = Field(default=None, gt=0)
-    home_location_verification_method: Literal["browser", "manual"]
+    # Schedule-only updates do not register or modify a location. Keep this
+    # optional so WFH permission edits do not fail request-body validation.
+    home_location_verification_method: Literal["browser", "manual"] = "manual"
     home_location_manually_verified: bool = False
     wfh_permitted_from: str | None = None
     wfh_permitted_to: str | None = None
@@ -4052,7 +4054,11 @@ def get_historical_attendance_month(
 
         rows.append({
             "attendance_date": date_iso,
-            "status": status_value,
+            "status": (
+                "Casual Leave (CL)" if record.get("leave_type_code") == "CL"
+                else "Medical Leave (ML)" if record.get("leave_type_code") == "ML"
+                else status_value
+            ),
             "check_in_time": _attendance_clock_hhmm(record.get("check_in_time") or details.get("first_check_in")),
             "check_out_time": _attendance_clock_hhmm(record.get("check_out_time") or details.get("last_check_out")),
             **half,
@@ -4098,6 +4104,56 @@ def get_historical_attendance_month(
         "year": year,
         "month": month,
         "records": rows,
+    }
+
+
+@router.get("/historical/user/{user_id}/leave-balance")
+def get_historical_leave_balance(
+    user_id: str,
+    year: int = Query(...),
+    month: int = Query(...),
+    authorization: str | None = Header(default=None),
+):
+    _require_historical_attendance_permission(authorization)
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid employee ID.")
+    employee = users_collection.find_one({"_id": ObjectId(user_id), "is_active": True})
+    if not employee:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
+    _validate_historical_read_month(employee, year, month)
+    from app import leave as leave_module
+    cl_type = db["leave_types"].find_one({"code": "CL", "is_active": True})
+    ml_type = db["leave_types"].find_one({"code": "ML", "is_active": True})
+    cl_entitlement = cl_used = cl_pending = 0.0
+    if cl_type:
+        policy = leave_module._get_policy(str(cl_type["_id"])) or {}
+        cl_entitlement = min(float(policy.get("monthly_entitlement", 0) or 0), 1.0)
+        cl_used, cl_pending = leave_module._monthly_leave_usage(user_id, str(cl_type["_id"]), year, month)
+        start = date(year, month, 1)
+        end = date(year + (month == 12), month % 12 + 1, 1)
+        cl_used += attendance_collection.count_documents({
+            "user_id": user_id, "attendance_date": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+            "leave_type_code": "CL", "attendance_source": {"$in": ["HISTORICAL_ATTENDANCE_CORRECTION", "ATTENDANCE_REQUEST"]},
+        })
+    ml = leave_module._ml_cycle_balance(employee, company_today())
+    ml_attendance_used = attendance_collection.count_documents({
+        "user_id": user_id, "attendance_date": {"$gte": ml["cycle_start"], "$lt": ml["cycle_end"]},
+        "leave_type_code": "ML", "attendance_source": {"$in": ["HISTORICAL_ATTENDANCE_CORRECTION", "ATTENDANCE_REQUEST"]},
+    })
+    cl_request_pending = sum(
+        1 for req in db["attendance_requests"].find({"user_id": user_id, "status": {"$in": ["pending", "processing"]}, "periods": f"{year:04d}-{month:02d}"}, {"dates": 1})
+        for item in req.get("dates", []) if str(item.get("attendance_date", "")).startswith(f"{year:04d}-{month:02d}") and item.get("requested_status") == "Casual Leave"
+    )
+    ml_request_pending = sum(
+        1 for req in db["attendance_requests"].find({"user_id": user_id, "status": {"$in": ["pending", "processing"]}}, {"dates": 1})
+        for item in req.get("dates", []) if ml["cycle_start"] <= str(item.get("attendance_date", "")) < ml["cycle_end"] and item.get("requested_status") == "Medical Leave"
+    )
+    return {
+        "cl": {"entitlement": cl_entitlement, "used": round(cl_used, 2), "pending": round(cl_pending, 2),
+               "available": round(max(cl_entitlement - cl_used - cl_pending - cl_request_pending, 0), 2), "year": year, "month": month},
+        "ml": {"credited": ml["credited"], "used": round(ml["used"] + ml_attendance_used, 2), "pending": round(ml["pending"] + ml_request_pending, 2),
+               "available": round(max(ml["available"] - ml_attendance_used - ml_request_pending, 0), 2),
+               "cycle_start": ml["cycle_start"], "cycle_end": ml["cycle_end_display"]},
     }
 
 
@@ -4481,7 +4537,8 @@ def modify_historical_attendance(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Active employee not found.")
     assert_on_or_after_joining(employee, selected)
     status_value = payload.status.strip().title()
-    allowed_statuses = {"Present", "Half-Day Present", "Absent", "Holiday", "Leave", "Weekly Off", "Medical Leave", "Permission", "Not Applicable", "Not Marked"}
+    status_value = {"Casual Leave (Cl)": "Casual Leave (CL)", "Medical Leave (Ml)": "Medical Leave (ML)"}.get(status_value, status_value)
+    allowed_statuses = {"Present", "Half-Day Present", "Absent", "Holiday", "Leave", "Casual Leave (CL)", "Medical Leave (ML)", "Weekly Off", "Medical Leave", "Permission", "Not Applicable", "Not Marked"}
     if status_value not in allowed_statuses:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsupported attendance status.")
     employee_id = str(employee.get("employee_id") or "")
@@ -4605,8 +4662,49 @@ def modify_historical_attendance(
             expected = expected.replace(tzinfo=timezone.utc)
         if actual != expected:
             raise HTTPException(status.HTTP_409_CONFLICT, "This attendance record was modified by someone else. Refresh the history before making another change.")
+    leave_code_for_edit = {"Casual Leave (CL)": "CL", "Medical Leave (ML)": "ML"}.get(status_value)
+    if leave_code_for_edit:
+        if _approved_leaves_for_date(selected.isoformat(), payload.user_id):
+            raise HTTPException(status.HTTP_409_CONFLICT, "An approved Leave Management request already covers this date.")
+        from app import leave as leave_module
+        leave_type = db["leave_types"].find_one({"code": leave_code_for_edit, "is_active": True})
+        if not leave_type:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"{leave_code_for_edit} is not configured in Leave Management.")
+        # Existing correction on this exact date is excluded so editing a CL/ML
+        # record does not reserve or deduct the same day twice.
+        cycle_start = cycle_end = None
+        if leave_code_for_edit == "CL":
+            policy = leave_module._get_policy(str(leave_type["_id"])) or {}
+            entitlement = min(float(policy.get("monthly_entitlement", 0) or 0), 1.0)
+            used, pending = leave_module._monthly_leave_usage(payload.user_id, str(leave_type["_id"]), selected.year, selected.month)
+            attendance_used = attendance_collection.count_documents({
+                "user_id": payload.user_id,
+                "attendance_date": {"$gte": selected.replace(day=1).isoformat(), "$lt": date(selected.year + (selected.month == 12), selected.month % 12 + 1, 1).isoformat(), "$ne": selected.isoformat()},
+                "leave_type_code": "CL", "attendance_source": {"$in": ["HISTORICAL_ATTENDANCE_CORRECTION", "ATTENDANCE_REQUEST"]},
+            })
+            attendance_request_pending = sum(
+                1 for req in db["attendance_requests"].find({"user_id": payload.user_id, "status": {"$in": ["pending", "processing"]}, "periods": selected.strftime("%Y-%m")}, {"dates": 1})
+                for item in req.get("dates", []) if str(item.get("attendance_date", "")).startswith(selected.strftime("%Y-%m")) and item.get("requested_status") == "Casual Leave"
+            )
+            if used + pending + attendance_used + attendance_request_pending >= entitlement:
+                remaining = max(entitlement-used-pending-attendance_used-attendance_request_pending, 0)
+                raise HTTPException(status.HTTP_409_CONFLICT, f"Casual Leave is unavailable: {remaining:g} day(s) remain for {selected.strftime('%B %Y')}.")
+        else:
+            ml = leave_module._ml_cycle_balance(employee, company_today())
+            cycle_start, cycle_end = ml["cycle_start"], ml["cycle_end"]
+            attendance_used = attendance_collection.count_documents({
+                "user_id": payload.user_id, "attendance_date": {"$gte": cycle_start, "$lt": cycle_end, "$ne": selected.isoformat()},
+                "leave_type_code": "ML", "attendance_source": {"$in": ["HISTORICAL_ATTENDANCE_CORRECTION", "ATTENDANCE_REQUEST"]},
+            })
+            attendance_request_pending = sum(
+                1 for req in db["attendance_requests"].find({"user_id": payload.user_id, "status": {"$in": ["pending", "processing"]}}, {"dates": 1})
+                for item in req.get("dates", []) if cycle_start <= str(item.get("attendance_date", "")) < cycle_end and item.get("requested_status") == "Medical Leave"
+            )
+            available = max(float(ml.get("available", 0) or 0) - attendance_used - attendance_request_pending, 0.0)
+            if available < 1:
+                raise HTTPException(status.HTTP_409_CONFLICT, f"Medical Leave is unavailable: {available:g} day(s) remain in the current six-month cycle ({cycle_start} to {cycle_end}).")
     approved_leave = _approved_leaves_for_date(selected.isoformat(), payload.user_id)
-    if approved_leave and approved_leave[0].get("day_part", "full_day") == "full_day" and status_value not in {"Leave"}:
+    if approved_leave and approved_leave[0].get("day_part", "full_day") == "full_day" and status_value not in {"Leave", "Casual Leave (CL)", "Medical Leave (ML)"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "Approved full-day leave locks this attendance date. Cancel the leave first.")
     if status_value == "Leave":
         if not approved_leave:
@@ -4628,6 +4726,15 @@ def modify_historical_attendance(
             "leave_type_code": None,
         }
         values.update(half_values)
+        if leave_code_for_edit:
+            values.update({
+                "status": "Leave",
+                "leave_type_code": leave_code_for_edit,
+                "leave_day_part": "full_day",
+                "leave_request_id": None,
+                "medical_leave": leave_code_for_edit == "ML",
+                "attendance_source": "HISTORICAL_ATTENDANCE_CORRECTION",
+            })
         if status_value == "Not Marked":
             values["check_in_time"] = None
             values["check_out_time"] = None

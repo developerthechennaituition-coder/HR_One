@@ -97,7 +97,7 @@ def serialize_details(record: dict | None) -> dict:
         "date_of_birth": serialize_date(record.get("date_of_birth")),
         "blood_group": record.get("blood_group") or "",
         "date_of_joining": serialize_date(record.get("date_of_joining")),
-        "work_stage": record.get("work_stage") if record.get("work_stage") in {"Probation", "Employee"} else "Employee",
+        "work_stage": record.get("work_stage") if record.get("work_stage") in {"Probation", "Employee", "Internship"} else "Employee",
         "work_field": record.get("work_field") or "",
         "nationality": record.get("nationality") or "",
         "address": record.get("address") or "",
@@ -244,8 +244,8 @@ class EmployeeExtraDetailsPayload(BaseModel):
     @classmethod
     def validate_work_stage(cls, value: str) -> str:
         value = (value or "Employee").strip().title()
-        if value not in {"Probation", "Employee"}:
-            raise ValueError("Work Stage must be Probation or Employee.")
+        if value not in {"Probation", "Employee", "Internship"}:
+            raise ValueError("Work Stage must be Probation, Employee, or Internship.")
         return value
 
     @field_validator("blood_group")

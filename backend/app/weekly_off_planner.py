@@ -8,6 +8,7 @@ these helpers to suggest dates and to validate what HR Admin submits.
 
 from __future__ import annotations
 
+from calendar import monthrange
 from datetime import date
 from typing import Iterable
 
@@ -16,6 +17,16 @@ MAX_WEEKLY_OFFS_PER_MONTH = 4
 # Tie-break when two weekdays are equally common: Sunday, then Saturday, then
 # Monday..Friday (date.weekday(): Monday=0 ... Sunday=6).
 _TIE_PREFERENCE = {6: 0, 5: 1, 0: 2, 1: 3, 2: 4, 3: 5, 4: 6}
+
+
+def monthly_weekly_off_entitlement(joining_date: date | None, year: int, month: int) -> int:
+    """Return the monthly entitlement, prorating only the employee's joining month."""
+    if not joining_date or (joining_date.year, joining_date.month) != (year, month):
+        return MAX_WEEKLY_OFFS_PER_MONTH
+    last_day = date(year, month, monthrange(year, month)[1])
+    eligible_days = max(0, (last_day - joining_date).days + 1)
+    whole_weeks, remainder = divmod(eligible_days, 7)
+    return min(MAX_WEEKLY_OFFS_PER_MONTH, whole_weeks + int(remainder > 4))
 
 
 def rank_weekdays(candidates: Iterable[date], configured_weekdays: Iterable[int] = ()) -> list[int]:

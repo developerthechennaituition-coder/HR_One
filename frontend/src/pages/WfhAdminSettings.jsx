@@ -193,13 +193,7 @@ function WfhAdminSettings({ session }) {
 
       const payload = {
         is_wfh_enabled: Boolean(employee.is_wfh_enabled),
-        home_latitude: null,
-        home_longitude: null,
         allowed_radius: Number(employee.allowed_radius || 100),
-        home_location_accuracy_meters: null,
-        home_location_timestamp: null,
-        home_location_verification_method: "manual",
-        home_location_manually_verified: false,
         wfh_permitted_from: employee.wfh_permitted_from || null,
         wfh_permitted_to: employee.wfh_permitted_to || null,
         wfh_permitted_start_time: employee.wfh_permitted_start_time || null,
@@ -210,7 +204,21 @@ function WfhAdminSettings({ session }) {
         method: "PUT", headers: headers(), body: JSON.stringify(payload),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.detail || "Unable to save WFH settings.");
+      if (!response.ok) {
+        const detail = data?.detail;
+        const validationMessage = Array.isArray(detail)
+          ? detail.map((item) => {
+              const field = Array.isArray(item?.loc) ? item.loc.filter((part) => part !== "body").join(" → ") : "";
+              const message = item?.msg || item?.message || "Invalid value";
+              return field ? `${field}: ${message}` : message;
+            }).join("; ")
+          : typeof detail === "string"
+            ? detail
+            : detail && typeof detail === "object"
+              ? (detail.message || detail.msg || JSON.stringify(detail))
+              : `Unable to save WFH settings (HTTP ${response.status}).`;
+        throw new Error(validationMessage || `Unable to save WFH settings (HTTP ${response.status}).`);
+      }
       setEmployees((rows) => rows.map((row) => row.user_id === employee.user_id ? { ...row, ...data } : row));
       setSuccess(`WFH settings saved for ${employee.name || employee.employee_id || "account"}.`);
       saved = true;
@@ -264,7 +272,7 @@ function WfhAdminSettings({ session }) {
     }
     const accuracy = employee.home_location_accuracy_meters != null ? `\nReported GPS accuracy: ±${Math.round(employee.home_location_accuracy_meters)} m` : "";
     const registered = employee.home_location_updated_at ? `\nRegistered/updated: ${formatIST(employee.home_location_updated_at)}` : "";
-    window.alert(`Registered WFH location for ${employee.name}\nLatitude: ${employee.home_latitude}\nLongitude: ${employee.home_longitude}${accuracy}${registered}`);
+    window.alert(`WFH location is registered for ${employee.name}.\nLocation coordinates are stored for attendance validation and are not displayed here.${accuracy}${registered}`);
   };
 
   const showFace = async (employee) => {

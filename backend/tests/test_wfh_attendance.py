@@ -404,6 +404,20 @@ class WfhAttendanceValidationTests(unittest.TestCase):
                     _validate_wfh_location(settings, payload)
                 self.assertEqual(error.exception.status_code, 409)
 
+    def test_admin_wfh_schedule_payload_does_not_require_location_metadata(self):
+        payload = WfhSettingsPayload(
+            is_wfh_enabled=True,
+            allowed_radius=100,
+            wfh_permitted_from="2026-11-30",
+            wfh_permitted_to="2026-11-30",
+            wfh_permitted_start_time="09:00",
+            wfh_permitted_end_time="19:00",
+            wfh_permitted_weekdays=["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+        )
+        self.assertEqual(payload.home_location_verification_method, "manual")
+        self.assertIsNone(payload.home_latitude)
+        self.assertIsNone(payload.home_longitude)
+
     def test_wfh_radius_must_be_configurable_and_positive(self):
         settings = WfhSettingsPayload(
             is_wfh_enabled=True,

@@ -29,6 +29,7 @@ from app.core_routes import router as core_router, _organization_user
 from app.attendance import router as attendance_router, ensure_attendance_indexes, generate_due_wfh_absences, mark_attendance_issues
 from app.essl import router as essl_attendance_router, ensure_essl_indexes
 from app.attendance_requests import router as attendance_requests_router
+from app.weekly_off_selection import router as weekly_off_selection_router
 
 # Notification
 from app.notifications import (
@@ -155,6 +156,7 @@ app.include_router(
 app.include_router(attendance_router)
 app.include_router(essl_attendance_router)
 app.include_router(attendance_requests_router)
+app.include_router(weekly_off_selection_router)
 
 # Employee Master / employee extra details router
 app.include_router(

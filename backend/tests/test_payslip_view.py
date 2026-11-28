@@ -76,6 +76,32 @@ class PayslipViewTests(unittest.TestCase):
         self.assertEqual((view["company"]["name"], view["bank_name"], view["pay_date"]), ("Acme Pvt Ltd", "State Bank", "2026-10-02"))
         self.assertIn("Forty Thousand", view["net_salary_in_words"])
 
+    def test_historical_payslip_survives_employee_deletion_and_missing_company_match(self):
+        # Simulate an employee removed from Employee Master and user records,
+        # with multiple active companies so no arbitrary company can be inferred.
+        db["users"].delete_one({"employee_id": "E-1"})
+        db["companies"].insert_one({"company": "Another Company", "legal_entity": "Another Legal Entity", "location": "Coimbatore", "is_active": True})
+        db["monthly_payroll_records"].update_one(
+            {"_id": ObjectId(self.record_id)},
+            {"$set": {"company_snapshot": {
+                "name": "Historical Legal Entity", "company_name": "Historical Company",
+                "address": "Historical Address", "location": "Historical Address", "branch": "Historical Branch",
+            }}},
+        )
+
+        view = payroll.get_payslip(self.record_id, self.hr["auth"], None)
+        self.assertEqual(view["employee_name"], "Asha Kumar with a very long employee name")
+        self.assertEqual(view["company"]["name"], "Historical Legal Entity")
+        self.assertEqual(view["company"]["address"], "Historical Address")
+        self.assertEqual(view["net_salary"], 40200.0)
+
+    def test_company_snapshot_handles_missing_company_document(self):
+        db["users"].delete_one({"employee_id": "E-1"})
+        db["companies"].insert_one({"company": "Another Company", "is_active": True})
+        snapshot = payroll._company_snapshot("E-1")
+        self.assertIsInstance(snapshot, dict)
+        self.assertEqual(snapshot["name"], "HRMS")
+
     def test_access_is_scoped(self):
         self.assert_http(403, payroll.get_payslip, self.record_id, self.employee["auth"], None)  # HR endpoint
         own = payroll.get_my_payslip(self.record_id, self.employee["auth"], None)

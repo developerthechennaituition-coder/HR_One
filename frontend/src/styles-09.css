@@ -1748,3 +1748,80 @@ section[aria-label="Monthly attendance calendar"]
     min-width: 760px;
   }
 }
+
+
+/* My Attendance history stays inside its own scroll region. */
+.attendance-history-scroll {
+  max-height: 26rem;
+  overflow-y: auto;
+  overflow-x: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.attendance-history-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f8f9fa;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.08);
+}
+
+@media (max-width: 767.98px) {
+  .attendance-history-scroll {
+    max-height: 22rem;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+.weekly-off-scroll-list {
+  max-height: 26rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.weekly-off-scroll-list--queue {
+  max-height: 34rem;
+}
+
+.weekly-off-request-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+  border-bottom: 1px solid var(--hr-line);
+}
+
+.weekly-off-request-card:last-child {
+  border-bottom: 0;
+}
+
+.weekly-off-request-card__details {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.weekly-off-request-card__actions {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+@media (max-width: 767.98px) {
+  .weekly-off-scroll-list {
+    max-height: 22rem;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .weekly-off-request-card {
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .weekly-off-request-card__actions,
+  .weekly-off-request-card__actions .btn {
+    width: 100%;
+  }
+}

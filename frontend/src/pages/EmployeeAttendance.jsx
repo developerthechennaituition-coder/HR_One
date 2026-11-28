@@ -230,7 +230,7 @@ function EmployeeAttendance({ session, onNavigate }) {
           <h2 className="mb-1">My Attendance</h2>
           <p className="text-muted mb-0">Your WFO and WFH attendance in one place</p>
         </div>
-        <div className="d-flex gap-2">
+        <div className="d-flex flex-wrap gap-2">
           <button
             type="button"
             className="btn btn-primary"
@@ -319,8 +319,8 @@ function EmployeeAttendance({ session, onNavigate }) {
       <div className="card border-0 shadow-sm mb-4">
         <div className="card-body">
           <h4 className="mb-3">Attendance History</h4>
-          <div className="table-responsive">
-            <table className="table table-hover align-middle">
+          <div className="table-responsive attendance-history-scroll">
+            <table className="table table-hover align-middle mb-0">
               <thead className="table-light">
                 <tr>
                   <th>Date</th>
